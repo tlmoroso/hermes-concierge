@@ -46,10 +46,10 @@ import time
 from pathlib import Path
 
 import pytest
-import yaml
 
 from agent.secret_scope import load_env_file
 from concierge import provision, registry
+from hermes_yaml import safe_load as _yaml_safe_load
 
 # Repo root (parent of the ``concierge`` package) so child processes can import it.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(provision.__file__)))
@@ -64,7 +64,7 @@ HUB_ENV = (
 
 
 def _yaml(path):
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    return _yaml_safe_load(Path(path).read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -292,26 +292,183 @@ def test_secret_files_pinned_0600_even_from_loose_hub_files(concierge_home):
     assert env_path.exists() and honcho_path.exists()
     assert _mode_of(env_path) == 0o600
     assert _mode_of(honcho_path) == 0o600
-    # content round-trips: the honcho key survives the copy, the discord token doesn't
+    # content round-trips: the synthesized config carries the hub's static key
+    # at its root, the discord token doesn't survive the .env strip
     assert json.loads(honcho_path.read_text())["apiKey"] == "honcho-key"
     assert "DISCORD_BOT_TOKEN" not in env_path.read_text()
 
 
 def test_honcho_bot_seeds_the_memory_provider_activation_key(concierge_home):
     """Task 9.1 invariant: a ``memory_provider='honcho'`` blueprint must
-    ACTIVATE the Honcho provider in the bot profile, not just copy its
+    ACTIVATE the Honcho provider in the bot profile, not just install its
     connection config. The real activation key (verified against the
     plugin's load chain, NOT guessed): ``memory.provider`` in config.yaml —
     the key ``agent/agent_init.py`` reads
     (``mem_config.get('provider')`` -> ``plugins.memory.load_memory_provider``),
     the one ``hermes_cli/memory_setup.py:313`` writes, and the one
     ``DEFAULT_CONFIG['memory']['provider']`` registers
-    (hermes_cli/config_defaults.py). Without it the copied honcho.json is
+    (hermes_cli/config_defaults.py). Without it the synthesized honcho.json is
     inert: the bot never constructs a session and remembers nothing across
     sessions — the silent failure Task 9.1 exists to close."""
+    (concierge_home / "honcho.json").write_text('{"apiKey": "honcho-key"}')
     binding = _provisioned(concierge_home, key="reminders")  # memory_provider="honcho"
     cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
     assert cfg["memory"] == {"provider": "honcho"}
+
+
+def test_install_honcho_synthesizes_from_static_key_never_copies_oauth(concierge_home):
+    """The M5 contract (supersedes the byte-copy): the bot's honcho.json is
+    SYNTHESIZED from a usable STATIC service key — never a byte-copy of the
+    hub's file. Honcho OAuth grants are per-profile-host single-use refresh
+    chains: the bot's profile host key (``hermes_bot_<slug>_<suffix>``,
+    plugins/memory/honcho/client.py::profile_host_key) does not exist in a
+    copied file, so the bot falls back to the ROOT apiKey — which, when the
+    hub logged in via OAuth, is itself an ``hch-at-`` access token that
+    expires, with no oauth block to refresh it: dead auth plus user-facing
+    re-login nagging. A synthesized root-key config (host lookup falls back
+    to root, client.py:_HostLookup.pick) authenticates for ANY bot profile
+    name and never refreshes (a static key never expires,
+    oauth.py::ensure_fresh_token returns (None, False) with no oauth block).
+    The bot file carries ONLY the static key + non-secret behavior tuning —
+    no hosts blocks, no oauth anywhere, no host-specific secrets."""
+    (concierge_home / "honcho.json").write_text(
+        json.dumps(
+            {
+                "apiKey": "hub-static-key",
+                "workspace": "personal",
+                "saveMessages": False,
+                "sessionStrategy": "per-channel",
+                "dialecticCadence": 3,
+                "writeFrequency": "turn",
+                "recallMode": "context",
+                "observationMode": "unified",
+                "dialecticReasoningLevel": "medium",
+                "hosts": {
+                    "hermes": {
+                        "apiKey": "host-token",
+                        "oauth": {
+                            "refreshToken": "hch-rt-secret",
+                            "expiresAt": 1,
+                        },
+                    }
+                },
+            }
+        )
+    )
+    binding = _provisioned(concierge_home)
+    bot_cfg_path = concierge_home / "profiles" / binding["profile"] / "honcho.json"
+    assert bot_cfg_path.exists()
+    assert _mode_of(bot_cfg_path) == 0o600
+    bot_cfg = json.loads(bot_cfg_path.read_text())
+    # the static key rides at the ROOT — what the bot's host lookup falls
+    # back to (its profile host block does not exist in this file)
+    assert bot_cfg["apiKey"] == "hub-static-key"
+    # never a byte-copy: the hub's host blocks, tokens and oauth chain are gone
+    assert "hosts" not in bot_cfg
+    assert "oauth" not in bot_cfg
+    assert "host-token" not in bot_cfg_path.read_text()
+    assert "hch-rt-secret" not in bot_cfg_path.read_text()
+    # non-secret behavior tuning is carried from the hub's root
+    assert bot_cfg["workspace"] == "personal"
+    assert bot_cfg["saveMessages"] is False
+    assert bot_cfg["sessionStrategy"] == "per-channel"
+    assert bot_cfg["dialecticCadence"] == 3
+    assert bot_cfg["writeFrequency"] == "turn"
+    assert bot_cfg["recallMode"] == "context"
+    assert bot_cfg["observationMode"] == "unified"
+    assert bot_cfg["dialecticReasoningLevel"] == "medium"
+    # the synthesized file carries nothing else
+    assert set(bot_cfg) == {
+        "apiKey",
+        "workspace",
+        "saveMessages",
+        "sessionStrategy",
+        "dialecticCadence",
+        "writeFrequency",
+        "recallMode",
+        "observationMode",
+        "dialecticReasoningLevel",
+    }
+
+
+def test_install_honcho_rejects_expired_oauth_root_key_and_skips_memory(concierge_home, caplog):
+    """The live incident: the hub's honcho.json root ``apiKey`` is an
+    expired OAuth access token (``hch-at-`` prefix) and no static key exists
+    anywhere in the file. Propagating that key would give the bot auth that
+    is already dead, and a copied oauth block cannot refresh (the refresh
+    chain is the hub profile's, single-use). The honest outcome: NO
+    honcho.json in the bot profile, NO memory.provider activation seed (a
+    bot without memory is correct; a bot that nags the user about OAuth is
+    not), and exactly one WARNING telling the operator how to fix it."""
+    import logging
+
+    (concierge_home / "honcho.json").write_text(
+        json.dumps(
+            {
+                "apiKey": "hch-at-expired-token",
+                "oauth": {"refreshToken": "hch-rt-secret", "expiresAt": 1},
+                "hosts": {"hermes": {"apiKey": "hch-at-also-oauth"}},
+            }
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="concierge.provision"):
+        binding = _provisioned(concierge_home, key="reminders")
+    profile_dir = concierge_home / "profiles" / binding["profile"]
+    assert not (profile_dir / "honcho.json").exists()
+    cfg = _yaml(profile_dir / "config.yaml")
+    assert cfg.get("memory", {}).get("provider") in (None, "")
+    assert "memory disabled" in caplog.text
+    assert "static Honcho key" in caplog.text
+    # one warning, not a log storm
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "memory disabled" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+
+
+def test_install_honcho_prefers_root_service_api_key(concierge_home):
+    """A root ``serviceApiKey`` (a static service key, e.g. one minted for
+    headless/bot use) beats the root ``apiKey`` — which may be the hub's
+    transient OAuth access token. Same static-only test as ``apiKey``: a
+    ``serviceApiKey`` that is itself an ``hch-at-`` token is rejected."""
+    (concierge_home / "honcho.json").write_text(
+        json.dumps(
+            {
+                "serviceApiKey": "svc-key",
+                "apiKey": "hch-at-oauth-token",
+            }
+        )
+    )
+    binding = _provisioned(concierge_home)
+    bot_cfg_path = concierge_home / "profiles" / binding["profile"] / "honcho.json"
+    assert bot_cfg_path.exists()
+    bot_cfg = json.loads(bot_cfg_path.read_text())
+    assert bot_cfg["apiKey"] == "svc-key"
+    assert "hch-at-oauth-token" not in bot_cfg_path.read_text()
+
+
+def test_install_honcho_falls_back_to_static_host_block_key(concierge_home):
+    """No root key (or only an OAuth root token), but the hub's active host
+    block (``hermes``) carries a STATIC key: that key works — the bot's host
+    lookup falls back to root apiKey, and a static key never refreshes or
+    expires. An oauth block on that host is never propagated."""
+    (concierge_home / "honcho.json").write_text(
+        json.dumps(
+            {
+                "apiKey": "hch-at-expired",
+                "hosts": {"hermes": {"apiKey": "hermes-static-key"}},
+            }
+        )
+    )
+    binding = _provisioned(concierge_home)
+    bot_cfg_path = concierge_home / "profiles" / binding["profile"] / "honcho.json"
+    assert bot_cfg_path.exists()
+    bot_cfg = json.loads(bot_cfg_path.read_text())
+    assert bot_cfg["apiKey"] == "hermes-static-key"
+    assert "hosts" not in bot_cfg and "oauth" not in bot_cfg
+    # the rejected OAuth token never reaches the bot file
+    assert "hch-at-expired" not in bot_cfg_path.read_text()
 
 
 def test_non_memory_bot_carries_no_memory_activation(concierge_home):
@@ -321,6 +478,58 @@ def test_non_memory_bot_carries_no_memory_activation(concierge_home):
     binding = _provisioned(concierge_home, key="researcher", channel_id="456")
     cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
     assert cfg.get("memory", {}).get("provider") in (None, "")
+
+
+def test_create_bot_pins_low_reasoning_effort(concierge_home):
+    """Live E2E (2026-09-27): with NO effort pinned, GLM-5.3-flash defaults to
+    thinking ON at the server default — a runaway 900s / 2.78 MB stream on a
+    trivial 'remind me in one minute'. Bots are single-tool-call agents; every
+    provisioned bot pins ``agent.reasoning_effort: low`` — the canonical key
+    every surface reads via ``hermes_constants.resolve_reasoning_config``
+    (per-model overrides > global), and 'low' is the GLM-5.3 vocabulary's
+    floor (agent/reasoning_effort.py GLM53_EFFORTS)."""
+    binding = _provisioned(concierge_home)
+    cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
+    assert cfg["agent"]["reasoning_effort"] == "low"
+    # the pin resolves to an explicit low effort for the bot's model — not
+    # None (the provider-default thinking the live E2E caught)
+    from hermes_constants import resolve_reasoning_config
+
+    assert resolve_reasoning_config(cfg) == {"enabled": True, "effort": "low"}
+
+
+def test_create_bot_disables_cron_response_wrapping(concierge_home):
+    """Live E2E (2026-09-27): cron deliveries arrived wrapped in 'Cronjob
+    Response: <name> (job_id: ...) ... to stop or manage this job' scaffolding
+    the user must never see. ``cron.wrap_response: False`` delivers the
+    model's final text VERBATIM (scheduler_delivery.py reads the key with
+    default True; hermes_cli/config_defaults.py registers it)."""
+    binding = _provisioned(concierge_home)
+    cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
+    assert cfg["cron"]["wrap_response"] is False
+
+
+def test_create_bot_is_answer_only_on_discord(concierge_home):
+    """Live E2E (2026-09-27): a provisioned bot with no ``display:`` section
+    fell back to the Discord platform tier default (TIER_HIGH) — ⚙️
+    tool-progress lines, ⏳ 'Working — N min' long-running notices, and
+    mid-turn interim commentary posted into the bot's channel. Bots must be
+    ANSWER-ONLY: the final response and nothing else. All three keys seed
+    False under ``display.platforms.discord``:
+
+    - ``tool_progress`` — _NORMALISERS['tool_progress'] (tristate) maps
+      False → 'off'; run_turn.py:3013 gates on
+      ``progress_mode not in {"off", "log"}``.
+    - ``long_running_notifications`` — _norm_long_running → False kills the
+      ⏳ status lines.
+    - ``interim_assistant_messages`` — _norm_bool → False suppresses
+      mid-turn assistant bubbles; the final answer is still delivered."""
+    binding = _provisioned(concierge_home)
+    cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
+    discord_display = cfg["display"]["platforms"]["discord"]
+    assert discord_display["tool_progress"] is False
+    assert discord_display["long_running_notifications"] is False
+    assert discord_display["interim_assistant_messages"] is False
 
 
 def test_create_bot_inherits_provider_resilience_config(concierge_home):

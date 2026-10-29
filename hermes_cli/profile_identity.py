@@ -114,14 +114,18 @@ def _purge_profile_identity(canon: str, live_mux: bool) -> bool:
             file=sys.stderr)
         return False
 
-    from hermes_cli.profiles import get_profile_dir
     from hermes_constants import get_default_hermes_root
     from hermes_state_registry import acquire, release_or_close
     root = get_default_hermes_root()
     purged = True
-    for db_path in (root / "state.db", get_profile_dir(canon) / "state.db"):
-        if not db_path.exists():
-            continue
+    # The DEFAULT root's state.db only. The profile's OWN state.db is deliberately not opened here:
+    # every caller that reaches this loop with the directory still present (delete_profile) has
+    # already tombstoned it — the tombstone is what satisfies the ``profile_exists`` refusal above —
+    # and the named-profile guard refuses to open a tombstoned home, so that leg could never run.
+    # Its rows are settled by the rmtree that follows the delete; a surviving row set after a failed
+    # rmtree stays unreachable behind the tombstone either way.
+    db_path = root / "state.db"
+    if db_path.exists():
         db = None
         try:
             db = acquire(db_path)

@@ -120,6 +120,38 @@ def test_rejects_interpreter_running_inline_source(cmd):
     assert matches_runtime(cmd) is False
 
 
+# The minted source launcher (hermes_cli/_launchers.py) runs its bootstrap inline and CONSUMES the
+# trailing argv in-process (``sys.exit(main())``): the tokens after the ``-c`` operand ARE this
+# process's argv, so a tail beginning with the ``gateway`` subcommand is the gateway itself. This
+# is the launchd/shim launch shape — a plain ``python -c <src> gateway run …`` must be recognised
+# (a live gateway invisible to live_gateway_pid_for_home pushed profile deletes into the CLI-side
+# durable identity purge a live multiplexer must own). A tail carrying interpreter options keeps
+# working the same way (the option walk lands on the same argv).
+LAUNCHER_ACCEPT = [
+    'python -I -c "import main_bootstrap" gateway run --external-supervisor',
+    'python -I -c "import main_bootstrap" gateway run',
+    'python -X utf8 -c "import main_bootstrap" gateway run --external-supervisor',
+    'python -c "import main_bootstrap" gateway restart',
+]
+
+
+@pytest.mark.parametrize("cmd", LAUNCHER_ACCEPT)
+def test_accepts_the_minted_launcher_consuming_its_own_argv(cmd):
+    assert matches_runtime(cmd) is True
+
+
+def test_launcher_tails_that_are_not_a_gateway_stay_rejected():
+    """The stderr_timestamp/serve launcher siblings consume argv the same way but are not
+    gateways; the watcher's spawn-later payload (target PID first) stays rejected too."""
+    assert matches_runtime(
+        'python -I -c "import main_bootstrap" serve --host 127.0.0.1 --port 0') is False
+    assert matches_runtime(
+        'python -I -c "import main_bootstrap" --run-module hermes_cli.stderr_timestamp '
+        "--error-log /logs/gateway.error.log -- "
+        "/Users/me/.hermes/hermes-agent/.hermes/bin/hermes gateway run") is False
+    assert matches_runtime('python -c "import main_bootstrap" 14980 hermes gateway run') is False
+
+
 # Spawn INTENT is the mirror image of process identity: the same wrapper that must not be read as a
 # live gateway MUST still be recognised as "launching this eventually produces a gateway runtime".
 # tests/_fixtures/live_system_guard.py relies on it — without this, the autouse guard stopped

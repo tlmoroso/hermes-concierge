@@ -20,6 +20,20 @@ class _OneTickStopEvent:
         return True
 
 
+class _IsSharedRouteAdapters:
+    """``==`` matcher: the other side is a SharedRouteAdapters view (whatever its contents)."""
+
+    def __eq__(self, other):
+        return isinstance(other, sched_preflight.SharedRouteAdapters)
+
+    def __repr__(self):
+        return "<any SharedRouteAdapters view>"
+
+
+def ANYInstanceOfSharedRouteAdapters():
+    return _IsSharedRouteAdapters()
+
+
 def test_gateway_housekeeping_drains_cron_delivery_with_live_adapters(monkeypatch):
     adapters = {"discord": object()}
     loop = object()
@@ -107,7 +121,9 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
         ("scope", root_home),
         ("drain", root_adapters),
         ("scope", secondary_home),
-        ("drain", secondary_adapters),
+        # A credentialless secondary drains through the SharedRouteAdapters view (never a bare
+        # {}), so its queued ORIGIN deliveries can ride the transport owner's adapter.
+        ("drain", ANYInstanceOfSharedRouteAdapters()),
     ]
 
 
@@ -135,7 +151,7 @@ def test_multiplex_housekeeping_uses_primary_routes_for_credentialless_satellite
         yield
 
     class FakeSharedRouteAdapters:
-        def __new__(cls, adapters, routes):
+        def __new__(cls, adapters, routes, process_adapters=None):
             calls.append(("routed", adapters, routes))
             return routed
 

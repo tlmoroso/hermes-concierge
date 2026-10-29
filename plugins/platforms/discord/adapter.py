@@ -1433,6 +1433,14 @@ class DiscordAdapter(DiscordMediaMixin, ConciergeDiscordMixin, BasePlatformAdapt
                 await adapter_self._concierge_on_guild_channel_create(channel)
 
             @self._client.event
+            async def on_guild_channel_delete(channel):
+                # Mirror of the create side: a deleted channel's registry
+                # entry is torn down (room key disbanded; a single-bot binding
+                # with no other channels retires+deletes the bot's profile).
+                # Registered unconditionally, gated inside the same way.
+                await adapter_self._concierge_on_guild_channel_delete(channel)
+
+            @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
@@ -5064,11 +5072,27 @@ class DiscordAdapter(DiscordMediaMixin, ConciergeDiscordMixin, BasePlatformAdapt
         return True
 
     def _discord_free_response_channels(self) -> set:
-        """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
-        raw = self.config.extra.get("free_response_channels")
-        if raw is None:
-            raw = self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS")
-        return self._gate_csv_set(raw)
+        """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit.
+
+        Unioned with the concierge bound/room channels (a provisioned bot OWNS its
+        channel: requiring an @mention of the shared hub identity there would make
+        the bot unusable and would @-summon the hub instead). The concierge hook is
+        a thin duck-typed indirection (adapter-side, like the shared history
+        formatter): the base set stays byte-identical when concierge is disabled,
+        unbound, or its registry is unreadable."""
+        base = self._gate_csv_set(
+            self.config.extra.get("free_response_channels")
+            if self.config.extra.get("free_response_channels") is not None
+            else self._gate_env("DISCORD_FREE_RESPONSE_CHANNELS"))
+        hook = getattr(self, "_concierge_free_response_channels", None)
+        if callable(hook):
+            try:
+                extra: Any = hook()
+                if extra:
+                    base = base | {str(c) for c in extra}
+            except Exception:
+                logger.debug("concierge free-response hook failed", exc_info=True)
+        return base
 
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract user-mention IDs (``<@ID>`` and legacy ``<@!ID>``) from raw content,

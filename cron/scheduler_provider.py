@@ -110,6 +110,33 @@ def _profile_cron_scope(home):
         reset_hermes_home_override(home_token)
 
 
+def _tick_adapters_for_profile(
+    profile_name, *, adapters=None, profile_adapters=None, default_profile=None,
+):
+    """Adapter view ONE multiplex tick of ``profile_name``'s store delivers through.
+
+    Isolation contract: deliver via the profile's OWN adapters; NEVER fall back to the default
+    profile's for arbitrary targets (wrong bot). A credentialless satellite (empty own map) gets
+    a ``SharedRouteAdapters`` view over the process's adapter registry: the PRIMARY adapter
+    serves exactly the targets an enabled primary route maps here, and — for the job's recorded
+    ORIGIN target only, multiplex active — an adapter owned by ANY other served profile in this
+    same process (the transport owner; a concierge bot holds its routine jobs in its own store
+    while the hub profile owns the shared Discord connection). Anything else fails closed
+    (delivery skipped this tick).
+    """
+    if profile_name is None or profile_name == default_profile:
+        return adapters
+    tick_adapters = (profile_adapters or {}).get(profile_name) or {}
+    if not tick_adapters:
+        from cron.scheduler_preflight import (
+            SharedRouteAdapters, _primary_profile_routes_for_current_home,
+        )
+        return SharedRouteAdapters(
+            adapters or {}, _primary_profile_routes_for_current_home(),
+            process_adapters=profile_adapters)
+    return tick_adapters
+
+
 class CronScheduler(ABC):
     """Decides WHEN a due cron job fires. Only ``name`` + ``start`` are required; keep every other
     hook NON-abstract with a safe default (``test_abc_growth_stays_additive``)."""
@@ -517,9 +544,6 @@ class InProcessCronScheduler(CronScheduler):
         heartbeated."""
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
-        from cron.scheduler_preflight import (
-            SharedRouteAdapters, _primary_profile_routes_for_current_home,
-        )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
 
@@ -533,15 +557,11 @@ class InProcessCronScheduler(CronScheduler):
         )
 
         def tick_adapters_for(profile_name):
-            # Deliver via the profile's OWN adapters; NEVER fall back to the default profile's
-            # (wrong bot). A credentialless satellite may ride the PRIMARY adapter only for targets
-            # an exact enabled route maps here; else fail closed (delivery skipped this tick).
-            if profile_name is None or profile_name == default_profile:
-                return adapters
-            tick_adapters = (profile_adapters or {}).get(profile_name) or {}
-            if not tick_adapters and adapters:
-                return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
-            return tick_adapters
+            # Delivered via ``_tick_adapters_for_profile`` (same construction the multiplex
+            # gateway uses; see that function for the isolation contract).
+            return _tick_adapters_for_profile(
+                profile_name, adapters=adapters, profile_adapters=profile_adapters,
+                default_profile=default_profile)
 
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's

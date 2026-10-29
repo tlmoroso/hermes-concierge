@@ -11,14 +11,20 @@ Task 4.1 discovery facts this module encodes (verified against the repo):
   ``hermes_cli/config.py::_normalize_root_model_keys`` normalizes everything to.
 - Honcho activation (Task 9.1, verified against the plugin's load chain):
   ``memory.provider: honcho`` in config.yaml — the key agent/agent_init.py
-  reads (``mem_config.get("provider")`` -> ``plugins.memory.
-  load_memory_provider``) and DEFAULT_CONFIG registers. The honcho.json copy
-  (``_install_honcho``) is CONNECTION config only (apiKey/baseUrl/environment/
-  workspace — plugins/memory/honcho/client.py ``resolve_config_path`` chain);
-  it activates nothing. Workspace and session strategy need NO seeding: they
-  default inside the plugin (workspace -> the profile host, client.py:283
-  ``look.pick("workspace") or host``; sessionStrategy -> "per-directory"), so
-  the verbatim copy already carries the hub's choices when it made any.
+  reads (``mem_config.get("provider")`` -> plugins.memory.
+  load_memory_provider) and DEFAULT_CONFIG registers. The bot's honcho.json
+  is SYNTHESIZED by ``_install_honcho`` from a STATIC service key (never a
+  byte-copy of the hub's file — OAuth grants are per-profile-host
+  single-use refresh chains and cannot survive a copy; see _install_honcho);
+  it is CONNECTION config only (apiKey/baseUrl/environment/workspace —
+  plugins/memory/honcho/client.py ``resolve_config_path`` chain) and
+  activates nothing. When no usable static key exists, the bot gets no
+  honcho.json and no memory.provider seed: a bot without memory beats a bot
+  with dead OAuth auth. Workspace and session strategy need NO seeding:
+  they default inside the plugin (workspace -> the profile host,
+  client.py:283 ``look.pick("workspace") or host``; sessionStrategy ->
+  "per-directory"), and the hub's root-level choices are carried into the
+  synthesized file when it made any.
 - Toolset allowlist: the TOP-LEVEL ``toolsets`` list (config_defaults.py:26,
   default ``["hermes-cli"]``); a turn under a bot profile needs only the
   blueprint's sets — the hub's Discord adapter owns the platform connection.
@@ -83,6 +89,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from hermes_yaml import safe_dump as _yaml_safe_dump
+from hermes_yaml import safe_load as _yaml_safe_load
 
 from hermes_time import now as _hermes_now
 from concierge import registry
@@ -93,7 +100,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.config import read_user_config_raw
 from hermes_cli.profile_channels import ChannelKeyIndex, strip_channel_env_file
 from hermes_cli.profiles import create_profile, get_profile_dir, validate_profile_name
-from utils import atomic_write_bytes, atomic_write_text
+from utils import atomic_json_write, atomic_write_bytes, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -225,23 +232,117 @@ def _install_skills(profile_dir: Path, skills: tuple, source_skills_dir: Path) -
             shutil.copytree(src, dst)
 
 
-def _install_honcho(profile_dir: Path) -> None:
-    """Bots learn the user over time via Honcho: copy the hub's honcho config
-    (plugins/memory/honcho config chain: $HERMES_HOME/honcho.json first).
+# Non-secret behavior tuning carried from the hub's honcho.json ROOT into the
+# bot's synthesized config. Deliberately exclude everything secret or
+# host-specific (apiKey variants, hosts blocks, oauth, endpoint credentials).
+_HONCHO_TUNING_KEYS = (
+    "workspace",
+    "saveMessages",
+    "sessionStrategy",
+    "dialecticCadence",
+    "writeFrequency",
+    "recallMode",
+    "observationMode",
+    "dialecticReasoningLevel",
+)
 
-    ``honcho.json`` carries the account's apiKey (root + host blocks), so the
-    copy is written with the atomic-secret mode — explicit 0o600, the mode the
-    Honcho plugin's own write path (``save_config`` -> ``atomic_json_write``)
-    pins; ``shutil.copyfile`` would land it at process umask (typically 0644).
-    Bytes are copied verbatim; every Honcho reader parses utf-8-sig, so a
-    source BOM survives as it would in place.
+
+def _static_honcho_key(raw: dict) -> Optional[str]:
+    """A usable STATIC service key from the hub's honcho.json, or None.
+
+    Preference order (mirrors how the bot will actually resolve auth —
+    _HostLookup.pick falls back to root): root ``serviceApiKey`` (a static
+    service key, e.g. minted for headless use), then root ``apiKey``, then
+    the apiKey of the hub's active host block (``hosts.hermes``, or
+    ``defaultHost`` when the file pins one — the same resolution
+    client.py::resolve_active_host applies to the default/hub profile).
+    Every candidate must pass ``is_oauth_access_token`` == False: an
+    ``hch-at-`` token is an OAuth access token that expires (and the
+    per-profile-host refresh chain cannot follow it into the bot's file) —
+    propagating one hands the bot auth that is already dead.
+    """
+    from plugins.memory.honcho.oauth import is_oauth_access_token
+
+    hosts = raw.get("hosts") or {}
+    active_host = str(raw.get("defaultHost") or "hermes").strip() or "hermes"
+    host_block = hosts.get(active_host) or {}
+    candidates = (
+        raw.get("serviceApiKey"),
+        raw.get("apiKey"),
+        host_block.get("apiKey"),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and not is_oauth_access_token(candidate):
+            return candidate
+    return None
+
+
+def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
+    """Synthesize the bot's honcho.json from a STATIC service key — NEVER a
+    byte-copy of the hub's file. Return True iff Honcho is usable for this
+    bot (honcho.json written); False means the caller must skip the
+    ``memory.provider: honcho`` activation seed too.
+
+    Why not copy (M5, the live incident): Honcho OAuth grants are
+    per-profile-host single-use refresh chains. The bot's profile host key
+    (``hermes_bot_<slug>_<suffix>``, plugins/memory/honcho/client.py::
+    profile_host_key) does not exist in a copied file, so the bot's host
+    lookup falls back to the ROOT apiKey — which, when the hub logged in via
+    OAuth, is an ``hch-at-`` access token that expires, with no oauth block
+    to refresh it: dead auth plus user-facing re-login nagging. A
+    synthesized config with ONLY a root static key works for ANY bot profile
+    name (client.py::_HostLookup.pick: host -> root fallback) and never
+    refreshes or expires (oauth.py::ensure_fresh_token returns (None, False)
+    when no oauth block exists — a static key is permanent by design).
+
+    The synthesized file carries: root ``apiKey`` = the static key, plus the
+    non-secret behavior tuning from the hub's root (_HONCHO_TUNING_KEYS).
+    Never: hosts blocks, oauth blocks, or any host-specific secret.
+
+    When NO usable static key exists (e.g. the hub's root apiKey is an
+    expired OAuth token — the incident shape), Honcho is SKIPPED for this
+    bot: no honcho.json, and the caller must not seed memory.provider. A bot
+    without memory is correct; a bot that nags the user about OAuth is not.
+    One WARNING tells the operator how to fix it.
+
+    The file is written with the atomic-secret mode — explicit 0o600, the
+    mode the Honcho plugin's own write path (``save_config`` ->
+    ``atomic_json_write``, mirrored by oauth.py::install_grant) pins; a
+    umask-default write would land it 0644.
     """
     hub_cfg = get_hermes_home() / "honcho.json"
     if not hub_cfg.is_file():
-        return
-    atomic_write_bytes(
-        profile_dir / "honcho.json", hub_cfg.read_bytes(), mode=0o600
-    )
+        # No hub Honcho config at all: the blueprint's memory intent stays
+        # unactivated rather than seeding a provider with no connection.
+        return False
+    try:
+        raw = _yaml_safe_load(hub_cfg.read_text(encoding="utf-8-sig")) or {}
+    except Exception:
+        logger.warning(
+            "concierge: hub honcho.json is unreadable for bot %s — memory disabled",
+            profile_name, exc_info=True,
+        )
+        return False
+    if not isinstance(raw, dict):
+        logger.warning(
+            "concierge: hub honcho.json is not a config object for bot %s — memory disabled",
+            profile_name,
+        )
+        return False
+    static_key = _static_honcho_key(raw)
+    if static_key is None:
+        logger.warning(
+            "concierge: no usable static Honcho key for bot %s — memory disabled "
+            "(run honcho setup with an API key on the hub)",
+            profile_name,
+        )
+        return False
+    bot_cfg: Dict = {"apiKey": static_key}
+    for key in _HONCHO_TUNING_KEYS:
+        if key in raw:
+            bot_cfg[key] = raw[key]
+    atomic_json_write(profile_dir / "honcho.json", bot_cfg, mode=0o600)
+    return True
 
 
 def _seed_credentials(profile_dir: Path) -> Dict[str, list]:
@@ -422,15 +523,55 @@ def create_bot(
                 "model.default": model.model,  # canonical pin (config.py::_normalize_root_model_keys)
                 "model.provider": model.provider,
                 "toolsets": list(bp.toolsets),  # top-level allowlist key
+                # On-rails bot behavior (live E2E 2026-09-27):
+                # - Low reasoning: with NO effort pinned, GLM-5.3-flash thinks
+                #   at the server default — a runaway 900s/2.78MB stream on a
+                #   trivial reminder. Bots are single-tool-call agents; 'low'
+                #   is the GLM-5.3 vocabulary's floor (GLM53_EFFORTS) and the
+                #   canonical key read via hermes_constants.resolve_reasoning_config
+                #   (per-model overrides > this global).
+                "agent.reasoning_effort": "low",
+                # - Verbatim cron delivery: scheduler_delivery.py reads
+                #   ``cron.wrap_response`` (default True) and wraps routine
+                #   output in 'Cronjob Response: <name> (job_id: ...)' +
+                #   'to stop or manage' scaffolding the user must never see.
+                #   False delivers the model's final text bare.
+                "cron.wrap_response": False,
+                # - Answer-only bots (live E2E 2026-09-27): with no
+                #   ``display:`` section, per-turn display resolution
+                #   (gateway/run_turn.py::_resolve_turn_display) falls back to
+                #   the Discord platform tier default — TIER_HIGH — which posts
+                #   intermediate chatter into the bot's channel: ⚙️ tool
+                #   progress, ⏳ 'Working — N min' notices, and mid-turn
+                #   interim assistant messages. Seed False for all three under
+                #   display.platforms.discord: the tristate normaliser maps
+                #   False → 'off' (gateway/display_config.py::_NORMALISERS),
+                #   consumed at gateway/run_turn.py:3013
+                #   (``tool_progress_enabled = progress_mode not in
+                #   {"off","log"}``); the final answer is still delivered.
+                "display.platforms.discord.tool_progress": False,
+                "display.platforms.discord.long_running_notifications": False,
+                "display.platforms.discord.interim_assistant_messages": False,
             }
-            if bp.memory_provider == "honcho":
+            # 5) long-lived memory: Honcho — SYNTHESIZED from a static service
+            #    key (never a byte-copy of the hub's OAuth-bearing file; see
+            #    _install_honcho). The install runs BEFORE the config seed
+            #    consults its verdict: when no usable static key exists the
+            #    bot gets NO honcho.json AND NO memory.provider activation —
+            #    a bot without memory is correct; a bot that nags the user
+            #    about OAuth re-login is not.
+            honcho_installed = (
+                bp.memory_provider == "honcho"
+                and _install_honcho(profile_dir, profile_name)
+            )
+            if honcho_installed:
                 # The Honcho ACTIVATION key (Task 9.1, verified against the
                 # plugin's load chain — not guessed): ``memory.provider`` is
                 # what agent/agent_init.py reads
                 # (``mem_config.get("provider")`` -> plugins.memory.
                 # load_memory_provider) and what DEFAULT_CONFIG registers
                 # (hermes_cli/config_defaults.py, "memory" -> "provider").
-                # The honcho.json copied in step 5 is CONNECTION config only —
+                # The honcho.json written just above is CONNECTION config only —
                 # without this key the plugin never loads and the bot remembers
                 # nothing across sessions.
                 config_seeds["memory.provider"] = "honcho"
@@ -451,9 +592,8 @@ def create_bot(
                 Path(source_skills_dir) if source_skills_dir else get_hermes_home() / "skills",
             )
 
-            # 5) long-lived memory: Honcho
-            if bp.memory_provider == "honcho":
-                _install_honcho(profile_dir)
+            # 5) long-lived memory: Honcho — installed above (before the config
+            #    seed, whose memory.provider activation depends on its verdict)
 
             # 5b) credentials: profiles are credential islands (no inheritance) — seed
             #     provider keys from the hub, minus every channel setting (the clone

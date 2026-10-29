@@ -30,9 +30,13 @@ Gates, in order:
    under multiplexing, so a stamp here would profile-namespace session keys
    while the agent still ran in ``agent:main`` — routing inert AND lying in
    session metadata).
-3. A ``source.profile`` already stamped (explicit ``gateway.profile_routes``
-   entry, or a secondary adapter's owner profile) → config.yaml is
-   authoritative over the runtime registry; the registry only fills in.
+3. A ``source.profile`` stamped with a profile OTHER than the adapter's
+   owner profile (an explicit ``gateway.profile_routes`` match) → config.yaml
+   is authoritative over the runtime registry; the registry only fills in.
+   A stamp EQUAL to the owner profile is the base's DEFAULT (it stamps
+   ``... or owner_profile`` whenever no route matched), not a decision: the
+   registry verdict still applies (the 2026-09-27 live bug was gate 3
+   reading that default as decided and never consulting the registry).
 4. A ``profile_route_rejected`` source → the fail-closed drop stands; the
    registry never resurrects a rejected route.
 
@@ -261,10 +265,28 @@ def _profile_exists(profile: str) -> "tuple[bool, str | None]":
     raises ValueError inside ``profile_exists`` and the answer is simply
     "does not exist" — the same verdict ``_profile_name_for_source``'s
     served-set gate would give.
-    """
-    try:
-        from hermes_cli.profiles import profile_exists
 
+    The failure verdict needs an explicit ``os.stat`` probe:
+    ``profile_exists`` checks liveness with ``Path.is_dir()``/``is_file()``,
+    which swallow OSError (EACCES reads as "absent" on 3.12+), so without the
+    probe the stat_error branch — and the operator-facing
+    "could not be checked" diagnosis — could never fire.
+    """
+    import os
+
+    try:
+        from hermes_cli.profiles import get_profile_dir, profile_exists
+
+        try:
+            profile_dir = get_profile_dir(profile)  # ValueError → invalid name
+        except ValueError:
+            return False, None
+        try:
+            os.stat(profile_dir)
+        except FileNotFoundError:
+            return False, None  # clean absence: the retired-bot diagnosis
+        except OSError as exc:
+            return False, repr(exc)  # the check failed: EACCES, EIO, ...
         return profile_exists(profile), None
     except OSError as exc:
         return False, repr(exc)
@@ -322,10 +344,21 @@ class ConciergeDiscordMixin:
             return super().build_source(*args, **kwargs)
 
         # The config seam runs first (inside base build_source); the registry
-        # only fills in when it left ``source.profile`` unset.
+        # only fills in when the config seam made NO decision.
         source = super().build_source(*args, **kwargs)
-        # Gate 3 — an explicit config route / secondary owner already decided.
-        if getattr(source, "profile", None):
+        # Gate 3 — an explicit config route already decided. The base stamps
+        # ``source.profile`` with the adapter's OWNER profile whenever no
+        # ``gateway.profile_routes`` entry matched (``... or owner_profile``),
+        # so a stamp EQUAL to ``_owner_profile`` is the DEFAULT, not a
+        # decision: under a multiplex hub with no routes it is set on every
+        # source, and reading it as "decided" would short-circuit the registry
+        # lookup entirely — the live 2026-09-27 bug (a bot-bound channel
+        # answered by the hub because gate 3 mistook the default stamp for a
+        # config verdict). Only a stamp that DIFFERS from the owner profile is
+        # a real ``profile_routes`` match and stays authoritative over the
+        # runtime registry.
+        stamped_profile = getattr(source, "profile", None)
+        if stamped_profile and stamped_profile != getattr(self, "_owner_profile", None):
             return source
         # Gate 4 — a rejected route's fail-closed drop stands.
         if getattr(source, "profile_route_rejected", False) is True:
@@ -858,6 +891,32 @@ class ConciergeDiscordMixin:
         except Exception:
             return False
 
+    @staticmethod
+    def _concierge_channel_is_forum(channel) -> bool:
+        """Best-effort forum-channel detection for the channel-create
+        auto-offer skip — the same verdict the adapter's
+        ``_is_forum_parent`` gives (``isinstance`` against
+        ``discord.ForumChannel``, else Discord's channel-type value 15),
+        duck-typed so the mixin stays importable and testable without the
+        adapter class present. False when discord.py or the channel cannot
+        answer: the picker is attempted exactly as before (never a silent
+        skip on an unknowable channel)."""
+        if channel is None:
+            return False
+        try:
+            import discord
+
+            forum_cls = getattr(discord, "ForumChannel", None)
+            if forum_cls is not None and isinstance(channel, forum_cls):
+                return True
+        except Exception:
+            return False
+        channel_type = getattr(channel, "type", None)
+        if channel_type is None:
+            return False
+        type_value = getattr(channel_type, "value", channel_type)
+        return type_value == 15
+
     async def _concierge_wait_for_member_turn(self, member_event) -> None:
         """Wait until the member's session is quiescent (its turn — and any
         follow-up drain that replaced the task — finished) before the next
@@ -959,6 +1018,27 @@ class ConciergeDiscordMixin:
                 {"concierge": section} if isinstance(section, dict) else None)
         except Exception:
             return None
+
+    def _concierge_free_response_channels(self):
+        """Bound + room channel ids for the adapter's free-response union.
+
+        The registry is the routing source of truth: a channel with a bot
+        binding or a room membership OWNS its conversation, so the hub
+        identity must answer there without an @mention (admission's
+        no-mention drop would otherwise make every provisioned bot
+        unreachable — the 2026-09-27 live E2E bug). Runs on the admission
+        path, so it must be cheap and NEVER raise (unreadable registry =
+        no extra channels, one warning per path is the adapter's)."""
+        try:
+            from concierge import registry
+
+            reg = registry.load_registry()
+            channels = set(reg.get("bindings", {}).keys())
+            channels.update(reg.get("rooms", {}).keys())
+            return channels
+        except Exception:
+            logger.debug("concierge free-response lookup failed", exc_info=True)
+            return ()
 
     def _concierge_events_wanted(self) -> bool:
         """Gate for the whole command/event surface: enabled AND multiplexed
@@ -1186,8 +1266,10 @@ class ConciergeDiscordMixin:
 
     def _concierge_component_auth(self, interaction) -> bool:
         """User/role gate for concierge component clicks (picker, confirm
-        buttons) — the adapter's own component gate when available (the mixin
-        may sit on a bare adapter in tests), else the hub allowlists."""
+        buttons). Uses the adapter module's own ``_component_check_auth``
+        (the same gate the adapter's approval/model-picker views use) with
+        THIS adapter's allowlist sets; a bare/duck-typed adapter in tests may
+        still provide ``_component_check_auth`` as an attribute, which wins."""
         checker = getattr(self, "_component_check_auth", None)
         if callable(checker):
             try:
@@ -1197,7 +1279,14 @@ class ConciergeDiscordMixin:
                     getattr(self, "_allowed_role_ids", set())))
             except Exception:
                 return False
-        return False
+        try:
+            from plugins.platforms.discord import adapter as _adapter_mod
+            return bool(_adapter_mod._component_check_auth(
+                interaction,
+                getattr(self, "_allowed_user_ids", set()),
+                getattr(self, "_allowed_role_ids", set())))
+        except Exception:
+            return False
 
     async def _concierge_provision_from_interaction(
         self, interaction, blueprint_key: str, *, source_view=None,
@@ -1288,6 +1377,18 @@ class ConciergeDiscordMixin:
                 # the ephemeral reply above is visible to the clicker only.
                 await self._concierge_greet_created_channel(
                     created_channel_id, title)
+            elif (plan.mode == "bind" and not already
+                    and self._concierge_channel_is_thread(
+                        getattr(interaction, "channel", None))):
+                # Forum-post provisioning (a Discord forum post IS a thread):
+                # the live 2026-09-27 bug — a BIND into a thread never posted
+                # the confirmation INTO the thread, because the greeting
+                # branch above is gated on channel creation. Post it through
+                # the same best-effort channel-send path, then seed the newly
+                # bound bot with the post's opening content. Fresh
+                # provisions only (``already``): a re-selection of an
+                # existing binding must not re-run the seed turn.
+                await self._concierge_greet_thread(interaction, title)
             if source_view is not None:
                 try:
                     for child in getattr(source_view, "children", []) or []:
@@ -1409,19 +1510,125 @@ class ConciergeDiscordMixin:
         await self._concierge_post_to_channel(
             channel_id, f"✅ **{title}** is live here — say hi!")
 
-    async def _concierge_post_to_channel(self, channel_id, text: str) -> None:
+    async def _concierge_greet_thread(self, interaction, title: str) -> None:
+        """The forum-post greeting (the thread-bind counterpart of
+        ``_concierge_greet_created_channel``): post the confirmation INTO
+        the thread through the same best-effort send, then seed the newly
+        bound bot with the post's opening content.
+
+        Why both ride here: a forum post's body is written at creation —
+        BEFORE the binding existed — so it can never arrive as a routed
+        message; without an explicit seed the new bot sits silent until the
+        user types a second message (the live 2026-09-27 bug). The seed
+        reuses the room fan-out's member-turn machinery (fresh source
+        stamped with the bound profile, dispatched through the REAL
+        ``super().handle_message``) — NO second turn mechanism. Best
+        effort, error-isolated: neither a greeting failure nor a seed
+        failure may fail the provisioning that already succeeded."""
+        channel_id = self._concierge_interaction_channel_id(interaction)
+        await self._concierge_post_to_channel(
+            channel_id, f"✅ **{title}** is live here — say hi!",
+            channel=getattr(interaction, "channel", None))
+        await self._concierge_seed_thread_opening(interaction, channel_id)
+
+    async def _concierge_seed_thread_opening(self, interaction,
+                                             channel_id) -> None:
+        """One seed turn for a freshly thread-bound bot, carrying the post's
+        opening message (the starter message the user wrote at post
+        creation — content that predates the binding and therefore can
+        never reach the bot as a routed message).
+
+        The turn rides the EXISTING dispatch: a source built through the
+        REAL ``build_source`` (the concierge routing seam stamps the bound
+        profile exactly as for any later thread message — the registry
+        binding was just written), a MessageEvent carrying the starter
+        content, dispatched via ``handle_message`` — canonicalization,
+        profile-namespaced session key, busy guard and the runner's
+        profile runtime scope all run as for any bound-channel message,
+        and the reply lands in the thread through the same delivery path
+        (the faaf55aac2 cross-profile origin-delivery fix). Spawns the same
+        way the room fan-out driver does (returns fast, work on a task),
+        then waits bounded for the seed turn so provisioning completes.
+        Never raises: a seed failure is logged, never a provisioning one."""
+        try:
+            thread = getattr(interaction, "channel", None)
+            if thread is None or channel_id is None:
+                return
+            # The post's opening content: the starter message the thread
+            # carries (discord.py forum threads expose it as
+            # ``starter_message``; older surfaces fetch by id). Missing
+            # content means there is nothing to seed — the greeting already
+            # told the user to say hi.
+            content = None
+            starter = getattr(thread, "starter_message", None)
+            if starter is not None:
+                content = getattr(starter, "content", None)
+            if not (content or "").strip():
+                logger.debug(
+                    "[%s] concierge: forum post %s has no opening message "
+                    "to seed; the greeting stands alone",
+                    getattr(self, "name", "discord"), channel_id)
+                return
+
+            from gateway.platforms.event import MessageEvent, MessageType
+
+            channel_name = getattr(thread, "name", "") or ""
+            parent = getattr(thread, "parent", None)
+            parent_id = (str(getattr(parent, "id", "") or "")
+                         if parent is not None else None)
+            source = self.build_source(
+                chat_id=str(channel_id), chat_name=channel_name,
+                chat_type="thread",
+                user_id=str(getattr(interaction, "user_id", "")
+                            or getattr(getattr(interaction, "user", None),
+                                      "id", "") or ""),
+                user_name=getattr(getattr(interaction, "user", None),
+                                  "display_name", None),
+                thread_id=str(channel_id),
+                guild_id=self._concierge_interaction_guild_id(interaction),
+                parent_chat_id=parent_id,
+            )
+            event = MessageEvent(
+                text=str(content), message_type=MessageType.TEXT,
+                source=source, raw_message=thread,
+            )
+            task = asyncio.create_task(self.handle_message(event))
+            background = getattr(self, "_background_tasks", None)
+            if background is not None:
+                try:
+                    background.add(task)
+                    task.add_done_callback(background.discard)
+                except Exception:
+                    pass
+            logger.info(
+                "[%s] concierge: seeded the forum post %s opening content "
+                "into the newly bound bot",
+                getattr(self, "name", "discord"), channel_id)
+        except Exception as e:
+            logger.warning(
+                "[%s] concierge: could not seed the forum post's opening "
+                "content for channel %s; the bot stays available for the "
+                "next message: %s",
+                getattr(self, "name", "discord"), channel_id, e)
+
+
+    async def _concierge_post_to_channel(self, channel_id, text: str,
+                                         channel=None) -> None:
         """Best-effort non-ephemeral post into a channel (the created-channel
-        greeting and the room greeting share it): resolved through the hub's
-        own client, never raises, and a post that cannot be sent is logged
-        and skipped — the command that triggered it already succeeded."""
-        client = getattr(self, "_client", None)
-        channel = None
-        if client is not None and channel_id is not None \
-                and hasattr(client, "get_channel"):
-            try:
-                channel = client.get_channel(int(channel_id))
-            except Exception:
-                channel = None
+        greeting, the forum-post greeting and the room greeting share it):
+        the destination resolved from an in-hand ``channel`` object when the
+        caller holds one (the thread-bind path does — the interaction's
+        channel IS the thread), else through the hub's own client. Never
+        raises, and a post that cannot be sent is logged and skipped — the
+        command that triggered it already succeeded."""
+        if channel is None:
+            client = getattr(self, "_client", None)
+            if client is not None and channel_id is not None \
+                    and hasattr(client, "get_channel"):
+                try:
+                    channel = client.get_channel(int(channel_id))
+                except Exception:
+                    channel = None
         try:
             if channel is None or not hasattr(channel, "send"):
                 logger.warning(
@@ -1766,6 +1973,67 @@ class ConciergeDiscordMixin:
         for member in list(registry.room_members(channel_id)):
             registry.remove_from_room(channel_id, member)
 
+    # ── channel-delete auto-teardown ────────────────────────────────────────
+
+    async def _concierge_on_guild_channel_delete(self, channel) -> None:
+        """``on_guild_channel_delete``: the mirror of the create-side
+        auto-offer. A deleted channel's registry entry is torn down; a
+        single-bot binding whose profile has NO other bound channels is
+        retired with ``retire_bot(delete_profile=True)`` — a bot with nowhere
+        left to answer is an orphan no retire picker can list. A room channel
+        keeps its member bots (each is still bound to its own channel); only
+        the room key dies. Never raises: broadcast event, same contract as
+        the create-side handler."""
+        try:
+            if not self._concierge_events_wanted():
+                return
+            from concierge import registry
+
+            chan_id = getattr(channel, "id", None)
+            if chan_id is None:
+                return
+            cid = str(chan_id)
+            binding = registry.get_binding(cid)
+            room = registry.room_members(cid)
+            if binding is None and not room:
+                return
+
+            def _teardown():
+                if room:
+                    # Members stay bound to their own channels — disband the
+                    # room key only.
+                    self._concierge_disband_room_members(cid)
+                    return None
+                profile = str((binding or {}).get("profile", ""))
+                if not profile:
+                    registry.unbind_channel(cid)
+                    return None
+                # Retire ONLY when the deleted channel was the bot's last:
+                # retire_bot's own order (pause → delete → unbind LAST) is
+                # what keeps a mid-teardown crash retryable, so this path
+                # never unbinds ahead of it.
+                remaining = [c for c in registry.channels_for_profile(profile)
+                             if c != cid]
+                if remaining:
+                    registry.unbind_channel(cid)
+                    return None
+                from concierge import provision
+
+                provision.retire_bot(profile, delete_profile=True)
+                return profile
+
+            profile = await asyncio.to_thread(_teardown)
+            if profile:
+                logger.info(
+                    "[%s] concierge: channel %s deleted — retired+deleted bot "
+                    "%s (no bound channels left)",
+                    getattr(self, "name", "discord"), cid, profile)
+        except Exception:
+            logger.warning(
+                "[%s] concierge: could not tear down a deleted channel's "
+                "registry entry",
+                getattr(self, "name", "discord"), exc_info=True)
+
     # ── /bot list ───────────────────────────────────────────────────────────
 
     async def _concierge_cmd_list(self, interaction) -> None:
@@ -2103,9 +2371,27 @@ class ConciergeDiscordMixin:
         """``on_guild_channel_create``: a new channel in a managed category
         gets the blueprint picker posted into it (non-ephemeral — anyone in
         the channel can click). Never raises: this is a broadcast event, and a
-        picker failure must not affect anything else listening."""
+        picker failure must not affect anything else listening.
+
+        FORUM channels are skipped silently (DEBUG only): Discord rejects
+        plain messages in a forum channel (only posts/threads carry
+        messages), so a picker send would 400 — the noise the 2026-09-27
+        live E2E surfaced. A forum channel's OFFERS are owned by the
+        thread-create flow (``_concierge_on_thread_create`` fires for each
+        new forum post), so skipping here loses nothing. Detection is the
+        adapter's own best-effort ``_is_forum_parent`` (isinstance
+        discord.ForumChannel, else channel type 15); False when unknowable
+        keeps the existing text-channel auto-offer byte-identical."""
         try:
             if not self._concierge_events_wanted():
+                return
+            if self._concierge_channel_is_forum(channel):
+                logger.debug(
+                    "[%s] concierge: new channel %s is a forum channel; "
+                    "skipping the bot picker (forum posts get their own "
+                    "offer via the thread-create flow)",
+                    getattr(self, "name", "discord"),
+                    getattr(channel, "id", "?"))
                 return
             settings = self._concierge_settings_obj()
             category_id = getattr(channel, "category_id", None) or getattr(

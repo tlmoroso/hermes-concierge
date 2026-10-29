@@ -42,7 +42,10 @@ interaction plumbing is the Task 5.6 manual E2E's job.
 
 import asyncio
 import logging
+import socket
 import threading
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +85,20 @@ def rig(tmp_path, monkeypatch):
         (root / "profiles" / name / ".env").write_text("K=1\n")
     monkeypatch.setenv("HERMES_HOME", str(root))
     (root / "concierge").mkdir()
+
+    # Live-install location artifact: gateway/run.py imports hermes_bootstrap,
+    # whose MODULE-LEVEL PM activation stats the REAL ~/.hermes/manifest.json
+    # when the checkout lives inside the home (a live install; CI's checkout
+    # sits outside the home, so the bootstrap's activation is a no-op there) —
+    # tripping tests/home_io_guard at fixture setup. Stub the module BEFORE
+    # the import: the only symbol gateway.run's import chain pulls is
+    # ``_happy_eyeballs_create_connection`` (agent/process_bootstrap.py),
+    # satisfied with a plain socket.create_connection fallback. Same shape
+    # gateway/run.py already tolerates for an unregistered bootstrap
+    # (except ModuleNotFoundError).
+    _bootstrap = types.ModuleType("hermes_bootstrap")
+    _bootstrap._happy_eyeballs_create_connection = socket.create_connection
+    sys.modules.setdefault("hermes_bootstrap", _bootstrap)
 
     from gateway.run import GatewayRunner
 
@@ -718,6 +735,111 @@ def test_auto_offer_survives_a_send_failure(rig):
         "hub_profile": "concierge"}
 
     _run(rig.adapter._concierge_on_guild_channel_create(_Exploding()))  # no raise
+
+
+# ── channel-delete auto-teardown ───────────────────────────────────────────
+
+
+def test_channel_delete_retires_and_deletes_a_last_channel_bot(rig, monkeypatch):
+    """A deleted channel bound to a bot with NO other channels retires the
+    bot with delete_profile=True — a bot with nowhere left to answer is an
+    orphan no retire picker can list."""
+    registry.bind_channel("700", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+    retired = []
+
+    def fake_retire(profile, *, delete_profile=False):
+        retired.append((profile, delete_profile))
+        # The real retire_bot's own contract: unbind LAST.
+        registry.unbind_channel("700")
+
+    from concierge import provision
+
+    monkeypatch.setattr(provision, "retire_bot", fake_retire)
+
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=700)))
+
+    assert retired == [("bot-reminders-a1b2", True)]
+    assert registry.get_binding("700") is None
+
+
+def test_channel_delete_keeps_a_bot_with_other_channels(rig, monkeypatch):
+    """A bot bound to several channels loses only the deleted channel's
+    binding — it still answers elsewhere, so its profile stays."""
+    registry.bind_channel("700", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+    registry.bind_channel("701", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+    retired = []
+
+    from concierge import provision
+
+    monkeypatch.setattr(
+        provision, "retire_bot",
+        lambda profile, *, delete_profile=False: retired.append(profile))
+
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=700)))
+
+    assert retired == []
+    assert registry.get_binding("700") is None
+    assert registry.get_binding("701") is not None
+
+
+def test_channel_delete_disbands_a_room_without_touching_members(rig,
+                                                                 monkeypatch):
+    """A deleted ROOM channel tears down the room key only — member bots
+    keep their own bindings and profiles."""
+    registry.bind_channel("800", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+    registry.create_room("900", ["bot-reminders-a1b2", "bot-researcher-b2c3"])
+    retired = []
+
+    from concierge import provision
+
+    monkeypatch.setattr(
+        provision, "retire_bot",
+        lambda profile, *, delete_profile=False: retired.append(profile))
+
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=900)))
+
+    assert retired == []
+    assert registry.room_members("900") == []
+    assert registry.get_binding("800") is not None
+
+
+def test_channel_delete_ignores_unbound_and_disabled(rig):
+    """An unbound channel is a no-op, and a disabled concierge never touches
+    the registry (same gate as the create-side auto-offer)."""
+    registry.bind_channel("700", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=999)))
+    assert registry.get_binding("700") is not None
+
+    _disable(rig)
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=700)))
+    assert registry.get_binding("700") is not None
+
+
+def test_channel_delete_survives_a_teardown_failure(rig, monkeypatch):
+    """A broadcast event handler never raises — even when the retire blows
+    up mid-teardown (a retry finishes the job: retire_bot's own order)."""
+    registry.bind_channel("700", profile="bot-reminders-a1b2",
+                          blueprint="reminders")
+
+    from concierge import provision
+
+    def boom(profile, *, delete_profile=False):
+        raise RuntimeError("teardown exploded")
+
+    monkeypatch.setattr(provision, "retire_bot", boom)
+    _run(rig.adapter._concierge_on_guild_channel_delete(
+        SimpleNamespace(id=700)))  # no raise
 
 
 # ── Task 5.5: on_thread_create chaining ────────────────────────────────────
@@ -1853,3 +1975,50 @@ def test_connect_is_gated_like_bot_and_room(rig, monkeypatch):
     interaction = _FakeInteraction()
     _run(rig.adapter._concierge_cmd_connect(interaction, None))
     assert interaction.response.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Real component-auth gate (regression: the 2026-09-27 live-deny bug)
+# ---------------------------------------------------------------------------
+
+class TestRealComponentAuthGate:
+    """The picker/confirm auth must work on the REAL adapter shape.
+
+    Live bug (2026-09-27 E2E): ``_component_check_auth`` is a MODULE function
+    on the adapter, never an instance attribute/method, so the mixin's
+    ``getattr(self, "_component_check_auth", None)`` resolved to None and the
+    gate returned False for EVERY user — every picker click got "You're not
+    allowed to use this." The handler tests above stub
+    ``_concierge_component_auth``, so they never exercised the real delegate;
+    these tests pin the real-class behavior without the stub.
+    """
+
+    def _rig_adapter(self, tmp_path, monkeypatch, allowed):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = object.__new__(DiscordAdapter)
+        adapter.gateway_runner = None
+        adapter._allowed_user_ids = set(allowed)
+        adapter._allowed_role_ids = set()
+        return adapter
+
+    def _interaction_for(self, uid):
+        return SimpleNamespace(user=SimpleNamespace(id=uid, roles=None))
+
+    def test_allowed_user_passes_the_real_gate(self, tmp_path, monkeypatch):
+        adapter = self._rig_adapter(tmp_path, monkeypatch, ["1551304278537150584"])
+        assert adapter._concierge_component_auth(
+            self._interaction_for(1551304278537150584)) is True
+
+    def test_stranger_is_denied_by_the_real_gate(self, tmp_path, monkeypatch):
+        adapter = self._rig_adapter(tmp_path, monkeypatch, ["1551304278537150584"])
+        assert adapter._concierge_component_auth(
+            self._interaction_for(1111111111111111111)) is False
+
+    def test_allow_all_env_passes_the_real_gate(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord import adapter as adapter_mod
+        adapter = self._rig_adapter(tmp_path, monkeypatch, [])
+        monkeypatch.setattr(
+            adapter_mod, "_scoped_gate_env",
+            lambda key, default="": "true" if key == "DISCORD_ALLOW_ALL_USERS" else default)
+        assert adapter._concierge_component_auth(
+            self._interaction_for(2222222222222222222)) is True

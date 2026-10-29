@@ -24,12 +24,16 @@ Contracts:
 Real imports against a temp HERMES_HOME (AGENTS.md: E2E validation, not mocks).
 """
 
+import io
 import logging
+import socket
+import sys
+import types
 from types import SimpleNamespace
 
 import asyncio
 import pytest
-import yaml
+from ruamel.yaml import YAML
 
 from concierge import registry
 from concierge.settings import concierge_settings
@@ -66,6 +70,20 @@ def concierge_rig_base(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(root))
     (root / "concierge").mkdir(exist_ok=True)
 
+    # Live-install location artifact: gateway/run.py imports hermes_bootstrap,
+    # whose MODULE-LEVEL PM activation stats the REAL ~/.hermes/manifest.json
+    # when the checkout lives inside the home (a live install; CI's checkout
+    # sits outside the home, so the bootstrap's activation is a no-op there) —
+    # tripping tests/home_io_guard at fixture setup. Stub the module BEFORE
+    # the import: the only symbol gateway.run's import chain pulls is
+    # ``_happy_eyeballs_create_connection`` (agent/process_bootstrap.py),
+    # satisfied with a plain socket.create_connection fallback. Same shape
+    # gateway/run.py already tolerates for an unregistered bootstrap
+    # (except ModuleNotFoundError).
+    _bootstrap = types.ModuleType("hermes_bootstrap")
+    _bootstrap._happy_eyeballs_create_connection = socket.create_connection
+    sys.modules.setdefault("hermes_bootstrap", _bootstrap)
+
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
@@ -101,8 +119,11 @@ def _set_concierge_config(root, *, enabled: bool) -> None:
     adapter seam reads the section from ``gateway_runner.config`` (M5b review:
     no config-file read on the message path), so a test that flips the file
     must flip the in-hand section too."""
-    (root / "config.yaml").write_text(
-        yaml.safe_dump({"concierge": {"enabled": enabled}}), encoding="utf-8")
+    # ruamel (the repo's canonical YAML lib): pyyaml is not in the canonical
+    # test environment (it only enters uv.lock via the ML extras stack).
+    buf = io.StringIO()
+    YAML(typ="safe").dump({"concierge": {"enabled": enabled}}, buf)
+    (root / "config.yaml").write_text(buf.getvalue(), encoding="utf-8")
     runner = _RUNNER_HOLDER.get("runner")
     if runner is not None:
         runner.config.concierge = {"enabled": enabled}
@@ -285,6 +306,113 @@ def test_registry_fill_in_when_no_config_route(concierge_rig):
     source = _source(rig.adapter, guild_id="42")
 
     assert source.profile == "bot-reminders-a1b2"
+
+
+# ── GATE 3 vs THE BASE'S OWNER-PROFILE DEFAULT STAMP (2026-09-27 live bug) ──
+#
+# BasePlatformAdapter.build_source now ALWAYS stamps source.profile with the
+# adapter's OWNER profile when no gateway.profile_routes entry matched
+# (``profile = ... or owner_profile``), so under a multiplex hub with no
+# routes the stamp is set on EVERY source. Gate 3 must not read that default
+# as "an explicit route decided" — the registry verdict still applies.
+
+
+def _owned_rig(rig, owner="concierge"):
+    """Give the adapter an owning multiplex profile the way a real hub
+    gateway does (run_adapters._configure_profile_adapter →
+    set_owner_profile, BEFORE any inbound event)."""
+    rig.adapter.set_owner_profile(owner)
+    return rig
+
+
+def test_owner_stamp_still_rehomes_to_registry_binding(concierge_rig):
+    """THE live-bug regression (2026-09-27): channel 1553811860749422703,
+    bound to a ``reminders`` bot profile, was answered by the HUB because the
+    base stamped the owner profile onto ``source.profile`` and gate 3 read
+    that default as an explicit routing decision. A stamp EQUAL to the
+    adapter's owner profile is "no decision was made": the registry binding
+    must still re-home the source to the bound bot."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+    _bind(rig.root, "100", "bot-reminders-a1b2")
+
+    source = _source(rig.adapter, guild_id="42")
+
+    assert source.profile == "bot-reminders-a1b2"  # registry verdict wins
+
+
+def test_owner_stamp_unbound_channel_keeps_the_hub(concierge_rig):
+    """The complementary row: no binding → the hub answers UNDER ITS OWN
+    NAME; the owner stamp stands and the mixin must not clear it."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+
+    source = _source(rig.adapter, chat_id="999", guild_id="42")
+
+    assert source.profile == "concierge"
+
+
+def test_owner_stamp_ghost_binding_fails_closed_to_the_hub(concierge_rig, caplog):
+    """Fail-closed parity under the owner stamp: a ghost binding degrades to
+    the hub (the owner stamp stands) WITH the same one-warning diagnosis —
+    under the old gate 3 the registry was never even read, so the operator
+    got no ghost warning at all."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+    # A distinct ghost name: the mixin's warn-once dedup is class-level and
+    # keyed by (channel, profile), and the sibling test above already
+    # consumed the ("100", "bot-ghost-zz9zz") key.
+    _bind(rig.root, "100", "bot-ghost-zz8zz")  # no such profile dir
+
+    with caplog.at_level(logging.WARNING):
+        source = _source(rig.adapter)
+
+    assert source.profile == "concierge"
+    assert "bot-ghost-zz8zz" in caplog.text
+
+
+def test_owner_stamp_bot_author_never_rehomes(concierge_rig):
+    """Anti-loop under the owner stamp: a bot-authored message in a bound
+    channel never re-homes to the bound bot (the pure layer's rule); the
+    hub stamp stands and the hub's own admission posture applies."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+    _bind(rig.root, "100", "bot-reminders-a1b2")
+
+    source = _source(rig.adapter, is_bot=True)
+
+    assert source.profile == "concierge"
+
+
+def test_owner_stamp_room_channel_still_fans_out(concierge_rig):
+    """Rooms too: an owner-stamped ROOM channel must still get its fan-out
+    targets — under the old gate 3 the room lookup never ran either."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+    registry.create_room("100", ["bot-reminders-a1b2", "bot-researcher-b2c3"])
+
+    source = _source(rig.adapter)
+
+    assert source._concierge_room_targets == (
+        "bot-reminders-a1b2", "bot-researcher-b2c3")
+
+
+def test_explicit_route_profile_beats_registry_despite_owner_stamp(concierge_rig):
+    """The inverse (gate 3's surviving skip): a REAL ``gateway.profile_routes``
+    match — a route whose ``bot_profile`` is this adapter's owner, naming a
+    profile DIFFERENT from the owner — is an explicit config decision and
+    stays authoritative over the runtime registry."""
+    rig = _owned_rig(concierge_rig)
+    _set_concierge_config(rig.root, enabled=True)
+    rig.runner.config.profile_routes = parse_profile_routes([
+        {"name": "pinned", "platform": "discord", "profile": "bot-researcher-b2c3",
+         "chat_id": "100", "bot_profile": "concierge"},
+    ])
+    _bind(rig.root, "100", "bot-reminders-a1b2")
+
+    source = _source(rig.adapter, guild_id="42")
+
+    assert source.profile == "bot-researcher-b2c3"  # the config route, not the registry
 
 
 # ── DOWNSTREAM: the existing identity machinery consumes the stamp ──────────

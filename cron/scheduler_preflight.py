@@ -198,12 +198,22 @@ class SharedRouteAdapters:
     the target; anything else (unmatched target, disabled route, other profile, or target-less
     ``get(platform)``) is a miss — fail closed, never the default bot.
 
+    Cross-profile origin grant: when the target IS the job's recorded origin
+    (``_resolved_from == "origin"``) and this process is a multiplex gateway, an adapter owned
+    by ANY served profile in the SAME process may deliver it — see ``_origin_owner_adapter``.
+
     See #101113.
     """
 
-    def __init__(self, primary_adapters, routes) -> None:
+    def __init__(self, primary_adapters, routes, *, process_adapters=None) -> None:
         self._primary = dict(primary_adapters or {})
         self._routes = list(routes or [])
+        # Multiplex process registry: OTHER served profiles' live adapter maps, keyed by profile
+        # name. Consulted ONLY for a job's recorded origin target (never home/explicit ones), so
+        # the "never the default bot" rule holds for every other target shape.
+        self._process_adapters = {
+            str(name): dict(owner_map) for name, owner_map in (process_adapters or {}).items()
+            if owner_map}
 
     def __bool__(self) -> bool:
         return bool(self._primary) and bool(self._routes)
@@ -212,24 +222,62 @@ class SharedRouteAdapters:
         if not target:
             return default
         adapter = self._primary.get(platform)
-        if adapter is None:
+        if adapter is not None:
+            platform_key = str(getattr(platform, "value", platform)).lower()
+            chat_id = str(target.get("chat_id") or "") or None
+            thread_id = target.get("thread_id")
+            thread_id = str(thread_id) if thread_id else None
+            # A cron target carries no inbound guild anchor, so a route's guild_id is matched against
+            # itself — the target-exact discriminators (chat_id/thread_id) authorize the send. Without
+            # this the documented ``guild_id + chat_id`` Discord route never authorized cron output.
+            for route in self._routes:
+                if str(route.platform).lower() != platform_key:
+                    continue
+                if not (route.chat_id or route.thread_id):
+                    continue  # guild-only routes are not target-exact
+                if route.matches(
+                    str(route.platform), guild_id=route.guild_id, chat_id=chat_id, thread_id=thread_id,
+                ):
+                    return adapter
+        return self._origin_owner_adapter(platform, target, default)
+
+    def _origin_owner_adapter(self, platform, target, default):
+        """Transport-OWNER resolution for a job's recorded origin target (multiplex only).
+
+        A concierge bot holds its routine cron job in its OWN store but owns no adapter — the
+        hub profile owns the shared connection — so origin delivery judged inside the bot's
+        scope found "platform 'discord' not configured/enabled" and every provisioned bot's
+        routine failed. The origin target is where the job was created (the bound channel): an
+        adapter owned by ANOTHER SERVED PROFILE in the SAME process may deliver it.
+
+        Enablement is judged by the OWNING profile's platform config: a live adapter in the
+        process registry only exists because its owner enabled the platform and holds the
+        credential (``_start_one_profile_adapters`` skips credentialless/disabled platforms), so
+        the live adapter IS the owner's authorization — #89302's shape. The job-holding
+        profile's absent/disabled block never vetoes (the ``_resolve_target_transport`` grant
+        path forces it enabled and keeps only its non-credential settings).
+
+        Scope — fail closed outside ALL of these: (1) same gateway process (the registry is
+        process state, never a cross-process lookup), (2) multiplex active, (3) origin target
+        ONLY (``_resolved_from == "origin"``; explicit/home targets still need a route).
+        """
+        if not isinstance(target, dict) or str(target.get("_resolved_from") or "") != "origin":
             return default
-        platform_key = str(getattr(platform, "value", platform)).lower()
-        chat_id = str(target.get("chat_id") or "") or None
-        thread_id = target.get("thread_id")
-        thread_id = str(thread_id) if thread_id else None
-        # A cron target carries no inbound guild anchor, so a route's guild_id is matched against
-        # itself — the target-exact discriminators (chat_id/thread_id) authorize the send. Without
-        # this the documented ``guild_id + chat_id`` Discord route never authorized cron output.
-        for route in self._routes:
-            if str(route.platform).lower() != platform_key:
-                continue
-            if not (route.chat_id or route.thread_id):
-                continue  # guild-only routes are not target-exact
-            if route.matches(
-                str(route.platform), guild_id=route.guild_id, chat_id=chat_id, thread_id=thread_id,
-            ):
-                return adapter
+        try:
+            from agent.secret_scope import is_multiplex_active
+            if not is_multiplex_active():
+                return default
+        except Exception:
+            return default
+        # Duplicate-credential refusal means at most one live adapter per platform per process;
+        # primary (launch profile) first, then other served profiles in a stable order.
+        owner = self._primary.get(platform)
+        if owner is not None:
+            return owner
+        for profile_name in sorted(self._process_adapters):
+            owner = self._process_adapters[profile_name].get(platform)
+            if owner is not None:
+                return owner
         return default
 
 

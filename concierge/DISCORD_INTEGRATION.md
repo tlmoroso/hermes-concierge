@@ -269,6 +269,39 @@ Concretely:
    the standard handler — sequential turns, Discord channel as transcript, reusing the
    existing `channel_context` backfill pattern (adapter.py:6075) for member history windows.
 
+## Live setup (multiplex launchd topology) — where the `concierge:` section lives
+
+Task 5.6's original commands assumed a standalone hub gateway (`hermes -p concierge
+gateway run`), where the hub profile's config.yaml IS the runner config. On the
+standard always-on topology — one launchd multiplex gateway from the default root
+(`ai.hermes.gateway`, HERMES_HOME=~/.hermes, the Discord adapter owned by the
+`concierge` profile) — `load_gateway_config_for_runner()` reloads the process-level
+GatewayConfig scoped to the DEFAULT root, so every `concierge:` key the surfaces
+read (`enabled`, `managed_category_ids`, `location_channel_id`, `provider_groups`,
+`default_provider_group`) is bridged from **`~/.hermes/config.yaml`**, not from
+`profiles/concierge/config.yaml`. The Discord event/command gate
+(`_concierge_events_wanted` → `runner.config.concierge`), the auto-offer settings,
+and the webhook location handler all read that bridge; a `concierge:` section that
+exists only in the profile config is a silent no-op (no events, no `/bot` group, no
+routing — verified live 2026-09-27).
+
+```bash
+hermes config set concierge.enabled true
+hermes config set concierge.managed_category_ids '["<CATEGORY_ID>"]'
+hermes gateway restart
+```
+
+The hub profile's own state — registry (`<profile>/concierge/registry.json`),
+spawned bot profiles, cron stores — still lives under `profiles/concierge/` (those
+paths resolve from `get_hermes_home()` inside the concierge profile's scope), and
+CLI access to them needs `-p concierge`.
+
+Discord credential ownership: exactly one profile's `.env` holds DISCORD_BOT_TOKEN
+(a duplicate is refused at boot by the token lock). The concierge hub's adapter
+authorizes senders from its own scoped `.env` — `DISCORD_ALLOWED_USERS`,
+`DISCORD_HOME_CHANNEL`(_THREAD_ID) move there with the token; under multiplex a
+secondary adapter never sees the default home's `.env`.
+
 ## Deferred follow-ups
 
 - Same-fan-out sibling visibility: room members see sibling replies from EARLIER rounds (the

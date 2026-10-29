@@ -121,3 +121,44 @@ def test_purge_verb_drops_routing_identity_and_reports_ok(tmp_path):
             "SELECT COUNT(*) AS n FROM gateway_heartbeats WHERE profile = ?", ("gone",))["n"] == 0
     finally:
         db.close()
+
+
+def test_durable_purge_settles_a_tombstoned_delete_without_its_own_db():
+    """The no-multiplexer delete flow: the profile's own state.db must not be opened.
+
+    ``delete_profile`` tombstones the directory BEFORE the purge (that tombstone is what
+    satisfies the ``profile_exists`` refusal), and the named-profile guard then refuses to
+    open any state.db under the tombstoned home — so the old loop's profile-own-db leg failed
+    unconditionally and every no-gateway delete reported
+    ``ProfileIdentitySettlementPending`` after a COMPLETE delete. The root store is the
+    settlement; the profile's own rows die with the rmtree that follows.
+    """
+    from hermes_constants import (
+        get_hermes_home, mark_named_profile_deleted, named_profile_is_deleted,
+    )
+    from hermes_state import SessionDB
+    from hermes_cli.profile_identity import _purge_profile_identity
+
+    root = Path(get_hermes_home())
+    profile_dir = root / "profiles" / "gone"
+    profile_dir.mkdir(parents=True)
+    own_db = SessionDB(profile_dir / "state.db")
+    own_db.close()
+
+    root_db = SessionDB(root / "state.db")
+    root_db.register_backend_heartbeat(
+        backend_id="be1", pid=1, started_at=time.time(), profile="gone", host="h")
+    root_db.close()
+
+    mark_named_profile_deleted(profile_dir)
+    assert named_profile_is_deleted(profile_dir)  # the delete flow's precondition
+
+    assert _purge_profile_identity("gone", live_mux=False) is True
+
+    root_db = SessionDB(root / "state.db")
+    try:
+        assert root_db._read_one(
+            "SELECT COUNT(*) AS n FROM gateway_heartbeats WHERE profile = ?",
+            ("gone",))["n"] == 0
+    finally:
+        root_db.close()
