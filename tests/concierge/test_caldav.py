@@ -8,7 +8,7 @@ process.
 """
 
 import base64
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, UTC
 
 import pytest
 
@@ -142,7 +142,7 @@ class TestParseEvents:
         assert standup.summary == "Standup"
         assert standup.location == "Room 4"
         assert standup.start == datetime(2026, 9, 21, 9, 0)
-        assert standup.end == datetime(2026, 9, 21, 16, 30, tzinfo=timezone.utc)
+        assert standup.end == datetime(2026, 9, 21, 16, 30, tzinfo=UTC)
         assert offsite.start == date(2026, 9, 21)  # VALUE=DATE
         assert offsite.end is None  # no DTEND in the fixture
 
@@ -176,7 +176,7 @@ class TestParseTodos:
     def test_completed_property_marks_done(self):
         todos = caldav.parse_todos(TODOS_ICS)
         done = next(t for t in todos if t.uid == "todo-done")
-        assert done.completed == datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
+        assert done.completed == datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
         assert done.summary == "Book dentist, semi-annual"  # unescaped \,
 
     def test_status_completed_marks_done(self):
@@ -270,7 +270,7 @@ class TestParseIcalDt:
         assert caldav._parse_ical_dt("20260921") == date(2026, 9, 21)
         assert caldav._parse_ical_dt(" 20260921 ") == date(2026, 9, 21)  # stripped
         assert caldav._parse_ical_dt("20260921T090000Z") == datetime(
-            2026, 9, 21, 9, 0, tzinfo=timezone.utc)
+            2026, 9, 21, 9, 0, tzinfo=UTC)
         assert caldav._parse_ical_dt("20260921T090000") == datetime(2026, 9, 21, 9, 0)
         assert caldav._parse_ical_dt("not-a-date") is None
         assert caldav._parse_ical_dt("") is None
@@ -291,7 +291,7 @@ class TestBuildReminderVtodo:
         assert todos[0].due is None
 
     def test_reminder_with_due_and_notes_round_trips(self):
-        due = datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc)
+        due = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)
         body = caldav.build_reminder_vtodo(
             "Pay rent; late after the 3rd, seriously", due=due, notes="line one\nline two")
         todos = caldav.parse_todos(body)
@@ -320,7 +320,7 @@ class TestBuildReminderVtodo:
 
     def test_explicit_dtstamp_and_uid_are_honored(self):
         body = caldav.build_reminder_vtodo(
-            "x", uid="fixed-uid", dtstamp=datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc))
+            "x", uid="fixed-uid", dtstamp=datetime(2026, 9, 21, 12, 0, tzinfo=UTC))
         assert "UID:fixed-uid" in body
         assert "DTSTAMP:20260921T120000Z" in body
 
@@ -331,8 +331,8 @@ class TestBuildReminderVtodo:
 
 class TestQueryBodies:
     def test_events_time_range_query(self):
-        start = datetime(2026, 9, 21, tzinfo=timezone.utc)
-        end = datetime(2026, 9, 22, tzinfo=timezone.utc)
+        start = datetime(2026, 9, 21, tzinfo=UTC)
+        end = datetime(2026, 9, 22, tzinfo=UTC)
         body = caldav.build_events_time_range_query(start, end)
         assert 'start="20260921T000000Z"' in body
         assert 'end="20260922T000000Z"' in body
@@ -383,7 +383,7 @@ class TestCalDAVClient:
     def test_list_today_events_reports_and_parses(self):
         client, transport = self._client(
             [(207, _multistatus(EVENTS_ICS, FOLDED_SUMMARY_ICS))])
-        today = datetime(2026, 9, 21, tzinfo=timezone.utc)
+        today = datetime(2026, 9, 21, tzinfo=UTC)
         events = client.list_today_events("/user/calendars/work/", today=today)
         report = transport.requests[0]
         assert report["method"] == "REPORT"
@@ -400,7 +400,7 @@ class TestCalDAVClient:
 
     def test_create_reminder_posts_vtodo(self):
         client, transport = self._client([(201, "")])
-        due = datetime(2026, 9, 22, 9, 0, tzinfo=timezone.utc)
+        due = datetime(2026, 9, 22, 9, 0, tzinfo=UTC)
         ok = client.create_reminder(
             "/user/reminders/", "Submit report", due=due, notes="by Friday")
         assert ok is True

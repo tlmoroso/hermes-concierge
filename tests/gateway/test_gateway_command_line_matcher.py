@@ -9,6 +9,8 @@ process and ``status``/``start`` report false positives.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gateway.status import (
@@ -16,6 +18,7 @@ from gateway.status import (
     looks_like_gateway_command_line as matches,
     looks_like_gateway_runtime_command_line as matches_runtime,
 )
+from hermes_cli import _launchers
 
 
 ACCEPT = [
@@ -25,6 +28,7 @@ ACCEPT = [
     "python -m hermes_cli.main gateway run --replace",
     "python -m hermes_cli/main.py gateway run",
     "python gateway/run.py",
+    "python -m gateway.run",   # module spelling of the dedicated entrypoint
     "hermes-gateway.exe",
     "hermes gateway",          # bare `hermes gateway` defaults to run
     "hermes gateway run",
@@ -120,18 +124,32 @@ def test_rejects_interpreter_running_inline_source(cmd):
     assert matches_runtime(cmd) is False
 
 
-# The minted source launcher (hermes_cli/_launchers.py) runs its bootstrap inline and CONSUMES the
-# trailing argv in-process (``sys.exit(main())``): the tokens after the ``-c`` operand ARE this
-# process's argv, so a tail beginning with the ``gateway`` subcommand is the gateway itself. This
-# is the launchd/shim launch shape — a plain ``python -c <src> gateway run …`` must be recognised
-# (a live gateway invisible to live_gateway_pid_for_home pushed profile deletes into the CLI-side
-# durable identity purge a live multiplexer must own). A tail carrying interpreter options keeps
-# working the same way (the option walk lands on the same argv).
+# The minted source launcher (hermes_cli/_launchers.py::runtime_command) runs its bootstrap inline
+# and CONSUMES the trailing argv in-process (``runpy.run_module('hermes_cli.main', …)``): the tokens
+# after the ``-c`` operand ARE this process's argv, so a tail beginning with the ``gateway``
+# subcommand is the gateway itself. This is the launchd/shim launch shape — the minted launcher's
+# command line must be recognised (a live gateway invisible to live_gateway_pid_for_home pushed
+# profile deletes into the CLI-side durable identity purge a live multiplexer must own). Upstream's
+# ``inline_bootstrap_argv`` (#124318) anchors this to the RECOGNISED bootstrap shapes, so these
+# cases exercise the command the launcher actually mints, space-joined the way /proc/psutil/``ps``
+# report it. Interpreter-option variants keep working (the option walk lands on the same argv).
+_LAUNCHER_ROOT = Path("/opt/Hermes Agent/hermes-agent")
+_LAUNCHER_PY = "/opt/venv/bin/python3"
+
+
+def _minted(argv, *interpreter_options):
+    """The minted store-launcher command line, space-joined, with the interpreter options replaced."""
+    command = [str(t) for t in _launchers.runtime_command(_LAUNCHER_ROOT, argv, python=Path(_LAUNCHER_PY))]
+    if interpreter_options:
+        command = command[:1] + [*interpreter_options] + command[2:]
+    return " ".join(command)
+
+
 LAUNCHER_ACCEPT = [
-    'python -I -c "import main_bootstrap" gateway run --external-supervisor',
-    'python -I -c "import main_bootstrap" gateway run',
-    'python -X utf8 -c "import main_bootstrap" gateway run --external-supervisor',
-    'python -c "import main_bootstrap" gateway restart',
+    _minted(["gateway", "run", "--external-supervisor"]),
+    _minted(["gateway", "run"]),
+    _minted(["gateway", "run", "--external-supervisor"], "-X", "utf8"),
+    _minted(["gateway", "restart"]),
 ]
 
 
@@ -141,10 +159,11 @@ def test_accepts_the_minted_launcher_consuming_its_own_argv(cmd):
 
 
 def test_launcher_tails_that_are_not_a_gateway_stay_rejected():
-    """The stderr_timestamp/serve launcher siblings consume argv the same way but are not
-    gateways; the watcher's spawn-later payload (target PID first) stays rejected too."""
-    assert matches_runtime(
-        'python -I -c "import main_bootstrap" serve --host 127.0.0.1 --port 0') is False
+    """The launcher's non-gateway siblings consume argv the same way but are not gateways; the
+    watcher's spawn-later payload (target PID first) and an UNRECOGNISED bootstrap's tail stay
+    data (#107002) — a lookalike ``-c`` program carrying a ``hermes gateway run`` string is not
+    this process's identity either."""
+    assert matches_runtime(_minted(["serve", "--host", "127.0.0.1", "--port", "0"])) is False
     assert matches_runtime(
         'python -I -c "import main_bootstrap" --run-module hermes_cli.stderr_timestamp '
         "--error-log /logs/gateway.error.log -- "

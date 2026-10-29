@@ -44,16 +44,16 @@ import logging
 from typing import Any, Iterable, Optional
 
 __all__ = [
-    "REPORT_SESSION_KEY",
-    "REPORT_HEADER",
     "EMPTY_COPY",
-    "FAILURE_COPY",
-    "MEMORY_QUERY",
-    "REPORT_MAX_CHARS",
-    "SUMMARY_MAX_CHARS",
     "FACT_MAX_CHARS",
+    "FAILURE_COPY",
     "MAX_CARD_FACTS",
     "MAX_CONCLUSIONS",
+    "MEMORY_QUERY",
+    "REPORT_HEADER",
+    "REPORT_MAX_CHARS",
+    "REPORT_SESSION_KEY",
+    "SUMMARY_MAX_CHARS",
     "build_memory_report",
     "memory_report_client",
 ]

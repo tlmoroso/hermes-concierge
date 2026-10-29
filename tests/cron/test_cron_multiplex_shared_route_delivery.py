@@ -164,6 +164,63 @@ def test_live_native_adapter_without_platform_block_is_not_treated_as_disabled()
     assert resolved is None and "not configured/enabled" in err
 
 
+def test_multiplex_tick_routes_desktop_served_satellite_with_only_local_adapter(
+    tmp_path, monkeypatch,
+):
+    """#139825: a satellite profile also chatted with from Hermes Desktop holds
+    ``{LOCAL: adapter}`` in ``_profile_adapters``. LOCAL carries no platform credential, so its
+    cron tick must still hand it the routed primary view — before, the non-empty map skipped
+    ``SharedRouteAdapters`` and delivery fell through to the profile's own credentialless config
+    (``platform 'discord' not configured/enabled``)."""
+    import threading
+
+    from cron.scheduler_provider import InProcessCronScheduler
+    from cron.scheduler_preflight import SharedRouteAdapters
+
+    root = tmp_path / "root"
+    sat_home = root / "profiles" / "sat"
+    (sat_home / "cron").mkdir(parents=True)
+    (root / "config.yaml").write_text(yaml.safe_dump({
+        "gateway": {"multiplex_profiles": True, "profile_routes": [
+            {"platform": "discord", "guild_id": "G1", "chat_id": "C1", "profile": "sat"}]},
+    }), encoding="utf-8")
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+
+    primary = _primary_adapter()
+    captured = {}
+    stop = threading.Event()
+
+    def _tick_and_stop(*_args, **kwargs):
+        captured["adapters"] = kwargs["adapters"]
+        stop.set()
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tick_and_stop):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": [("sat", sat_home)],
+                "adapters": {Platform.DISCORD: primary},
+                "profile_adapters": {"sat": {Platform.LOCAL: object()}},
+                "default_profile": "default",
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=10)
+        stop.set()
+        thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    shared = captured["adapters"]
+    assert isinstance(shared, SharedRouteAdapters)
+    # The routed view releases the primary adapter for exactly the route-mapped target.
+    assert shared.get(Platform.DISCORD, {"chat_id": "C1"}) is primary
+    assert shared.get(Platform.DISCORD, {"chat_id": "unmapped"}) is None
+
+
 # ── Cross-profile origin delivery (concierge bots) ──────────────────────────────
 # A concierge bot holds its routine cron job in ITS OWN store (deliver=origin,
 # origin platform discord) but owns no Discord adapter — the hub profile owns the
@@ -281,7 +338,7 @@ def test_multiplex_hub_path_unchanged(tmp_path, monkeypatch):
             assert view is own_map
             assert not isinstance(view, SharedRouteAdapters)
         # and the hub's own origin job delivers through its own map exactly as before
-        error, standalone = _deliver(_origin_job(), own_map, platforms={})
+        error, _standalone = _deliver(_origin_job(), own_map, platforms={})
         assert error is None, error
         assert hub.sent == ["456"]
     finally:

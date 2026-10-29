@@ -54,11 +54,11 @@ from concierge import registry
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 
-from tests.gateway.conftest import _ensure_discord_mock  # noqa: E402
+from tests.gateway.conftest import _ensure_discord_mock
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 async def _allow(*_a, **_kw):
@@ -247,7 +247,7 @@ def test_bot_new_posts_the_catalog_picker(rig, monkeypatch):
     _run(rig.adapter._concierge_cmd_new(interaction))
 
     assert len(interaction.response.sent) == 1
-    text, view, ephemeral = interaction.response.sent[0]
+    _text, view, ephemeral = interaction.response.sent[0]
     assert ephemeral is True
     # The view carries the whole catalog as select options.
     select = view.children[0]
@@ -622,7 +622,7 @@ def test_auto_offer_posts_picker_into_managed_channel(rig):
     _run(rig.adapter._concierge_on_guild_channel_create(channel))
 
     assert len(sends) == 1
-    chan_id, text, view = sends[0]
+    chan_id, _text, view = sends[0]
     assert chan_id == "700"
     # Non-ephemeral (channel.send has no ephemeral at all) and the whole
     # catalog is on the picker.
@@ -2015,10 +2015,13 @@ class TestRealComponentAuthGate:
             self._interaction_for(1111111111111111111)) is False
 
     def test_allow_all_env_passes_the_real_gate(self, tmp_path, monkeypatch):
-        from plugins.platforms.discord import adapter as adapter_mod
+        from plugins.platforms.discord import adapter_component_auth as component_auth_mod
         adapter = self._rig_adapter(tmp_path, monkeypatch, [])
+        # The approval-card refactor moved _component_check_auth (and its scoped
+        # env reads) out of adapter.py into adapter_component_auth — patch the
+        # binding the gate actually reads.
         monkeypatch.setattr(
-            adapter_mod, "_scoped_gate_env",
+            component_auth_mod, "_scoped_gate_env",
             lambda key, default="": "true" if key == "DISCORD_ALLOW_ALL_USERS" else default)
         assert adapter._concierge_component_auth(
             self._interaction_for(2222222222222222222)) is True

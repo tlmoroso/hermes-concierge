@@ -6,7 +6,7 @@ vice versa), the next operator following the skill hits a usage error."""
 import re
 from pathlib import Path
 
-import yaml
+import hermes_yaml as yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_PATH = (

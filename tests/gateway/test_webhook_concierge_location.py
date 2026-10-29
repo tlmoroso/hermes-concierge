@@ -53,6 +53,23 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     return app
 
 
+@pytest.fixture(autouse=True)
+def _stubbed_durable_admission(monkeypatch):
+    """Upstream's durable admission (real GatewayRunner + session authorities, #129958) is
+    generic pipeline behavior owned by the authority suites (test_webhook_authority and
+    friends, which mount the real runner). These route-kind tests run the handler dispatch
+    end to end on the isolated adapter: the admission seam — ``admit_producer``, imported at
+    call time inside ``_admit_agent_run`` — forwards the admitted event to the observer
+    (``adapter.handle_message``, the capture below) and reports it consumed, so a 202 stays
+    a 202 without the runner."""
+    async def _admit(adapter, event):
+        observer = adapter.__dict__.get("handle_message")
+        if observer is not None:
+            await observer(event)
+
+    monkeypatch.setattr("gateway.platforms.webhook_ingress.admit_producer", _admit)
+
+
 async def _drain_background_tasks(adapter: WebhookAdapter) -> None:
     tasks = list(adapter._background_tasks)
     if tasks:
@@ -125,8 +142,12 @@ class TestConciergeLocationRun:
         assert "arrived at work" in events[0].text
         # The reply leg egresses through the hub's adapters (profile None =
         # primary lane) to the bound channel — the bot's cron origin delivery
-        # shape: {'platform': 'discord', 'chat_id': <channel>}.
-        delivery = adapter._delivery_info["webhook:concierge-location:loc-1"]
+        # shape: {'platform': 'discord', 'chat_id': <channel>}. The session key
+        # is the durable-identity spelling (upstream's ``webhook:v2:`` token).
+        from gateway.platforms.webhook import _WebhookDeliveryIdentity
+        chat_id = _WebhookDeliveryIdentity.from_parts(
+            "bot-reminders-a1b2", "concierge-location", "loc-1").session_chat_id
+        delivery = adapter._delivery_info[chat_id]
         assert delivery["deliver"] == "discord"
         assert delivery["deliver_extra"]["chat_id"] == "100"
         assert delivery["profile"] is None

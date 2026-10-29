@@ -44,12 +44,12 @@ from concierge import registry
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 
-from tests.gateway.conftest import _ensure_discord_mock  # noqa: E402
+from tests.gateway.conftest import _ensure_discord_mock
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 def _run(coro):

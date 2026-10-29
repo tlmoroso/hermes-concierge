@@ -252,7 +252,7 @@ def _concierge_enabled_from_config(runner) -> bool:
         return False
 
 
-def _profile_exists(profile: str) -> "tuple[bool, str | None]":
+def _profile_exists(profile: str) -> tuple[bool, str | None]:
     """Live (non-tombstoned) profile check — the same primitive
     ``profile_exists`` gives ``_profile_name_for_source``'s served-set gate,
     without the O(profiles) ``profiles_to_serve`` scan per inbound event.
@@ -315,9 +315,9 @@ class ConciergeDiscordMixin:
     binding count alone does not bound it).
     """
 
-    _concierge_warned: "set[tuple[str, ...]]" = set()
+    _concierge_warned: set[tuple[str, ...]] = set()
 
-    def _concierge_warn_once(self, key: "tuple[str, ...]", message: str,
+    def _concierge_warn_once(self, key: tuple[str, ...], message: str,
                              *args: Any, exc_info: bool = False) -> None:
         """Emit ``message % args`` as a WARNING the first time ``key`` is seen;
         silent after. No TTL: every key names a registry state (a binding, a
@@ -419,7 +419,7 @@ class ConciergeDiscordMixin:
 
     # ── Task 8.2: account-connection nudges (decision at build_source) ─────
 
-    def _concierge_binding_key(self, source, bindings) -> "str | None":
+    def _concierge_binding_key(self, source, bindings) -> str | None:
         """The registry key the routing verdict's binding lives under — the
         channel itself, else its parent (threads/forum posts inherit the
         parent's binding), in the same lookup order
@@ -503,7 +503,7 @@ class ConciergeDiscordMixin:
                 exc_info=True)
             return None
 
-    def _concierge_profile_from_registry(self, source, reg) -> "str | None":
+    def _concierge_profile_from_registry(self, source, reg) -> str | None:
         """Single-bot verdict's profile for *source* from a LOADED registry
         (the M5b ``resolve_target_profile`` call, fed the shared read)."""
         from concierge.routing import resolve_target_profile
@@ -516,7 +516,7 @@ class ConciergeDiscordMixin:
         )
         return verdict.profile if verdict.routed else None
 
-    def _concierge_room_targets_from_registry(self, source, reg) -> "list[str]":
+    def _concierge_room_targets_from_registry(self, source, reg) -> list[str]:
         """Task 7.3 room verdict: the ordered member profiles this source's
         event must fan out to; ``[]`` when the channel is not a room, the
         message is bot-authored (anti-loop, pure layer), or every member was
@@ -569,7 +569,7 @@ class ConciergeDiscordMixin:
 
     # ── Task 7.3: sequential member-turn fan-out (execution seam) ──────────
 
-    def _concierge_room_targets_on(self, event) -> "tuple[str, ...]":
+    def _concierge_room_targets_on(self, event) -> tuple[str, ...]:
         """The fan-out targets stamped on *event*'s source by ``build_source``
         (empty when the event is not a room fan-out — the common case, and
         the pure pass-through path)."""
@@ -605,7 +605,7 @@ class ConciergeDiscordMixin:
 
     # ── Task 8.2: account-connection nudges (execution at handle_message) ──
 
-    def _concierge_connect_nudge_on(self, event) -> "tuple | None":
+    def _concierge_connect_nudge_on(self, event) -> tuple | None:
         """The nudge stamp ``build_source`` left on *event*'s source:
         ``(registry_binding_key, missing_kind, ...)``, or ``None`` for the
         common case (unbound channel, connectless blueprint, all
@@ -732,7 +732,7 @@ class ConciergeDiscordMixin:
                     del tasks[channel_id]
 
     async def _concierge_run_member_turn(self, event, member: str,
-                                         room_history: "str | None" = None) -> None:
+                                         room_history: str | None = None) -> None:
         """One member's turn, through the SAME machinery a single-bot
         message takes: a fresh source stamped ``profile = member`` (the M5b
         stamping mechanism — ``dataclasses.replace`` so the cached routing
@@ -753,7 +753,7 @@ class ConciergeDiscordMixin:
         import dataclasses
 
         member_source = dataclasses.replace(
-            getattr(event, "source"), profile=member)
+            event.source, profile=member)
         member_event = dataclasses.replace(event, source=member_source)
         if room_history is not None:
             # The cloned event carries the STANDARD backfill's context, which
@@ -769,7 +769,7 @@ class ConciergeDiscordMixin:
         await super().handle_message(member_event)
         await self._concierge_wait_for_member_turn(member_event)
 
-    async def _concierge_fetch_room_history(self, event) -> "str | None":
+    async def _concierge_fetch_room_history(self, event) -> str | None:
         """The room fan-out's channel-history window: recent messages BEFORE
         the trigger from ALL conversational authors — humans AND the shared
         bot identity, i.e. sibling members' replies — with NO self-partition
@@ -794,7 +794,7 @@ class ConciergeDiscordMixin:
         channel_id = str(getattr(channel, "id", "?"))
         is_thread_channel = self._concierge_channel_is_thread(channel)
         try:
-            lines: "list[str]" = []
+            lines: list[str] = []
             has_unverified = False
             # Newest-first scan (discord.py's default direction), anchored
             # BEFORE the trigger so the trigger stays the "[New message]"
@@ -817,7 +817,7 @@ class ConciergeDiscordMixin:
             # line always survives (a window, not a filter — one oversized
             # line alone is still the member's most recent context). ``lines``
             # is newest-first, so the walk starts at the newest line.
-            kept: "list[str]" = []
+            kept: list[str] = []
             total = 0
             for line in lines:
                 if kept and total + len(line) + 1 > _ROOM_HISTORY_CHAR_CAP:
@@ -829,7 +829,7 @@ class ConciergeDiscordMixin:
                 _UNVERIFIED_HISTORY_PREAMBLE,
             )
 
-            blocks: "list[str]" = []
+            blocks: list[str] = []
             if has_unverified:
                 blocks.append(_UNVERIFIED_HISTORY_PREAMBLE)
             blocks.append("[Recent channel messages]\n" + "\n".join(kept))
@@ -842,7 +842,7 @@ class ConciergeDiscordMixin:
             return None
 
     def _concierge_room_history_line(self, msg, channel_id: str,
-                                     is_thread_channel: bool) -> "tuple[str | None, bool]":
+                                     is_thread_channel: bool) -> tuple[str | None, bool]:
         """Format one history message for the room window — the adapter's ONE
         canonical line formatter (``_format_channel_history_line``, the same
         function the standard ``_fetch_channel_context`` window formats
@@ -989,7 +989,7 @@ class ConciergeDiscordMixin:
             pass
         return profile
 
-    def _concierge_route_for_source(self, source) -> "str | None":
+    def _concierge_route_for_source(self, source) -> str | None:
         """Legacy single-lookup shape (kept for direct callers/tests): load
         the registry and resolve the single-bot binding verdict."""
         reg = self._concierge_registry_or_none(source)
@@ -1072,17 +1072,17 @@ class ConciergeDiscordMixin:
             return
 
         @discord.app_commands.describe()
-        async def _new(interaction: "discord.Interaction"):
+        async def _new(interaction: discord.Interaction):
             await self._concierge_cmd_new(interaction)
 
         @discord.app_commands.describe(bot="The bot to retire (from /bot list)")
-        async def _retire(interaction: "discord.Interaction", bot: str):
+        async def _retire(interaction: discord.Interaction, bot: str):
             await self._concierge_cmd_retire(interaction, bot)
 
-        async def _list(interaction: "discord.Interaction") -> None:
+        async def _list(interaction: discord.Interaction) -> None:
             await self._concierge_cmd_list(interaction)
 
-        async def _memory(interaction: "discord.Interaction") -> None:
+        async def _memory(interaction: discord.Interaction) -> None:
             await self._concierge_cmd_memory(interaction)
 
         _new.__name__ = "concierge_bot_new"
@@ -1123,19 +1123,19 @@ class ConciergeDiscordMixin:
 
         @discord.app_commands.describe(
             topic="Optional topic — names the room's channel")
-        async def _room_create(interaction: "discord.Interaction",
-                               topic: "str | None" = None):
+        async def _room_create(interaction: discord.Interaction,
+                               topic: str | None = None):
             await self._concierge_cmd_room_create(interaction, topic)
 
         @discord.app_commands.describe(bot="The bot to add (from /bot list)")
-        async def _room_add(interaction: "discord.Interaction", bot: str):
+        async def _room_add(interaction: discord.Interaction, bot: str):
             await self._concierge_cmd_room_add(interaction, bot)
 
         @discord.app_commands.describe(bot="The bot to remove")
-        async def _room_remove(interaction: "discord.Interaction", bot: str):
+        async def _room_remove(interaction: discord.Interaction, bot: str):
             await self._concierge_cmd_room_remove(interaction, bot)
 
-        async def _room_disband(interaction: "discord.Interaction"):
+        async def _room_disband(interaction: discord.Interaction):
             await self._concierge_cmd_room_disband(interaction)
 
         _room_create.__name__ = "concierge_room_create"
@@ -1167,8 +1167,8 @@ class ConciergeDiscordMixin:
         try:
             @discord.app_commands.describe(
                 kind="Optional: the account to connect (e.g. email, calendar)")
-            async def _connect(interaction: "discord.Interaction",
-                               kind: "str | None" = None):
+            async def _connect(interaction: discord.Interaction,
+                               kind: str | None = None):
                 await self._concierge_cmd_connect(interaction, kind)
 
             _connect.__name__ = "concierge_connect"
@@ -1243,7 +1243,7 @@ class ConciergeDiscordMixin:
         adapter module."""
         import discord
 
-        async def _on_select(interaction: "discord.Interaction") -> None:
+        async def _on_select(interaction: discord.Interaction) -> None:
             if not self._concierge_component_auth(interaction):
                 await interaction.response.send_message(
                     "You're not allowed to use this.", ephemeral=True)
@@ -1279,9 +1279,12 @@ class ConciergeDiscordMixin:
                     getattr(self, "_allowed_role_ids", set())))
             except Exception:
                 return False
+        # Upstream's approval-card refactor moved ``_component_check_auth`` out of
+        # adapter.py into adapter_component_auth.py — resolve it there (still the
+        # same gate the adapter's approval/model-picker views use).
         try:
-            from plugins.platforms.discord import adapter as _adapter_mod
-            return bool(_adapter_mod._component_check_auth(
+            from plugins.platforms.discord.adapter_component_auth import _component_check_auth
+            return bool(_component_check_auth(
                 interaction,
                 getattr(self, "_allowed_user_ids", set()),
                 getattr(self, "_allowed_role_ids", set())))
@@ -1646,7 +1649,7 @@ class ConciergeDiscordMixin:
     # ── Task 7.4: /room create | add | remove | disband ─────────────────────
 
     async def _concierge_cmd_room_create(self, interaction,
-                                         topic: "str | None" = None) -> None:
+                                         topic: str | None = None) -> None:
         """``/room create [topic]``: an ephemeral MULTI-SELECT of this guild's
         bound bots (2–6); the selection creates ``#room-<topic>`` and rooms
         it (Task 7.4). Fewer than two guild bots is actionable refusal — no
@@ -1701,7 +1704,7 @@ class ConciergeDiscordMixin:
         """Bound callback for the room picker's multi-select: auth, defer
         (the channel create + registry write are slow), then create the room
         (see ``_concierge_create_room_from_interaction``)."""
-        async def _on_select(interaction: "discord.Interaction") -> None:
+        async def _on_select(interaction: discord.Interaction) -> None:
             if not self._concierge_component_auth(interaction):
                 await interaction.response.send_message(
                     "You're not allowed to use this.", ephemeral=True)
@@ -1792,7 +1795,7 @@ class ConciergeDiscordMixin:
             return invoking
         return managed[0] if managed else None
 
-    def _concierge_room_of_interaction(self, interaction) -> "list[str]":
+    def _concierge_room_of_interaction(self, interaction) -> list[str]:
         """The room members of the channel the interaction was invoked IN
         (the /room add|remove|disband operand), or ``[]`` when that channel
         is not a room — callers answer the actionable refusal."""
@@ -2192,7 +2195,7 @@ class ConciergeDiscordMixin:
     # ── Task 8.2: /connect — account-connection deep links ─────────────────
 
     async def _concierge_cmd_connect(self, interaction,
-                                     kind: "str | None" = None) -> None:
+                                     kind: str | None = None) -> None:
         """/connect [kind]: account-connection status + deep links into the
         gateway dashboard's EXISTING connect pages (no new OAuth plumbing).
 

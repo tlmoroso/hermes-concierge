@@ -61,7 +61,7 @@ _LOCATION_PROMPTS = {
 }
 
 
-def _load_cfg(cfg: Optional[Dict]) -> Optional[Dict]:
+def _load_cfg(cfg: Optional[dict]) -> Optional[dict]:
     """``cfg`` as given, or the config.yaml from the active home (defaults-only
     when unreadable) — so the plan's bare ``handle_location_event(payload)``
     signature works standalone."""
@@ -110,7 +110,7 @@ def _validated_location(payload: Any) -> Optional[tuple]:
     return user.strip(), region, event
 
 
-def resolve_location_run(payload: Any, cfg: Optional[Dict] = None) -> Optional[Dict]:
+def resolve_location_run(payload: Any, cfg: Optional[dict] = None) -> Optional[dict]:
     """Resolve the location-event run target, or None when there is none.
 
     Returns ``{"prompt", "profile", "channel_id", "region", "event", "user"}``
@@ -180,7 +180,7 @@ def resolve_location_run(payload: Any, cfg: Optional[Dict] = None) -> Optional[D
     }
 
 
-def handle_location_event(payload: Any, cfg: Optional[Dict] = None) -> Optional[str]:
+def handle_location_event(payload: Any, cfg: Optional[dict] = None) -> Optional[str]:
     """The plan's Task 10.1 API: the prompt to run for a location event, or None.
 
     Pure data-in/data-out plus registry/config reads — never raises.

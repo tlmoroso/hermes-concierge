@@ -37,8 +37,12 @@ from __future__ import annotations
 
 from typing import Any, List, Mapping, Optional, Sequence, Union
 
-__all__ = ["RoutingVerdict", "resolve_target_profile", "resolve_room_targets",
-           "should_auto_offer"]
+__all__ = [
+    "RoutingVerdict",
+    "resolve_room_targets",
+    "resolve_target_profile",
+    "should_auto_offer",
+]
 
 
 class RoutingVerdict:
@@ -52,7 +56,7 @@ class RoutingVerdict:
     ``if verdict:`` — use ``verdict.routed``.
     """
 
-    __slots__ = ("profile", "binding", "fallback_profile")
+    __slots__ = ("binding", "fallback_profile", "profile")
 
     def __init__(self, profile: Optional[str], binding: Optional[Mapping],
                  fallback_profile: Optional[str]) -> None:
@@ -70,7 +74,7 @@ class RoutingVerdict:
                 f"binding={self.binding!r})")
 
 
-def _channel_key(channel_id: Optional[Union[str, int]]) -> str:
+def _channel_key(channel_id: Optional[str | int]) -> str:
     """Registry keys are strings; inbound ids can arrive int-shaped (YAML,
     mocks, test doubles). ``str()`` is the whole normalization — Discord
     snowflakes have no aliases."""
@@ -80,9 +84,9 @@ def _channel_key(channel_id: Optional[Union[str, int]]) -> str:
 def resolve_target_profile(
     bindings: Mapping[str, Any],
     *,
-    channel_id: Optional[Union[str, int]] = None,
+    channel_id: Optional[str | int] = None,
     fallback_profile: Optional[str] = None,
-    parent_channel_id: Optional[Union[str, int]] = None,
+    parent_channel_id: Optional[str | int] = None,
     author_is_bot: bool = False,
 ) -> RoutingVerdict:
     """Decide which profile runs ``channel_id``'s messages.
@@ -119,7 +123,7 @@ def resolve_target_profile(
     return RoutingVerdict(binding["profile"], binding, fallback_profile)
 
 
-def _room_member_list(members: Any) -> List[str]:
+def _room_member_list(members: Any) -> list[str]:
     """Normalize a room membership for a fan-out decision: list/tuple input
     only (a bare string would char-split; None means "no lookup result"),
     stored order kept, blank/non-string entries skipped (a hand-edited
@@ -142,7 +146,7 @@ def resolve_room_targets(
     *,
     author_is_bot: bool,
     mentioned_profiles: Sequence[str] = (),
-) -> List[str]:
+) -> list[str]:
     """Room fan-out decision (Task 7.2): which room members run this message?
 
     ``members`` is the room's membership as a VALUE (normally
@@ -181,7 +185,7 @@ def resolve_room_targets(
         # Not a room (empty membership / junk): never a fan-out of nothing.
         return []
     member_set = set(member_list)
-    targeted: List[str] = []
+    targeted: list[str] = []
     for name in mentioned_profiles:
         if isinstance(name, str) and name in member_set and name not in targeted:
             targeted.append(name)
@@ -190,7 +194,7 @@ def resolve_room_targets(
     return targeted or list(member_list)
 
 
-def should_auto_offer(category_id: Optional[Union[str, int]],
+def should_auto_offer(category_id: Optional[str | int],
                       managed_category_ids: Any) -> bool:
     """Task 5.5 decision: does a newly created channel get the blueprint picker?
 

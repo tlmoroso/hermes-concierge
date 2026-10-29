@@ -41,17 +41,17 @@ from concierge.registry import MAX_ROOM_MEMBERS
 
 __all__ = [
     "ChannelPlan",
-    "build_new_bot_response",
     "build_list_payload",
+    "build_new_bot_response",
     "build_retire_choices",
-    "build_room_member_choices",
-    "validate_room_selection",
-    "room_channel_name",
     "build_room_created_response",
     "build_room_disband_response",
     "build_room_info_response",
-    "create_vs_bind",
+    "build_room_member_choices",
     "channel_name_for_blueprint",
+    "create_vs_bind",
+    "room_channel_name",
+    "validate_room_selection",
 ]
 
 # Discord's channel-name rules: lowercase, hyphens instead of spaces, and a
@@ -70,7 +70,7 @@ class ChannelPlan:
     A value object, not a promise: always truthy, so test ``plan.mode``.
     """
 
-    __slots__ = ("mode", "channel_name", "reason")
+    __slots__ = ("channel_name", "mode", "reason")
 
     def __init__(self, mode: str, channel_name: Optional[str] = None,
                  reason: str = "") -> None:
@@ -83,7 +83,7 @@ class ChannelPlan:
                 f"reason={self.reason!r})")
 
 
-def build_new_bot_response() -> Dict[str, Any]:
+def build_new_bot_response() -> dict[str, Any]:
     """The blueprint picker payload for ``/bot new`` (and Task 5.5 auto-offer).
 
     ``choices`` is the catalog rendered as select-menu options (title/description
@@ -102,10 +102,10 @@ def build_new_bot_response() -> Dict[str, Any]:
 
 def build_list_payload(
     bindings: Mapping[str, Mapping[str, Any]],
-    status_fn: Optional[Callable[[str], Dict[str, Any]]] = None,
+    status_fn: Optional[Callable[[str], dict[str, Any]]] = None,
     *,
     guild_id: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """``/bot list`` rows: one line per bound bot (grouped by profile).
 
     ``status_fn(profile_name) -> bot_status()``-shaped dict supplies routine
@@ -115,7 +115,7 @@ def build_list_payload(
     business. Bindings recorded without a guild (CLI-provisioned) are always
     shown (they are the operator's, not a guild's).
     """
-    rows: List[Tuple[str, List[str]]] = []
+    rows: list[tuple[str, list[str]]] = []
     for channel_id, binding in bindings.items():
         if not isinstance(binding, Mapping):
             continue
@@ -137,7 +137,7 @@ def build_list_payload(
     if not rows:
         return {"lines": [], "empty": True}
 
-    lines: List[str] = []
+    lines: list[str] = []
     for profile, channels in rows:
         try:
             title = get_blueprint(str(_blueprint_of(bindings, profile))).title
@@ -173,7 +173,7 @@ def _blueprint_of(bindings: Mapping[str, Mapping[str, Any]], profile: str) -> st
 
 def _guild_bound_bots(
     bindings: Mapping[str, Mapping[str, Any]], guild_id: Optional[str],
-) -> List[Tuple[str, str, List[str]]]:
+) -> list[tuple[str, str, list[str]]]:
     """This guild's bound bots as ``(profile, title, channel_ids)`` rows —
     the shared guild-scoping core behind /bot retire's and /room's pickers.
 
@@ -182,7 +182,7 @@ def _guild_bound_bots(
     eligible everywhere. One row per PROFILE (a bot bound in several of this
     guild's channels is still one persona), channels collected for the
     description."""
-    seen: Dict[str, Tuple[str, str, List[str]]] = {}
+    seen: dict[str, tuple[str, str, list[str]]] = {}
     for channel_id, binding in bindings.items():
         if not isinstance(binding, Mapping):
             continue
@@ -205,7 +205,7 @@ def _guild_bound_bots(
 
 def build_retire_choices(
     bindings: Mapping[str, Mapping[str, Any]], guild_id: Optional[str],
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Picker choices for ``/bot retire``: this guild's bots only.
 
     A bot bound in another guild is not this guild's to retire (the retire
@@ -245,7 +245,7 @@ def create_vs_bind(
     *,
     can_create_channels: bool,
     category_id: Optional[str],
-    managed_category_ids: "Any",
+    managed_category_ids: Any,
     channel_id: Optional[str],
     prefer_create: bool = False,
 ) -> ChannelPlan:
@@ -294,7 +294,7 @@ def create_vs_bind(
 
 def build_room_member_choices(
     bindings: Mapping[str, Mapping[str, Any]], guild_id: Optional[str],
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Multi-select choices for ``/room create``: this guild's BOUND bots
     (plan: 2–6 of this guild's bound bots — a member must be a bot this
     guild already sees, so an unbound or other-guild name can never be
@@ -321,7 +321,7 @@ def validate_room_selection(
     once — resolve_room_targets collapses again, so this is copy clarity,
     not correctness)."""
     allowed = {str(c.get("value")) for c in choices if isinstance(c, Mapping)}
-    picked: List[str] = []
+    picked: list[str] = []
     for value in values or ():
         name = str(value)
         if name not in allowed:

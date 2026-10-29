@@ -93,6 +93,24 @@ def _provisioned(home, key="reminders", channel_id="123", **kwargs):
     return provision.create_bot(key, channel_id=channel_id, guild_id="42", **kwargs)
 
 
+@pytest.fixture
+def honcho_oauth(monkeypatch):
+    """The bundled Honcho plugin moved upstream to a catalog install, so
+    ``plugins.memory.honcho.oauth`` is not importable from a bare checkout.
+    Inject a stub carrying the real predicate's semantics (oauth.py::
+    ACCESS_TOKEN_PREFIX == "hch-at-") so the synthesis contracts still
+    exercise the in-tree logic they lock."""
+    import types
+
+    pkg = types.ModuleType("plugins.memory.honcho")
+    pkg.__path__ = []
+    oauth = types.ModuleType("plugins.memory.honcho.oauth")
+    oauth.is_oauth_access_token = (
+        lambda value: bool(value) and value.startswith("hch-at-"))
+    monkeypatch.setitem(sys.modules, "plugins.memory.honcho", pkg)
+    monkeypatch.setitem(sys.modules, "plugins.memory.honcho.oauth", oauth)
+
+
 def test_create_bot_makes_profile_with_pinned_model_and_soul(concierge_home):
     binding = _provisioned(concierge_home)
     profile_dir = concierge_home / "profiles" / binding["profile"]
@@ -278,7 +296,7 @@ def test_seed_credentials_never_touches_hub_env(concierge_home):
     assert (concierge_home / ".env").read_bytes() == before
 
 
-def test_secret_files_pinned_0600_even_from_loose_hub_files(concierge_home):
+def test_secret_files_pinned_0600_even_from_loose_hub_files(concierge_home, honcho_oauth):
     """Explicit 0600, not inherited: hub copies land umask-loose (0644) yet the
     bot's .env and honcho.json are owner-only."""
     (concierge_home / ".env").write_text("OPENAI_API_KEY=sk-x\nDISCORD_BOT_TOKEN=secret\n")
@@ -298,7 +316,7 @@ def test_secret_files_pinned_0600_even_from_loose_hub_files(concierge_home):
     assert "DISCORD_BOT_TOKEN" not in env_path.read_text()
 
 
-def test_honcho_bot_seeds_the_memory_provider_activation_key(concierge_home):
+def test_honcho_bot_seeds_the_memory_provider_activation_key(concierge_home, honcho_oauth):
     """Task 9.1 invariant: a ``memory_provider='honcho'`` blueprint must
     ACTIVATE the Honcho provider in the bot profile, not just install its
     connection config. The real activation key (verified against the
@@ -316,7 +334,7 @@ def test_honcho_bot_seeds_the_memory_provider_activation_key(concierge_home):
     assert cfg["memory"] == {"provider": "honcho"}
 
 
-def test_install_honcho_synthesizes_from_static_key_never_copies_oauth(concierge_home):
+def test_install_honcho_synthesizes_from_static_key_never_copies_oauth(concierge_home, honcho_oauth):
     """The M5 contract (supersedes the byte-copy): the bot's honcho.json is
     SYNTHESIZED from a usable STATIC service key — never a byte-copy of the
     hub's file. Honcho OAuth grants are per-profile-host single-use refresh
@@ -391,7 +409,7 @@ def test_install_honcho_synthesizes_from_static_key_never_copies_oauth(concierge
     }
 
 
-def test_install_honcho_rejects_expired_oauth_root_key_and_skips_memory(concierge_home, caplog):
+def test_install_honcho_rejects_expired_oauth_root_key_and_skips_memory(concierge_home, honcho_oauth, caplog):
     """The live incident: the hub's honcho.json root ``apiKey`` is an
     expired OAuth access token (``hch-at-`` prefix) and no static key exists
     anywhere in the file. Propagating that key would give the bot auth that
@@ -427,7 +445,7 @@ def test_install_honcho_rejects_expired_oauth_root_key_and_skips_memory(concierg
     assert len(warnings) == 1
 
 
-def test_install_honcho_prefers_root_service_api_key(concierge_home):
+def test_install_honcho_prefers_root_service_api_key(concierge_home, honcho_oauth):
     """A root ``serviceApiKey`` (a static service key, e.g. one minted for
     headless/bot use) beats the root ``apiKey`` — which may be the hub's
     transient OAuth access token. Same static-only test as ``apiKey``: a
@@ -448,7 +466,7 @@ def test_install_honcho_prefers_root_service_api_key(concierge_home):
     assert "hch-at-oauth-token" not in bot_cfg_path.read_text()
 
 
-def test_install_honcho_falls_back_to_static_host_block_key(concierge_home):
+def test_install_honcho_falls_back_to_static_host_block_key(concierge_home, honcho_oauth):
     """No root key (or only an OAuth root token), but the hub's active host
     block (``hermes``) carries a STATIC key: that key works — the bot's host
     lookup falls back to root apiKey, and a static key never refreshes or
@@ -469,6 +487,29 @@ def test_install_honcho_falls_back_to_static_host_block_key(concierge_home):
     assert "hosts" not in bot_cfg and "oauth" not in bot_cfg
     # the rejected OAuth token never reaches the bot file
     assert "hch-at-expired" not in bot_cfg_path.read_text()
+
+
+def test_install_honcho_skips_memory_when_plugin_not_installed(
+        concierge_home, monkeypatch, caplog):
+    """The post-merge contract: Honcho left the bundled tree for a catalog
+    plugin (upstream), so a hub honcho.json with the plugin NOT installed
+    must degrade to the honest skip — no bot honcho.json, no
+    memory.provider seed, one WARNING naming the fix — never crash the
+    provision."""
+    import logging
+
+    # deterministic on any checkout: block the module path even where the
+    # catalog plugin happens to be installed
+    monkeypatch.setitem(sys.modules, "plugins.memory.honcho", None)
+    monkeypatch.setitem(sys.modules, "plugins.memory.honcho.oauth", None)
+    (concierge_home / "honcho.json").write_text('{"apiKey": "honcho-key"}')
+    with caplog.at_level(logging.WARNING, logger="concierge.provision"):
+        binding = _provisioned(concierge_home, key="reminders")
+    profile_dir = concierge_home / "profiles" / binding["profile"]
+    assert not (profile_dir / "honcho.json").exists()
+    cfg = _yaml(profile_dir / "config.yaml")
+    assert cfg.get("memory", {}).get("provider") in (None, "")
+    assert "honcho plugin not installed" in caplog.text
 
 
 def test_non_memory_bot_carries_no_memory_activation(concierge_home):
@@ -667,7 +708,7 @@ def test_reprovision_failure_rolls_back_new_bot_keeps_channel_routed(concierge_h
     routine step fails): the NEW half-built profile is rolled back and the
     original error propagates. The channel keeps no stale binding to the
     deleted old bot — a retry provisions cleanly from scratch."""
-    first = _provisioned(concierge_home, key="reminders")
+    _first = _provisioned(concierge_home, key="reminders")
     from cron import jobs as cron_jobs
 
     _real_create_job = cron_jobs.create_job

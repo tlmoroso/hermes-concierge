@@ -15,13 +15,13 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG
 class ConciergeSettings:
     enabled: bool
     hub_profile: str
-    managed_category_ids: List[str] = field(default_factory=list)
+    managed_category_ids: list[str] = field(default_factory=list)
     default_provider_group: Optional[str] = None
-    provider_groups: Dict[str, Dict] = field(default_factory=dict)
+    provider_groups: dict[str, dict] = field(default_factory=dict)
     location_channel_id: Optional[str] = None
 
 
-def concierge_settings(cfg: Optional[Dict] = None) -> ConciergeSettings:
+def concierge_settings(cfg: Optional[dict] = None) -> ConciergeSettings:
     """Merge a loaded config dict over DEFAULT_CONFIG['concierge'].
 
     ``cfg`` is the full config dict from any of the three loaders; None means

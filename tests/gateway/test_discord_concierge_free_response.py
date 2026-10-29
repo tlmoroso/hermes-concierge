@@ -15,7 +15,7 @@ DiscordAdapter over the conftest discord mock with ``handle_message``
 await-mocked at the gateway boundary.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -24,12 +24,12 @@ import pytest
 from concierge import registry
 from gateway.config import PlatformConfig
 
-from tests.gateway.conftest import _ensure_discord_mock  # noqa: E402
+from tests.gateway.conftest import _ensure_discord_mock
 
 _ensure_discord_mock()
 
-import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+import plugins.platforms.discord.adapter as discord_platform
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 BOUND_CHANNEL = 1553803778493382688
 ROOM_CHANNEL = 1553809999999999999
@@ -51,7 +51,7 @@ def make_message(*, channel, content: str):
         mentions=[],
         attachments=[],
         reference=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
         channel=channel,
         author=author,
         type=discord_platform.discord.MessageType.default,

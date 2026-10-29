@@ -15,7 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -375,7 +375,7 @@ class TestInstall:
         with use_cron_store(staged):
             shipped = list_jobs(include_disabled=True)[0]
             update_job(shipped["id"], {
-                "next_run_at": (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+                "next_run_at": (datetime.now(UTC) - timedelta(days=2)).isoformat()
             })
         (staged / "cron" / "future-runtime.bin").write_text("runtime", encoding="utf-8")
         (staged / "skills" / ".future-runtime").write_text("runtime", encoding="utf-8")
@@ -489,6 +489,8 @@ class TestUpdate:
         (staged / "skills" / "research" / "web-search" / "SKILL.md").write_text("author v2\n", encoding="utf-8")
         (staged / "skills" / "research" / "arxiv").mkdir()
         (staged / "skills" / "research" / "arxiv" / "SKILL.md").write_text("new author skill\n", encoding="utf-8")
+        # Category metadata beyond DESCRIPTION.md must not turn the category into a root.
+        (staged / "skills" / "research" / "README.md").write_text("about research\n", encoding="utf-8")
 
         update_distribution("rb")
 
@@ -497,6 +499,12 @@ class TestUpdate:
         assert not (research / "web-search" / "stale.txt").exists()  # an owned root is still replaced whole
         assert (research / "arxiv" / "SKILL.md").exists()
         assert (research / "DESCRIPTION.md").read_text(encoding="utf-8") == "research skills\n"
+        assert (research / "README.md").read_text(encoding="utf-8") == "about research\n"
+        # A dir inside a skill is part of that skill: owning ``web-search/scripts`` replaces it whole.
+        from hermes_cli.profile_distribution import _merges_per_root
+        scripts = staged / "skills" / "research" / "web-search" / "scripts"
+        scripts.mkdir()
+        assert not _merges_per_root(scripts, ("skills", "research", "web-search", "scripts"))
 
     def test_an_owned_category_refuses_a_symlinked_subcategory_before_writing(self, profile_env, tmp_path):
         staged, plan = self._owned_category(profile_env, "rb")
@@ -822,7 +830,7 @@ class TestInstalledAtStamp:
         class _FakeDT(_dt.datetime):
             @classmethod
             def now(cls, tz=None):
-                return _dt.datetime(2099, 1, 1, 0, 0, 0, tzinfo=tz or _dt.timezone.utc)
+                return _dt.datetime(2099, 1, 1, 0, 0, 0, tzinfo=tz or _dt.UTC)
         monkeypatch.setattr(
             "hermes_cli.profile_distribution.datetime", _FakeDT, raising=True
         )

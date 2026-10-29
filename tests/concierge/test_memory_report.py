@@ -98,7 +98,7 @@ def test_report_asks_the_prewarm_question_of_the_user_peer_uncapped():
     client = StubDialecticClient(summary="something")
     memory_report.build_memory_report(client)
     (call,) = _dialectic_calls(client)
-    _name, session_key, query, kw = call
+    _name, _session_key, query, kw = call
     assert query == (
         "Summarize what you know about this user. Focus on preferences, "
         "current projects, and working style.")

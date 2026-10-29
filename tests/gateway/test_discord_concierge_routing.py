@@ -42,13 +42,13 @@ from gateway.profile_routing import parse_profile_routes
 from gateway.session_identity import canonical_identity
 from gateway.platforms.base import BasePlatformAdapter
 
-from tests.gateway.conftest import _ensure_discord_mock  # noqa: E402
+from tests.gateway.conftest import _ensure_discord_mock
 
 _ensure_discord_mock()
 
-import discord  # noqa: E402  (the mock above; same module object the adapter sees)
+import discord
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 _RUNNER_HOLDER: dict = {}
@@ -1306,7 +1306,7 @@ def test_room_history_includes_foreign_bots_with_allow_bots(concierge_rig, monke
     include-other-bots behavior)."""
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     rig = concierge_rig
-    shared = _arm_shared_identity(rig)
+    _shared = _arm_shared_identity(rig)
     alice = _room_author(name="Alice", id=42)
     foreign = _room_author(name="OtherBot", id=777, bot=True)
 

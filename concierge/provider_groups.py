@@ -13,10 +13,10 @@ from typing import Dict, Optional
 
 from concierge.blueprints import ModelPreset
 
-__all__ = ["resolve_provider_group", "apply_group_to_preset"]
+__all__ = ["apply_group_to_preset", "resolve_provider_group"]
 
 
-def _annotated(group: Dict, name: str) -> Dict:
+def _annotated(group: dict, name: str) -> dict:
     """The winning group as a COPY carrying its config key under ``"name"``.
 
     The registry binding stores that key (``bind_channel(provider_group=...)``),
@@ -28,9 +28,9 @@ def _annotated(group: Dict, name: str) -> Dict:
     return {**group, "name": str(name)}
 
 
-def resolve_provider_group(groups: Dict[str, Dict], *, guild_id: Optional[str],
+def resolve_provider_group(groups: dict[str, dict], *, guild_id: Optional[str],
                            category_id: Optional[str],
-                           default_group: Optional[str] = None) -> Optional[Dict]:
+                           default_group: Optional[str] = None) -> Optional[dict]:
     """Most-specific match wins: category -> guild -> default. None if nothing.
 
     The winner is returned ANNOTATED with its config key under ``"name"`` (see
@@ -56,7 +56,7 @@ def resolve_provider_group(groups: Dict[str, Dict], *, guild_id: Optional[str],
     return None
 
 
-def apply_group_to_preset(group: Optional[Dict], preset: ModelPreset) -> ModelPreset:
+def apply_group_to_preset(group: Optional[dict], preset: ModelPreset) -> ModelPreset:
     """A matched group overrides the blueprint's preset; no group = preset as-is.
 
     A group missing ``provider`` or ``model`` raises KeyError naming the

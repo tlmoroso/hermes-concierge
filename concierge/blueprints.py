@@ -11,8 +11,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-__all__ = ["ModelPreset", "BotBlueprint", "RoutineTemplate",
-           "MODEL_PRESETS", "CATALOG", "get_blueprint", "blueprint_choices"]
+__all__ = [
+    "CATALOG",
+    "MODEL_PRESETS",
+    "BotBlueprint",
+    "ModelPreset",
+    "RoutineTemplate",
+    "blueprint_choices",
+    "get_blueprint",
+]
 
 
 @dataclass(frozen=True)
@@ -25,7 +32,7 @@ class ModelPreset:
 # model.default z-ai/glm-5.3-flash, provider nous). Bots pin ONE preset at creation
 # (never swapped mid-conversation - prompt-caching invariant). Presets are data,
 # retunable here in one place.
-MODEL_PRESETS: Dict[str, ModelPreset] = {
+MODEL_PRESETS: dict[str, ModelPreset] = {
     "nano": ModelPreset(provider="nous", model="z-ai/glm-5.3-flash"),
     "core": ModelPreset(provider="nous", model="z-ai/glm-5.3"),
 }
@@ -48,15 +55,15 @@ class BotBlueprint:
     title: str                            # Discord-facing name
     description: str                      # one-line picker copy
     model_preset: str                     # key into MODEL_PRESETS
-    toolsets: Tuple[str, ...]             # allowlist; everything else stays OFF
-    skills: Tuple[str, ...]               # exact skills copied into the profile
+    toolsets: tuple[str, ...]             # allowlist; everything else stays OFF
+    skills: tuple[str, ...]               # exact skills copied into the profile
     soul: str                             # SOUL.md template; {name} substituted
     routine: Optional[RoutineTemplate] = None
     memory_provider: Optional[str] = None  # "honcho" or None
-    connects: Tuple[str, ...] = ()         # account kinds needed ("calendar", "email", ...)
+    connects: tuple[str, ...] = ()         # account kinds needed ("calendar", "email", ...)
 
 
-CATALOG: Dict[str, BotBlueprint] = {bp.key: bp for bp in (
+CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
     BotBlueprint(
         key="reminders",
         title="Reminder Bot",
@@ -204,7 +211,7 @@ def get_blueprint(key: str) -> BotBlueprint:
         raise KeyError(f"Unknown blueprint '{key}'. Known: {known}") from None
 
 
-def blueprint_choices() -> List[Dict[str, str]]:
+def blueprint_choices() -> list[dict[str, str]]:
     """Discord select-menu choices, catalog order preserved."""
     return [{"value": bp.key, "label": bp.title, "description": bp.description}
             for bp in CATALOG.values()]

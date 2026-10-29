@@ -104,7 +104,7 @@ from utils import atomic_json_write, atomic_write_bytes, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["create_bot", "retire_bot", "bot_status"]
+__all__ = ["bot_status", "create_bot", "retire_bot"]
 
 _PROFILE_PREFIX = "bot"
 
@@ -117,7 +117,7 @@ _PROVISION_LOCK_TIMEOUT_SECONDS = 60.0
 # In-process half of the per-channel provision lock: a gateway thread per
 # inbound event can provision concurrently. Keyed by channel id; one RLock per
 # channel ever provisioned (tiny, and removing entries races waiters).
-_provision_thread_locks: Dict[str, threading.RLock] = {}
+_provision_thread_locks: dict[str, threading.RLock] = {}
 _provision_thread_locks_guard = threading.Lock()
 
 
@@ -192,7 +192,7 @@ def _channel_provision_lock(channel_id: str):
             registry._release_flock(lock_fd)  # unlocks and closes
 
 
-def _seed_profile_config(profile_dir: Path, updates: Dict) -> None:
+def _seed_profile_config(profile_dir: Path, updates: dict) -> None:
     """Read-modify-write the FRESH profile's config.yaml with atomic replace.
 
     Safe here because we own the file from cradle: create_profile just wrote
@@ -261,7 +261,19 @@ def _static_honcho_key(raw: dict) -> Optional[str]:
     per-profile-host refresh chain cannot follow it into the bot's file) —
     propagating one hands the bot auth that is already dead.
     """
-    from plugins.memory.honcho.oauth import is_oauth_access_token
+    try:
+        from plugins.memory.honcho.oauth import is_oauth_access_token
+    except ImportError:
+        # Upstream moved Honcho from the bundled tree to a catalog plugin
+        # (``hermes plugins install honcho``). A hub honcho.json with the
+        # plugin not installed degrades to "no usable key" — the same honest
+        # outcome as any other unusable Honcho credential: provisioning
+        # skips the memory seed instead of crashing.
+        logger.warning(
+            "concierge: honcho plugin not installed — memory disabled "
+            "(hermes plugins install honcho)"
+        )
+        return None
 
     hosts = raw.get("hosts") or {}
     active_host = str(raw.get("defaultHost") or "hermes").strip() or "hermes"
@@ -337,7 +349,7 @@ def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
             profile_name,
         )
         return False
-    bot_cfg: Dict = {"apiKey": static_key}
+    bot_cfg: dict = {"apiKey": static_key}
     for key in _HONCHO_TUNING_KEYS:
         if key in raw:
             bot_cfg[key] = raw[key]
@@ -345,7 +357,7 @@ def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
     return True
 
 
-def _seed_credentials(profile_dir: Path) -> Dict[str, list]:
+def _seed_credentials(profile_dir: Path) -> dict[str, list]:
     """Copy the hub's .env into the bot profile, minus channel settings.
 
     Profiles are credential islands (no inheritance from the hub or the
@@ -476,10 +488,10 @@ def create_bot(
     *,
     channel_id: str,
     guild_id: Optional[str] = None,
-    provider_group: Optional[Dict] = None,
+    provider_group: Optional[dict] = None,
     source_skills_dir: Optional[Path] = None,
     display_name: Optional[str] = None,
-) -> Dict:
+) -> dict:
     """Create (or return the existing) bot bound to ``channel_id``.
 
     Idempotent per channel: a channel never gets two bots. The whole
@@ -693,7 +705,7 @@ def retire_bot(profile_name: str, *, delete_profile: bool = False) -> None:
         registry.unbind_channel(channel_id)
 
 
-def bot_status(profile_name: str) -> Dict:
+def bot_status(profile_name: str) -> dict:
     """One bot's channels + routine state, for /bot list."""
     try:
         profile_dir = get_profile_dir(profile_name)

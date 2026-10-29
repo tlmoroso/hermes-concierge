@@ -39,20 +39,30 @@ from __future__ import annotations
 import base64
 import logging
 import uuid
-import xml.etree.ElementTree as ElementTree
+from xml.etree import ElementTree
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, UTC
 from typing import Any, Dict, List, Mapping, Optional, Protocol
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "CalendarEvent", "Reminder", "TransportResponse", "CalDAVTransport",
-    "RequestsTransport", "CalDAVClient", "MissingCredentials",
-    "parse_events", "parse_todos", "escape_text", "format_ical_utc",
-    "build_reminder_vtodo", "build_events_time_range_query",
-    "build_incomplete_todos_query", "icloud_credentials_from_env",
+    "CalDAVClient",
+    "CalDAVTransport",
+    "CalendarEvent",
+    "MissingCredentials",
+    "Reminder",
+    "RequestsTransport",
+    "TransportResponse",
+    "build_events_time_range_query",
+    "build_incomplete_todos_query",
+    "build_reminder_vtodo",
     "client_from_env",
+    "escape_text",
+    "format_ical_utc",
+    "icloud_credentials_from_env",
+    "parse_events",
+    "parse_todos",
 ]
 
 ICLOUD_SERVER_URL = "https://caldav.icloud.com"
@@ -102,9 +112,9 @@ class Reminder:
 # RFC 5545 parsing (pure — fixtures in, dataclasses out, never raises)
 # ---------------------------------------------------------------------------
 
-def _unfold(text: str) -> List[str]:
+def _unfold(text: str) -> list[str]:
     """Logical lines: RFC 5545 folds long lines with CRLF + space/tab."""
-    lines: List[str] = []
+    lines: list[str] = []
     for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         if raw[:1] in (" ", "\t") and lines:
             lines[-1] += raw[1:]
@@ -156,13 +166,13 @@ def _parse_ical_dt(value: str) -> Any:
         if "T" not in value:  # date-only (VALUE=DATE): no time part
             return datetime.strptime(value, _ICAL_DATE).date()
         if value.endswith("Z"):
-            return datetime.strptime(value, _ICAL_DT_Z).replace(tzinfo=timezone.utc)
+            return datetime.strptime(value, _ICAL_DT_Z).replace(tzinfo=UTC)
         return datetime.strptime(value, _ICAL_DT)  # floating / TZID-qualified
     except ValueError:
         return None
 
 
-def _components(lines: List[str], kind: str) -> List[Dict[str, str]]:
+def _components(lines: list[str], kind: str) -> list[dict[str, str]]:
     """Property lists of every BEGIN:<kind>...END:<kind> block, unfolded.
 
     Lines inside NESTED components (a VTODO's or VEVENT's VALARM) belong to
@@ -175,7 +185,7 @@ def _components(lines: List[str], kind: str) -> List[Dict[str, str]]:
         prop = _split_property(line)
         if prop is None:
             continue
-        name, params, value = prop
+        name, _params, value = prop
         if current is not None and depth:  # inside a nested sub-component
             if name == "BEGIN":
                 depth += 1
@@ -195,7 +205,7 @@ def _components(lines: List[str], kind: str) -> List[Dict[str, str]]:
     return blocks
 
 
-def parse_events(text: str) -> List[CalendarEvent]:
+def parse_events(text: str) -> list[CalendarEvent]:
     """Every VEVENT in an iCalendar payload (garbage/empty → [])."""
     events = []
     for block in _components(_unfold(text), "VEVENT"):
@@ -209,7 +219,7 @@ def parse_events(text: str) -> List[CalendarEvent]:
     return events
 
 
-def parse_todos(text: str) -> List[Reminder]:
+def parse_todos(text: str) -> list[Reminder]:
     """Every VTODO in an iCalendar payload (garbage/empty → [])."""
     todos = []
     for block in _components(_unfold(text), "VTODO"):
@@ -239,15 +249,15 @@ def escape_text(value: str) -> str:
 def format_ical_utc(moment: datetime) -> str:
     """...Z form; a naive datetime is treated as UTC."""
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(timezone.utc).strftime(_ICAL_DT_Z)
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).strftime(_ICAL_DT_Z)
 
 
 def _fold(text: str) -> str:
     """Fold every logical line to <=75 octets (UTF-8) with CRLF + space. The
     continuation line's leading space COUNTS toward its 75, and folding happens
     on character boundaries so multibyte text is never split mid-codepoint."""
-    out_lines: List[str] = []
+    out_lines: list[str] = []
     for logical in text.replace("\r\n", "\n").split("\n"):
         if len(logical.encode("utf-8")) <= _LINE_OCTET_LIMIT:
             out_lines.append(logical)
@@ -268,7 +278,7 @@ def build_reminder_vtodo(summary: str, *, due: Optional[datetime] = None,
                          notes: Optional[str] = None, uid: Optional[str] = None,
                          dtstamp: Optional[datetime] = None) -> str:
     """The iCalendar body for creating a reminder (POST to a VTODO collection)."""
-    stamp = format_ical_utc(dtstamp or datetime.now(timezone.utc))
+    stamp = format_ical_utc(dtstamp or datetime.now(UTC))
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
@@ -326,14 +336,14 @@ def build_incomplete_todos_query() -> str:
 class TransportResponse:
     status: int
     body: str
-    headers: Dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class CalDAVTransport(Protocol):
     """One HTTP round-trip. The ONLY place network lives; everything else is pure."""
 
     def request(self, method: str, url: str, *, body: Optional[str] = None,
-                headers: Optional[Dict[str, str]] = None) -> TransportResponse: ...
+                headers: Optional[dict[str, str]] = None) -> TransportResponse: ...
 
 
 class RequestsTransport:
@@ -346,14 +356,14 @@ class RequestsTransport:
         self._password = password
         self._timeout = timeout
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         token = base64.b64encode(
             f"{self._username}:{self._password}".encode()).decode()
         return {"Authorization": f"Basic {token}",
                 "Content-Type": "text/calendar; charset=utf-8"}
 
     def request(self, method: str, url: str, *, body: Optional[str] = None,
-                headers: Optional[Dict[str, str]] = None) -> TransportResponse:
+                headers: Optional[dict[str, str]] = None) -> TransportResponse:
         import requests  # core dependency; lazy so pure parsing needs no HTTP stack
 
         merged = {**self._headers(), **(headers or {})}
@@ -367,7 +377,7 @@ class RequestsTransport:
 # Client
 # ---------------------------------------------------------------------------
 
-def _calendar_data_bodies(xml_text: str) -> List[str]:
+def _calendar_data_bodies(xml_text: str) -> list[str]:
     """calendar-data payloads from a 207 multistatus REPORT response (by local
     name — DAV prefixes vary across servers)."""
     try:
@@ -403,7 +413,7 @@ class CalDAVClient:
         return path if path.startswith(("http://", "https://")) \
             else f"{self.server_url}/{path.lstrip('/')}"
 
-    def _report(self, url: str, query_body: str) -> List[str]:
+    def _report(self, url: str, query_body: str) -> list[str]:
         response = self._transport.request(
             "REPORT", self._url(url), body=query_body, headers={"Depth": "1"})
         if response.status not in (200, 207):
@@ -412,22 +422,22 @@ class CalDAVClient:
         return _calendar_data_bodies(response.body)
 
     def list_today_events(self, calendar_url: str,
-                          today: Optional[date] = None) -> List[CalendarEvent]:
+                          today: Optional[date] = None) -> list[CalendarEvent]:
         """Events overlapping today (the server's time-range filter)."""
-        day = today or datetime.now(timezone.utc).date()
-        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+        day = today or datetime.now(UTC).date()
+        start = datetime(day.year, day.month, day.day, tzinfo=UTC)
         end = start + timedelta(days=1)
-        events: List[CalendarEvent] = []
+        events: list[CalendarEvent] = []
         for body in self._report(calendar_url,
                                  build_events_time_range_query(start, end)):
             events.extend(parse_events(body))
         return events
 
-    def list_incomplete_reminders(self, reminders_url: str) -> List[Reminder]:
+    def list_incomplete_reminders(self, reminders_url: str) -> list[Reminder]:
         """Open reminders (no COMPLETED stamp). The server filter is primary;
         the client re-filters because Apple occasionally returns completed
         VTODOs alongside."""
-        reminders: List[Reminder] = []
+        reminders: list[Reminder] = []
         for body in self._report(reminders_url, build_incomplete_todos_query()):
             reminders.extend(parse_todos(body))
         return [r for r in reminders
@@ -452,7 +462,7 @@ class CalDAVClient:
 # Credentials — env only, never hardcoded
 # ---------------------------------------------------------------------------
 
-def icloud_credentials_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[Dict[str, str]]:
+def icloud_credentials_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[dict[str, str]]:
     """iCloud CalDAV credentials from the environment (``.env``-sourced at boot):
     ``ICLOUD_USERNAME`` + ``ICLOUD_APP_PASSWORD``. None when either is missing —
     the caller decides between "no bridge" and a loud error."""

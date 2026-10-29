@@ -57,15 +57,15 @@ from concierge.blueprints import CATALOG
 
 __all__ = [
     "DASHBOARD_PATHS",
+    "account_probe",
+    "build_connect_kind_reply",
+    "build_connect_status",
+    "build_nudge_response",
+    "connect_links",
+    "dashboard_base_url",
+    "missing_connections",
     "needed_kinds",
     "probe_profile_for",
-    "missing_connections",
-    "connect_links",
-    "build_connect_status",
-    "build_connect_kind_reply",
-    "build_nudge_response",
-    "account_probe",
-    "dashboard_base_url",
 ]
 
 logger = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # ladder (a new account kind is one entry here, zero code paths). ``label``
 # is the user-facing name; ``path`` is the SPA client route discovered in
 # Task 8.1 (see the module docstring for what each page actually does).
-DASHBOARD_PATHS: Dict[str, Dict[str, str]] = {
+DASHBOARD_PATHS: dict[str, dict[str, str]] = {
     "email": {"label": "Email", "path": "/messaging"},
     "calendar": {"label": "Calendar", "path": "/settings?tab=keys"},
 }
@@ -106,7 +106,7 @@ def _kind_label(kind: str, kind_paths: Mapping[str, Mapping[str, str]]) -> str:
     return str(kind).replace("_", " ").strip().title()
 
 
-def _connects_of(source: Any) -> List[str]:
+def _connects_of(source: Any) -> list[str]:
     """The account kinds *source* declares: a BotBlueprint (``.connects``)
     or a bare connects iterable, duck-typed. Non-string entries are
     skipped (a hand-edited catalog must not crash the nudge decision)."""
@@ -116,7 +116,7 @@ def _connects_of(source: Any) -> List[str]:
     return [k for k in connects if isinstance(k, str) and k.strip()]
 
 
-def missing_connections(source: Any, probe: Callable[[str], bool]) -> List[str]:
+def missing_connections(source: Any, probe: Callable[[str], bool]) -> list[str]:
     """The UNCONFIGURED account kinds *source* (a BotBlueprint, or a bare
     ``connects`` tuple) needs — ``connects`` order preserved, deduped.
 
@@ -125,7 +125,7 @@ def missing_connections(source: Any, probe: Callable[[str], bool]) -> List[str]:
     ``connects`` returns ``[]`` without ever calling ``probe`` — the
     reminders/researcher/notes bots pay zero hot-path probe work.
     """
-    missing: List[str] = []
+    missing: list[str] = []
     for kind in _connects_of(source):
         if kind in missing:
             continue
@@ -138,7 +138,7 @@ def connect_links(
     missing: Sequence[str],
     base_url: Optional[str],
     kind_paths: Mapping[str, Mapping[str, str]] = DASHBOARD_PATHS,
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Deep-link payloads for the missing kinds: ``{"kind", "label", "url"}``
     per MAPPED kind, dashboard base + the discovered page path.
 
@@ -151,7 +151,7 @@ def connect_links(
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return []
-    links: List[Dict[str, str]] = []
+    links: list[dict[str, str]] = []
     for kind in missing:
         entry = kind_paths.get(kind) if isinstance(kind, str) else None
         if not isinstance(entry, Mapping):
@@ -169,7 +169,7 @@ def connect_links(
 
 def needed_kinds(
     bindings: Mapping[str, Any], guild_id: Optional[str],
-) -> List[str]:
+) -> list[str]:
     """The account kinds this guild's bound bots depend on: the deduped
     union of their blueprints' ``connects``, first-seen order.
 
@@ -179,7 +179,7 @@ def needed_kinds(
     keys and junk entries are skipped defensively — a hand-edited registry
     must not crash the /connect listing.
     """
-    kinds: List[str] = []
+    kinds: list[str] = []
     for binding in bindings.values():
         if not isinstance(binding, Mapping):
             continue
@@ -221,7 +221,7 @@ def build_connect_status(
     configured: Mapping[str, bool],
     base_url: Optional[str],
     kind_paths: Mapping[str, Mapping[str, str]] = DASHBOARD_PATHS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The ``/connect`` no-arg listing: ``{"lines", "links", "empty"}``.
 
     ``lines`` carry the configured/unconfigured status per needed kind
@@ -233,8 +233,8 @@ def build_connect_status(
     kinds = needed_kinds(bindings, guild_id)
     if not kinds:
         return {"lines": [], "links": [], "empty": True}
-    lines: List[str] = []
-    unconfigured: List[str] = []
+    lines: list[str] = []
+    unconfigured: list[str] = []
     for kind in kinds:
         label = _kind_label(kind, kind_paths)
         if configured.get(kind):
@@ -252,7 +252,7 @@ def build_connect_kind_reply(
     configured: Optional[bool],
     base_url: Optional[str],
     kind_paths: Mapping[str, Mapping[str, str]] = DASHBOARD_PATHS,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The ``/connect <kind>`` reply: ``{"content", "link"}`` where ``link``
     is a ``connect_links`` entry (or ``None`` when there is nothing to tap).
 
@@ -287,7 +287,7 @@ def build_nudge_response(
     missing: Sequence[str],
     links: Sequence[Mapping[str, str]],
     kind_paths: Mapping[str, Mapping[str, str]] = DASHBOARD_PATHS,
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """The first-message nudge copy: ``{"text"}``.
 
     With links (Task 8.2's shape, adapted naturally): "I need access to your
@@ -299,7 +299,7 @@ def build_nudge_response(
     """
     by_kind = {str(link.get("kind")): link for link in links
                if isinstance(link, Mapping)}
-    rows: List[str] = []
+    rows: list[str] = []
     for kind in missing:
         label = _kind_label(str(kind), kind_paths)
         link = by_kind.get(str(kind))
@@ -354,7 +354,7 @@ def _email_configured(_profile: str) -> bool:
 # kind -> checker(profile) -> configured?  DATA: a new account kind is one
 # entry here plus one in DASHBOARD_PATHS. Kinds without a checker read as
 # CONFIGURED (fail-open — the nudge must be certain before it nags).
-_KIND_CHECKS: Dict[str, Callable[[str], bool]] = {
+_KIND_CHECKS: dict[str, Callable[[str], bool]] = {
     "calendar": _calendar_configured,
     "email": _email_configured,
 }

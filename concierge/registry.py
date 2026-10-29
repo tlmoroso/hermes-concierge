@@ -53,11 +53,22 @@ except ImportError:  # pragma: no cover - non-Windows
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["registry_path", "load_registry", "bind_channel", "unbind_channel",
-           "get_binding", "channels_for_profile", "list_bindings",
-           "MAX_ROOM_MEMBERS", "create_room", "room_members",
-           "add_to_room", "remove_from_room",
-           "nudged_connections", "mark_connections_nudged"]
+__all__ = [
+    "MAX_ROOM_MEMBERS",
+    "add_to_room",
+    "bind_channel",
+    "channels_for_profile",
+    "create_room",
+    "get_binding",
+    "list_bindings",
+    "load_registry",
+    "mark_connections_nudged",
+    "nudged_connections",
+    "registry_path",
+    "remove_from_room",
+    "room_members",
+    "unbind_channel",
+]
 
 REGISTRY_VERSION = 1
 
@@ -99,7 +110,7 @@ def _registry_lock_file() -> Path:
     return registry_path().parent / ".registry.lock"
 
 
-def _empty_registry() -> Dict:
+def _empty_registry() -> dict:
     return {"version": REGISTRY_VERSION, "bindings": {}, "rooms": {}}
 
 
@@ -114,12 +125,12 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return True
-            except (OSError, IOError):
+            except OSError:
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.1)
     if msvcrt is not None:
-        getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)
         return True
     return None
 
@@ -130,8 +141,8 @@ def _release_flock(lock_fd) -> None:
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         elif msvcrt is not None:
-            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-    except (OSError, IOError):
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
         pass
     finally:
         lock_fd.close()
@@ -173,7 +184,7 @@ def _registry_lock():
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
-            except (OSError, IOError) as e:
+            except OSError as e:
                 # A locking failure must never take down registry writes — the
                 # in-process lock is still held.
                 logger.warning("registry.json cross-process lock unavailable (%s); "
@@ -222,7 +233,7 @@ def _warn_registry_unreadable_once(path) -> None:
         path, exc_info=True)
 
 
-def _clean_section(raw: Dict, path: Path, key: str, singular: str) -> bool:
+def _clean_section(raw: dict, path: Path, key: str, singular: str) -> bool:
     """Normalize a top-level ``key`` holding a channel->entry mapping
     (``bindings``/``rooms`` — one shared tolerance policy, not two copies):
 
@@ -255,7 +266,7 @@ def _clean_section(raw: Dict, path: Path, key: str, singular: str) -> bool:
     return True
 
 
-def load_registry() -> Dict:
+def load_registry() -> dict:
     path = registry_path()
     if not path.exists():
         return _empty_registry()
@@ -293,7 +304,7 @@ def load_registry() -> Dict:
     return raw
 
 
-def _save(reg: Dict) -> None:
+def _save(reg: dict) -> None:
     path = registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_json_write(path, reg)
@@ -301,7 +312,7 @@ def _save(reg: Dict) -> None:
 
 def bind_channel(channel_id: str, *, profile: str, blueprint: str,
                  guild_id: Optional[str] = None,
-                 provider_group: Optional[str] = None) -> Dict:
+                 provider_group: Optional[str] = None) -> dict:
     """Bind a Discord channel to a bot profile (idempotent: rebind overwrites).
 
     Refuses (ValueError) a channel that is already a ROOM: a channel is a
@@ -337,24 +348,24 @@ def unbind_channel(channel_id: str) -> bool:
         return True
 
 
-def get_binding(channel_id: str) -> Optional[Dict]:
+def get_binding(channel_id: str) -> Optional[dict]:
     binding = load_registry()["bindings"].get(str(channel_id))
     return dict(binding) if isinstance(binding, dict) else None
 
 
-def channels_for_profile(profile: str) -> List[str]:
+def channels_for_profile(profile: str) -> list[str]:
     reg = load_registry()
     return [cid for cid, b in reg["bindings"].items() if b.get("profile") == profile]
 
 
-def list_bindings() -> Dict[str, Dict]:
+def list_bindings() -> dict[str, dict]:
     return dict(load_registry()["bindings"])
 
 
 # ── Rooms (Task 7.1): one channel, several member profiles ────────────────
 
 
-def _stored_members(room: Dict) -> List:
+def _stored_members(room: dict) -> list:
     """A room's members list, defensively: load_registry only guarantees the
     ENTRY is a dict, so a hand-edited members value must not crash a mutation
     (iterating a junk string would silently char-split it)."""
@@ -380,7 +391,7 @@ def _require_member_string(member) -> None:
             f"profile names")
 
 
-def _normalize_member_list(members) -> List[str]:
+def _normalize_member_list(members) -> list[str]:
     """Consume any iterable of profile names into a stored-order list,
     enforcing the invariants that apply to ANY whole-membership write
     (create_room): every entry is a non-blank, unpadded string
@@ -405,7 +416,7 @@ def _normalize_member_list(members) -> List[str]:
     return member_list
 
 
-def create_room(channel_id: str, members) -> Dict:
+def create_room(channel_id: str, members) -> dict:
     """Make ``channel_id`` a bot room holding ``members`` (any iterable of
     profile names); returns the stored room dict.
 
@@ -434,7 +445,7 @@ def create_room(channel_id: str, members) -> Dict:
         return dict(room)
 
 
-def room_members(channel_id: str) -> List[str]:
+def room_members(channel_id: str) -> list[str]:
     """The room's member profiles in stored (creation/add) order; [] when the
     channel is not a room (or the entry is hand-edited junk). This list feeds
     routing.resolve_room_targets — the adapter's "is this channel a room?"
@@ -445,7 +456,7 @@ def room_members(channel_id: str) -> List[str]:
     return [m for m in _stored_members(room) if isinstance(m, str)]
 
 
-def add_to_room(channel_id: str, profile: str) -> List[str]:
+def add_to_room(channel_id: str, profile: str) -> list[str]:
     """Add ``profile`` to the room on ``channel_id``; returns the new member
     list (the member goes LAST — stored order is creation/add order).
 
@@ -516,7 +527,7 @@ def remove_from_room(channel_id: str, profile: str) -> bool:
 # ── Task 8.2: connection-nudge state on the binding ────────────────────────
 
 
-def _binding_nudged(binding: Dict) -> List[str]:
+def _binding_nudged(binding: dict) -> list[str]:
     """A binding's nudged kinds, defensively: a hand-edited value must not
     crash the hot path (the registry's one tolerance policy — non-list
     reads as never-nudged, junk entries drop out, the next save
@@ -527,7 +538,7 @@ def _binding_nudged(binding: Dict) -> List[str]:
     return [k for k in stored if isinstance(k, str) and k.strip()]
 
 
-def nudged_connections(channel_id: str) -> List[str]:
+def nudged_connections(channel_id: str) -> list[str]:
     """The account kinds this channel's binding has ALREADY nudged about
     (Task 8.2 once-flag, registry-persisted so a gateway restart never
     re-nudges). ``[]`` when unbound, or for a binding written before the
@@ -539,7 +550,7 @@ def nudged_connections(channel_id: str) -> List[str]:
     return _binding_nudged(binding)
 
 
-def mark_connections_nudged(channel_id: str, kinds) -> List[str]:
+def mark_connections_nudged(channel_id: str, kinds) -> list[str]:
     """Record that the binding on *channel_id* nudged about *kinds* — MERGE
     into the stored list (order-preserving, deduped), never replace: the
     once-flag is per (binding, kind), so a newly required kind still gets

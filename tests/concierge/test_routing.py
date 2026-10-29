@@ -134,7 +134,7 @@ def test_verdict_is_a_plain_value_not_a_promise():
     assert verdict.profile == "p"
     assert verdict.routed is True
     with pytest.raises(AttributeError):
-        getattr(verdict, "no_such_attribute")  # slots keep the value object closed
+        verdict.no_such_attribute  # slots keep the value object closed
 
 
 # ── Task 5.5: the managed-category auto-offer decision ─────────────────────
