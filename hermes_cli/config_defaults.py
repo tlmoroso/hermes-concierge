@@ -2984,6 +2984,14 @@ OPTIONAL_ENV_VARS = {
         "https://discord.com/developers/applications", password=True),
     "DISCORD_ALLOWED_USERS": _msg("Comma-separated Discord user IDs allowed to use the bot",
         "Allowed Discord user IDs (comma-separated)", None),
+    "DISCORD_ADMIN_USERS": _msg("Comma-separated Discord user IDs with admin privileges "
+        "(can provision bots, run admin commands, use terminal/file bots); defaults to "
+        "DISCORD_ALLOWED_USERS when unset",
+        "Admin Discord user IDs (comma-separated)", None),
+    "DISCORD_USER_USERS": _msg("Comma-separated Discord user IDs with chat-only access "
+        "(can talk to existing bots in their own private space; cannot provision or use "
+        "terminal/file toolsets)",
+        "Chat-only Discord user IDs (comma-separated)", None),
     "DISCORD_REPLY_TO_MODE": _msg(
         "Discord reply threading mode: 'off' (no reply references), 'first' (reply on first "
         "message only, default), 'all' (reply on every chunk)",

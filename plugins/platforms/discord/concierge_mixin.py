@@ -1291,10 +1291,18 @@ class ConciergeDiscordMixin:
 
         @discord.app_commands.describe()
         async def _new(interaction: discord.Interaction):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_new(interaction)
 
         @discord.app_commands.describe(bot="The bot to retire (from /bot list)")
         async def _retire(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_retire(interaction, bot)
 
         async def _list(interaction: discord.Interaction) -> None:
@@ -1343,17 +1351,33 @@ class ConciergeDiscordMixin:
             topic="Optional topic — names the room's channel")
         async def _room_create(interaction: discord.Interaction,
                                topic: str | None = None):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_create(interaction, topic)
 
         @discord.app_commands.describe(bot="The bot to add (from /bot list)")
         async def _room_add(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_add(interaction, bot)
 
         @discord.app_commands.describe(bot="The bot to remove")
         async def _room_remove(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_remove(interaction, bot)
 
         async def _room_disband(interaction: discord.Interaction):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_disband(interaction)
 
         _room_create.__name__ = "concierge_room_create"
@@ -1387,6 +1411,10 @@ class ConciergeDiscordMixin:
                 kind="Optional: the account to connect (e.g. email, calendar)")
             async def _connect(interaction: discord.Interaction,
                                kind: str | None = None):
+                from concierge.auth_tiers import is_admin
+                if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                    await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                    return
                 await self._concierge_cmd_connect(interaction, kind)
 
             _connect.__name__ = "concierge_connect"
