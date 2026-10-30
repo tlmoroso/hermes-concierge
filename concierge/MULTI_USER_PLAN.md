@@ -104,9 +104,11 @@ Non-goal for v1: per-user bot *profiles* (too heavy; one bot profile per channel
 - Add DM routing: hub bot answers in DMs with isolated session keys.
 - Invariant tests for no cross-user session reuse.
 
-**Phase 3 — Memory partitioning**
-- Pass user id into memory provider init; Honcho workspaces keyed by `(bot, user)`.
-- Fallback: disable memory if partitioning unavailable.
+**Phase 3 — Memory partitioning** (status: fallback chosen)
+- Honcho is an external provider not in this repo; per-call user/session partitioning is unverified
+  (open question #1). Per the plan's fallback clause, multi-user/shared bots run with memory
+  DISABLED rather than risk cross-user recall, until Honcho partitioning is confirmed.
+- Single-owner bots keep memory enabled (backward compat).
 
 **Phase 4 — Data isolation**
 - Per-user `terminal.cwd` / worktree for terminal/file bots.
