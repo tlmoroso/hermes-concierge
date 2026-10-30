@@ -1291,10 +1291,6 @@ class ConciergeDiscordMixin:
 
         @discord.app_commands.describe()
         async def _new(interaction: discord.Interaction):
-            from concierge.auth_tiers import is_admin
-            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
-                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
-                return
             await self._concierge_cmd_new(interaction)
 
         @discord.app_commands.describe(bot="The bot to retire (from /bot list)")
@@ -1351,10 +1347,6 @@ class ConciergeDiscordMixin:
             topic="Optional topic — names the room's channel")
         async def _room_create(interaction: discord.Interaction,
                                topic: str | None = None):
-            from concierge.auth_tiers import is_admin
-            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
-                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
-                return
             await self._concierge_cmd_room_create(interaction, topic)
 
         @discord.app_commands.describe(bot="The bot to add (from /bot list)")

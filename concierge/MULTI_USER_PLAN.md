@@ -38,16 +38,17 @@ Non-goal for v1: per-user bot *profiles* (too heavy; one bot profile per channel
 
 ### 2.1 Private spaces, not shared channels
 
-- **DMs are the default private surface.** A user DMs the hub bot; the session key is
-  `discord:<bot>:dm:<user_id>` (or the platform's DM chat id, which is already user-unique).
-  No other user can see it. This is the lowest-friction private space and needs no new Discord
-  permissions.
-- **Per-user threads** as the opt-in "shared but private" surface: when a second user posts in
-  a bot channel, the bot (or the hub) creates a thread named for that user and routes the
-  conversation there, so the main channel stays a public lobby while each user's thread is
-  private (Discord thread membership is public, but content is at least separated; note threads
-  are still readable by anyone with channel access — DMs are the true privacy boundary).
-- **Recommend DMs for anything sensitive** (repo work, email triage, notes). Document this.
+- **Per-user personal categories** (the default private surface). When a user is admitted, the hub
+  creates (or reuses) a Discord category named for that user, permission-locked so only that user
+  and admins can see/create channels in it. The user provisions bots into channels inside their
+  own category; they never need to talk to the concierge directly — their bots live there.
+  Admins can still create public/shared spaces (categories/channels visible to multiple users).
+- **No direct concierge chat.** Users interact with their bots in their private channels; the
+  concierge hub is an admin/provisioning surface, not a conversational partner for end users.
+- **Per-user threads** remain the opt-in "shared but private" surface inside a public channel.
+- **Admin-only actions:** deleting another user's bot, creating public/shared spaces, retiring
+  bots outside one's own category. Provisioning into one's own category is allowed for any
+  admitted user.
 
 ### 2.2 Session keys include the user
 

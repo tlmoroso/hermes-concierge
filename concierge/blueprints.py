@@ -220,7 +220,7 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Developer Bot",
         description="Repo work in a per-user sandbox (admin-only).",
         model_preset="core",
-        toolsets=("file", "terminal"),
+        toolsets=("file", "terminal", "web"),
         skills=(),
         soul=(
             "# {name}\n\nYou are the user's developer assistant. You work in a per-user "
