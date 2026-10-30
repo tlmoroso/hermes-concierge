@@ -196,9 +196,11 @@ and END THE TURN.
 
 ## 9. Open threads & backlog (none block operation)
 
-1. **Notes Bot in the cloud** needs the Obsidian vault reachable on the VM
-   (git-sync recommended; see `concierge/APPLE_BRIDGE.md`). Until then, Notes
-   stays un-deployed. Its blueprint toolsets (`file`) are ready.
+1. **Notes Bot in the cloud** needs the Obsidian vault reachable on the VM.
+   APPROVED DESIGN (2026-10-30, NOT BUILT): Zettelkasten method, Syncthing
+   sync (multi-user reproducible), vault at a neutral path (`~/hermes-vault`,
+   not Documents/iCloud), NO pre-defined sections (MOCs emerge from topic
+   clusters). Full spec: `concierge/NOTES_BOT_HANDOFF.md`.
 2. **VM hardening:** gateway runs as root (installer's LXC-style override);
    consider re-homing under a dedicated user + enabling Hetzner automated
    backups (console, ~€0.90/mo, 7 rolling days) as the second backup layer.
