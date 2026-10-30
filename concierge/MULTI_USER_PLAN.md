@@ -50,7 +50,9 @@ Non-goal for v1: per-user bot *profiles* (too heavy; one bot profile per channel
   bots outside one's own category. Provisioning into one's own category is allowed for any
   admitted user.
 
-### 2.2 Session keys include the user
+- **Open follow-up:** an admin slash command (`/bot category <user>`) to create a
+  permission-locked Discord category for a user is not yet implemented; categories are
+  created manually until then.
 
 - `build_session_key` / `_session_key_profile` path: when the source is a DM or a per-user
   thread, the key already differs by chat id. For shared channels where we still want isolation,
