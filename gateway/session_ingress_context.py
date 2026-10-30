@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import copy
 from contextvars import ContextVar
 from pathlib import Path
+import logging
 import weakref
 import hashlib
 import hmac
@@ -10,8 +11,15 @@ import json
 
 from hermes_state_runtime import RuntimeStoreError
 
+logger = logging.getLogger(__name__)
+
 _callback: ContextVar[tuple | None] = ContextVar('native_ingress_callback', default=None)
 _relay_callback: ContextVar[tuple | None] = ContextVar('relay_ingress_callback', default=None)
+
+# Once-latch for the dynamic resolver's failure warning: a broken resolver is a
+# process-lifetime state, so the first failure says everything a per-message
+# WARNING would (admission calls the resolver on every multiplexed message).
+_dynamic_resolver_warned = False
 
 
 @contextmanager
@@ -102,6 +110,36 @@ def carry_callback(event, rewritten):
 _PREFIX_PRODUCERS = ('webhook', 'api_server', 'msgraph_webhook')
 
 
+def _resolver_runtime_profile(runner, source, homes):
+    """Last-resort profile from an optional runner-installed resolver.
+
+    The hook is duck-typed (``runner._dynamic_runtime_profile``) so core never
+    imports the plugin layer — the concierge mixin installs it for channels its
+    REGISTRY routes (bindings/rooms), which ``profile_routes`` cannot express
+    (a room binds one channel to several profiles; the registry is the single
+    source of truth, not duplicated into config). Fail-closed: absent → None,
+    a raise → None (one WARNING per process, then debug), and the returned name
+    is only a CANDIDATE — ``_binding`` still enforces the stamp equality,
+    served-home membership and authority checks afterwards.
+    """
+    global _dynamic_resolver_warned
+    resolver = getattr(runner, '_dynamic_runtime_profile', None)
+    if resolver is None:
+        return None
+    try:
+        resolved = resolver(source, homes)
+    except Exception:
+        if not _dynamic_resolver_warned:
+            _dynamic_resolver_warned = True
+            logger.warning('dynamic runtime-profile resolver failed; admission '
+                           'falls back to the owner profile', exc_info=True)
+        else:
+            logger.debug('dynamic runtime-profile resolver failed again',
+                         exc_info=True)
+        return None
+    return resolved if isinstance(resolved, str) and resolved else None
+
+
 def _runtime_profile(runner, source, profile, owner_name, homes, relay):
     """The multiplexed runtime profile *source* routes to; ``_binding`` checks it is served."""
     # Same matcher as ingress stamping, ``user_id`` included: a ``user_id`` route stamps the
@@ -126,6 +164,12 @@ def _runtime_profile(runner, source, profile, owner_name, homes, relay):
         # The instance's one authenticated connector (relay is process-level) routes scopes to
         # served profiles (Team Gateway); the relay seal covers ``source.profile``.
         return source.profile
+    resolved = _resolver_runtime_profile(runner, source, homes)
+    if resolved is not None:
+        # A registry-stamped source (concierge): the resolver confirms the stamp
+        # against the routing source of truth. Routes, prefix producers and relay
+        # keep their priority above; the caller re-verifies everything.
+        return resolved
     return owner_name
 
 

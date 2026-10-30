@@ -1712,6 +1712,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
                 # registrations so a native name collision keeps the native
                 # command. Self-gating: disabled concierge adds nothing.
                 self._concierge_register_slash(self._client.tree)
+            # Concierge admission resolver (self-gated, idempotent): lets
+            # admission resolve the registry-stamped runtime profile of a
+            # bound/room channel — without it every such message dies at the
+            # profile_mismatch guard (the 2026-10 live bug). Wired before the
+            # client starts taking events; build_source re-checks per message.
+            self._concierge_wire_dynamic_router()
             self._disconnecting = False
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
             self._bot_task.add_done_callback(self._handle_bot_task_done)

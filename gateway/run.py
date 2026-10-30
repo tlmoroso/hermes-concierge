@@ -4481,15 +4481,20 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             if (profile_name is not None
                     and not sched_preflight.has_credential_platform(profile_adapters, owned)
                     and (adapters or getattr(runner, "_profile_adapters", None))):
-                routes = sched_preflight._primary_profile_routes_for_current_home()
-                # Routed delivery needs a route; the concierge shape has NONE at all — a bot
-                # profile with an empty map still gets the view so an ORIGIN target resolves
-                # its transport owner in this process (any other target shape fails closed
-                # inside the view; a non-empty map keeps its own LOCAL adapter here).
-                if routes or not profile_adapters:
-                    profile_adapters = sched_preflight.SharedRouteAdapters(
-                        adapters, routes,
-                        process_adapters=getattr(runner, "_profile_adapters", None))
+                # Wrap EVERY credentialless map, not only the empty one. A served profile's
+                # session machinery creates its LOCAL adapter on first use
+                # (gateway.session_local_recovery.local_adapter — the hub profile holds one
+                # live), so a concierge bot's map at delivery time is LOCAL-ONLY, and the old
+                # `routes or not profile_adapters` gate read that non-empty map as "has its own
+                # adapters" with zero profile_routes configured: the queued ORIGIN row was sent
+                # through the raw map and died with "platform 'discord' not configured/enabled"
+                # (live job c4bcac5a9d5d, never delivered). Queue rows never target LOCAL
+                # (``deliver=local`` never enqueues; bot-chat is its own pseudo-platform), so
+                # the view loses nothing; a profile with a REAL bot never reaches here
+                # (has_credential_platform above), keeping #101113's route-only semantics.
+                profile_adapters = sched_preflight.SharedRouteAdapters(
+                    adapters, sched_preflight._primary_profile_routes_for_current_home(),
+                    process_adapters=getattr(runner, "_profile_adapters", None))
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 

@@ -79,25 +79,32 @@ ROOMS (Task 7.3) split the M5 mechanism in two, at the same seams:
   spirit) and NO single profile: the re-home stamp is the one-bot mechanism,
   a room is N turns. Ghost members are skipped with the same
   warn-once/fail-closed posture as ghost bindings.
-- EXECUTION, at ``handle_message`` (every dispatch path funnels here — plain
-  messages, batched text flushes, recovered messages, slash-built events):
-  an event whose source carries targets is NEVER dispatched as itself; a
-  fan-out DRIVER task runs the members instead, spawned off the inbound
-  path so the discord.py loop is never blocked (the same
-  returns-quickly-spawns-task contract the base's ``handle_message``
-  already has). Per member, IN STORED ORDER: a fresh source stamped
+- EXECUTION, at the RUNNER'S MESSAGE-HANDLER SEAM (``set_message_handler``
+  installs a concierge wrap as ``_message_handler`` — the ONE attribute
+  ``_process_message_background`` awaits, so every live dispatch funnels
+  through it whatever entry computed the session key; the 2026-10-29 live
+  bug was the fan-out living in a ``handle_message`` override upstream's
+  refactor had left off that chain): an event whose source carries targets
+  is NEVER dispatched as itself; a fan-out DRIVER task runs the members
+  instead, spawned off the inbound path so the discord.py loop is never
+  blocked (the same returns-quickly-spawns-task contract the base's own
+  dispatch already has). Per member, IN STORED ORDER: a fresh source stamped
   ``profile = member`` (the M5b stamping mechanism, per member —
   ``dataclasses.replace`` gives each member its own source so the cached
   routing identity is resolved per member, not reused from the previous
   one) and a fresh event, dispatched through the REAL
   ``super().handle_message`` — canonicalization, profile-namespaced session
-  keys, busy-guard install and the runner's ``_profile_runtime_scope`` all
+  keys, busy-guard install and (through ``_process_message_background`` →
+  the wrap → the stored runner handler) the runner's
+  ``_profile_runtime_scope`` plus the adapter-side response delivery all
   run exactly as for a single-bot message; NO second turn mechanism. The
   driver then waits for that member's session task to finish before
   dispatching the next member (SEQUENTIAL turns, desktop-room parity: member
   N+1's turn starts only after member N's reply landed), bounded by a
   generous circuit breaker that gives up WAITING (never cancels the turn —
-  ``asyncio.shield``) and continues the fan-out.
+  ``asyncio.shield``) and continues the fan-out. The wrap is FAIL-CLOSED:
+  any concierge-branch error warns once and delegates to the stored runner
+  handler — message intake never breaks.
 - Mention addressing, v1: NONE. All room members share ONE Discord identity
   (the hub's bot), so a ``<@BOT_ID>`` token names the shared identity, not a
   member — no per-member Discord identity exists to address. The desktop
@@ -150,7 +157,7 @@ gates:
   implementations; the google-workspace ``setup.py --check`` does a network
   OAuth refresh and is deliberately NOT the message-path probe) stamped on
   the source as a wire-invisible marker, exactly like the room targets.
-- EXECUTION, at ``handle_message``: the FIRST inbound message in a bound
+- EXECUTION, at the wrap: the FIRST inbound message in a bound
   channel posts ONE nudge ("I need access to your Calendar… tap here to
   connect: <link>") into the channel BEFORE the bot's turn dispatches.
   Nudge state is REGISTRY-PERSISTED on the binding
@@ -187,20 +194,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # Wire-invisible, process-local marker: the ordered room members a source's
-# event must fan out to (stamped by build_source, consumed by handle_message).
-# Never serialized (SessionSource.to_dict reads declared fields only).
+# event must fan out to (stamped by build_source, consumed by the
+# set_message_handler wrap). Never serialized (SessionSource.to_dict reads
+# declared fields only).
 _ROOM_TARGETS_ATTR = "_concierge_room_targets"
 
 # Wire-invisible, process-local marker for the Task 8.2 connection nudge:
 # ``(registry_binding_key, missing_kind, ...)`` — the binding the nudge must
 # mark and the UNCONFIGURED account kinds the bound bot needs and has not been
-# nudged about (stamped by build_source, consumed by handle_message). Same
-# discipline as _ROOM_TARGETS_ATTR: never serialized.
+# nudged about (stamped by build_source, consumed by the
+# set_message_handler wrap). Same discipline as _ROOM_TARGETS_ATTR: never
+# serialized.
 _CONCIERGE_CONNECT_NUDGE_ATTR = "_concierge_connect_nudge"
 
 # Circuit breaker on waiting for ONE member's turn: generous vs a normal
@@ -208,6 +218,16 @@ _CONCIERGE_CONNECT_NUDGE_ATTR = "_concierge_connect_nudge"
 # the room's remaining members from ever answering). Giving up waits ONLY —
 # the member's turn itself is shielded, never cancelled.
 _ROOM_MEMBER_TURN_WAIT_SECONDS = 600.0
+
+# Hub-created channels suppress the create-side auto-offer for a short TTL:
+# the hub's own channel creations (``/room create``, ``/bot new``'s create
+# plan) post their own greeting/confirmation into the new channel, so the
+# ``on_guild_channel_create`` bot picker would be noise on top of it (the
+# 2026-10-29 live wart: a picker landed in a fresh room channel 0.4s before
+# the room registered). Short TTL so a stale entry is harmless — Discord
+# never reuses a channel id, but a wedged entry must not silence the offer
+# for a genuinely fresh channel forever.
+_HUB_CREATED_CHANNEL_TTL_SECONDS = 30.0
 
 # Desktop-parity window for the room fan-out's shared channel history (the
 # M7 review gap): the newest ~200 messages, ~32k characters total, truncated
@@ -342,6 +362,12 @@ class ConciergeDiscordMixin:
         # profile-scoped run only activates under multiplexing.
         if not getattr(getattr(runner, "config", None), "multiplex_profiles", False):
             return super().build_source(*args, **kwargs)
+
+        # Gates passed: make sure the runner can RESOLVE the registry stamps
+        # this path is about to produce (admission's last-resort resolver;
+        # idempotent, one identity compare when already wired). The connect
+        # path also wires it — this covers a runner attached after connect.
+        self._concierge_wire_dynamic_router(runner)
 
         # The config seam runs first (inside base build_source); the registry
         # only fills in when the config seam made NO decision.
@@ -567,7 +593,16 @@ class ConciergeDiscordMixin:
             live.append(member)
         return live
 
-    # ── Task 7.3: sequential member-turn fan-out (execution seam) ──────────
+    # ── Task 7.3/8.2 EXECUTION: the runner's message-handler seam ──────────
+    #
+    # The 2026-10-29 live bug: upstream's inbound refactor moved the live
+    # chain to ``_start_session_processing`` → ``_process_message_background``
+    # → ``self._message_handler(event)`` — the RUNNER's handler installed via
+    # ``set_message_handler`` — and this mixin's ``handle_message`` override
+    # (where the fan-out + nudges used to live) fell out of that chain: dead
+    # code on the live path, so a room message ran the hub lane instead. The
+    # consumption now rides the seam every live dispatch funnels through,
+    # whatever entry computed the session key: the wrap below.
 
     def _concierge_room_targets_on(self, event) -> tuple[str, ...]:
         """The fan-out targets stamped on *event*'s source by ``build_source``
@@ -579,31 +614,109 @@ class ConciergeDiscordMixin:
             return targets
         return ()
 
-    async def handle_message(self, event) -> None:
-        """Task 7.3 execution seam: an event whose source carries room
-        targets is never dispatched as itself — a fan-out DRIVER task runs
-        each member's turn sequentially instead, spawned here so the
-        inbound path (and the discord.py event loop behind it) returns
-        immediately, exactly like the base's own spawn-a-task contract.
-        Every other event is the base's ``handle_message``, untouched —
-        except the Task 8.2 nudge stamp: a single-bot bound event carrying
-        one posts the connection nudge BEFORE the turn dispatches."""
-        targets = self._concierge_room_targets_on(event)
-        if not targets:
-            nudge = self._concierge_connect_nudge_on(event)
-            if nudge is not None:
-                await self._concierge_post_connect_nudge(event, nudge)
-            return await super().handle_message(event)
-        channel_id = str(
-            getattr(getattr(event, "source", None), "chat_id", "") or "")
-        task = asyncio.create_task(
-            self._concierge_run_room_turns(event, targets))
-        self._concierge_track_fanout_task(channel_id, task)
-        logger.debug(
-            "[%s] concierge: room fan-out started for channel %s (%d members)",
-            getattr(self, "name", "discord"), channel_id, len(targets))
+    def set_message_handler(self, handler) -> None:
+        """Install *handler* under a CONCIERGE WRAP (the runner's own seam).
 
-    # ── Task 8.2: account-connection nudges (execution at handle_message) ──
+        The wrap (``_concierge_inbound_dispatch``) consumes the room-targets
+        stamp (fan-out driver, never delegated) and posts the Task 8.2
+        connect nudge before delegating; everything else delegates 1:1. The
+        wrap is installed UNCONDITIONALLY — it is a pure pass-through for
+        events without concierge stamps, and those stamps only exist when
+        concierge routing ran (``build_source`` gates), so a non-concierge
+        install sees no stamps and behaves exactly like the base. Re-sets
+        re-wrap around the STORED runner handler, never the wrap itself
+        (idempotent); ``None`` restores the base's exact clear semantics.
+        """
+        if handler is None:
+            self._concierge_runner_message_handler = None
+            super().set_message_handler(None)
+            return
+        installed = getattr(self, "_concierge_inbound_wrap", None)
+        if (installed is not None
+                and getattr(self, "_message_handler", None) is installed):
+            # Already wrapped: swap the stored runner handler underneath the
+            # single installed wrap — never double-wrap.
+            self._concierge_runner_message_handler = handler
+            return
+        self._concierge_runner_message_handler = handler
+
+        async def _concierge_inbound_wrap(event):
+            return await self._concierge_inbound_dispatch(event)
+
+        super().set_message_handler(_concierge_inbound_wrap)
+        self._concierge_inbound_wrap = _concierge_inbound_wrap
+
+    async def _concierge_inbound_dispatch(self, event):
+        """The wrap body: ONE place consumes the concierge stamps.
+
+        (a) room-targets stamp → spawn the fan-out DRIVER task (exactly the
+            old ``handle_message`` contract: returns quickly, the driver
+            runs the members) and RETURN — a room message is fully consumed
+            by the fan-out, that is the designed semantics;
+        (b) connect-nudge stamp → post the nudge FIRST, then delegate;
+        (c) otherwise delegate 1:1 to the stored runner handler.
+        FAIL-CLOSED: any error in a concierge branch warns once and the
+        message is delegated to the runner handler — intake never breaks.
+        """
+        runner_handler = getattr(self, "_concierge_runner_message_handler", None)
+        try:
+            targets = self._concierge_room_targets_on(event)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("wrap-room-stamp",),
+                "[%s] concierge: reading the room-target stamp failed (%s); "
+                "the message is delegated to the normal lane instead",
+                getattr(self, "name", "discord"), e, exc_info=True)
+            targets = ()
+        if targets:
+            task = None
+            try:
+                channel_id = str(
+                    getattr(getattr(event, "source", None), "chat_id", "") or "")
+                task = asyncio.create_task(
+                    self._concierge_run_room_turns(event, targets))
+                self._concierge_track_fanout_task(channel_id, task)
+                logger.debug(
+                    "[%s] concierge: room fan-out started for channel %s "
+                    "(%d members)",
+                    getattr(self, "name", "discord"), channel_id, len(targets))
+                return None
+            except Exception as e:
+                self._concierge_warn_once(
+                    ("wrap-fanout",),
+                    "[%s] concierge: spawning the room fan-out failed (%s); "
+                    "the message is delegated to the normal lane instead",
+                    getattr(self, "name", "discord"), e, exc_info=True)
+                if task is not None:
+                    # Never run the message twice: the half-spawned driver is
+                    # cancelled before the fallback turn dispatches.
+                    task.cancel()
+        try:
+            nudge = self._concierge_connect_nudge_on(event)
+        except Exception:
+            nudge = None
+        if nudge is not None:
+            try:
+                await self._concierge_post_connect_nudge(event, nudge)
+            except Exception as e:
+                logger.warning(
+                    "[%s] concierge: connection nudge failed for channel %s; "
+                    "the turn proceeds normally: %s",
+                    getattr(self, "name", "discord"), nudge[0], e)
+        if runner_handler is None:
+            # The base's no-handler contract, kept exact under the wrap: an
+            # adapter that still polls and sends must not silently pretend.
+            if not getattr(self, "_concierge_no_runner_handler_logged", False):
+                self._concierge_no_runner_handler_logged = True
+                logger.error(
+                    "[%s] Dropping inbound message: no gateway message "
+                    "handler is installed on this adapter. The adapter is "
+                    "connected and can send, but every inbound message is "
+                    "discarded.", getattr(self, "name", "discord"))
+            return None
+        return await runner_handler(event)
+
+    # ── Task 8.2: account-connection nudges (execution at the wrap) ────────
 
     def _concierge_connect_nudge_on(self, event) -> tuple | None:
         """The nudge stamp ``build_source`` left on *event*'s source:
@@ -736,13 +849,20 @@ class ConciergeDiscordMixin:
         """One member's turn, through the SAME machinery a single-bot
         message takes: a fresh source stamped ``profile = member`` (the M5b
         stamping mechanism — ``dataclasses.replace`` so the cached routing
-        identity is resolved for THIS member, not reused) and a fresh event
-        (fresh media/metadata containers: a busy-session merge must never
-        mutate a sibling member's event), dispatched via the REAL
+        identity is resolved for THIS member, not reused; the plain-attr
+        concierge stamps do not survive the replace, so the member event is
+        a pure delegate through the wrap, never a nested fan-out) and a fresh
+        event (fresh media/metadata containers: a busy-session merge must
+        never mutate a sibling member's event), dispatched via the REAL
         ``super().handle_message`` — canonicalization, profile-namespaced
-        session key, busy guard and the runner's profile scope all run as
-        for any bound-channel message. Then WAIT for that member's session
-        task before returning (sequentiality).
+        session key, busy guard, and (through ``_process_message_background``
+        → the ``set_message_handler`` wrap) the runner's admission, scope
+        and turn machinery, plus the adapter-side response delivery, all run
+        as for any bound-channel message. Direct-calling the stored runner
+        handler instead would SKIP that delivery lane (the runner handler
+        only RETURNS the response — ``_process_message_background`` is what
+        posts it), so the base dispatch stays. Then WAIT for that member's
+        session task before returning (sequentiality).
 
         ``room_history`` (the fan-out's shared channel window, sibling
         members' replies included) is stamped as the member event's
@@ -1049,6 +1169,104 @@ class ConciergeDiscordMixin:
         if not _concierge_enabled_from_config(runner):
             return False
         return bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
+
+    # ── Admission's dynamic runtime-profile resolver ─────────────────────────
+    #
+    # The live bound-channel admission bug (2026-10): ``build_source`` stamps
+    # ``source.profile`` with the registry's binding verdict, but the ADMISSION
+    # machinery (gateway/session_ingress_context.py) resolved the runtime profile
+    # from ``gateway.profile_routes`` alone — a registry-routed source has no
+    # matching route, so it resolved to the adapter's owner and died at the
+    # ``profile_mismatch`` guard. Rooms make static routes impossible (one
+    # channel, up to six member profiles → same-specificity admission_conflict),
+    # so the registry itself must answer — via a duck-typed runner attribute
+    # (the ``_concierge_free_response_channels`` precedent), keeping core free
+    # of any plugin import.
+
+    def _concierge_dynamic_runtime_profile(self, source, homes) -> str | None:
+        """The runtime profile a REGISTRY-STAMPED source admits to — the stamp
+        itself, but ONLY when the registry still confirms it:
+
+        (a) the source's channel — or its parent, threads/forum posts inherit
+            the parent's binding (``_concierge_binding_key``'s key resolution)
+            — is bound to exactly ``source.profile``, or
+        (b) the channel (or parent) is a ROOM with ``source.profile`` among
+            its members.
+
+        Anything else → None: admission keeps its owner fallback, so the
+        fail-closed guard refuses (an unbound channel answers as the hub
+        naturally; a stamp the registry does not confirm is a spoof, never a
+        route). Registry unreadable → None (fail closed). Read-only: no
+        registry writes, and ``homes`` is the caller's contract — ``_binding``
+        still enforces served-home membership and the authority check.
+        """
+        if getattr(getattr(source, "platform", None), "value", None) != "discord":
+            return None  # the registry speaks Discord channel ids only
+        stamp = getattr(source, "profile", None)
+        if not isinstance(stamp, str) or not stamp:
+            return None
+        try:
+            from concierge import registry
+
+            reg = registry.load_registry()
+            bindings = reg.get("bindings")
+            if isinstance(bindings, dict):
+                key = self._concierge_binding_key(source, bindings)
+                if key is not None:
+                    binding = bindings.get(key)
+                    # Bound to a DIFFERENT profile than the stamp: not registry
+                    # truth. A bound channel is a binding XOR a room, so no
+                    # room fallthrough either.
+                    if isinstance(binding, dict) and binding.get("profile") == stamp:
+                        return stamp
+                    return None
+            rooms = reg.get("rooms")
+            if isinstance(rooms, dict):
+                for candidate in (getattr(source, "chat_id", None),
+                                  getattr(source, "parent_chat_id", None)):
+                    cid = str(candidate) if candidate is not None else ""
+                    if not cid:
+                        continue
+                    room = rooms.get(cid)
+                    if not isinstance(room, dict):
+                        continue  # not a room under this key: try the parent
+                    members = room.get("members")
+                    if isinstance(members, list) and stamp in members:
+                        return stamp
+                    return None  # the chat's room does not include the stamp
+        except Exception:
+            logger.debug(
+                "[%s] concierge: dynamic runtime-profile resolution failed; "
+                "admission falls back to the owner profile",
+                getattr(self, "name", "discord"), exc_info=True)
+            return None
+        return None
+
+    def _concierge_wire_dynamic_router(self, runner=None) -> None:
+        """Install the resolver on the gateway runner (idempotent; re-assign is
+        fine). The runner attribute is the duck-typed hook core reads — the
+        only seam that does not make gateway/session_ingress_context.py import
+        the plugin layer. Self-gated: disabled concierge or a non-multiplexed
+        gateway installs nothing (zero behavior change, the MRO rule). Called
+        from the adapter's connect path AND from ``build_source`` after its
+        gates pass (belt and suspenders: per-message re-check is one identity
+        compare)."""
+        runner = runner if runner is not None else getattr(self, "gateway_runner", None)
+        if runner is None:
+            return
+        # ONE stable bound method per adapter (a fresh ``self.method`` access is
+        # a new object each time, so the identity check below would never hit).
+        hook = getattr(self, "_concierge_runtime_profile_hook", None)
+        if hook is None:
+            hook = self._concierge_runtime_profile_hook = self._concierge_dynamic_runtime_profile
+        if getattr(runner, "_dynamic_runtime_profile", None) is hook:
+            return  # already wired: cheap per-message identity check
+        if not self._concierge_events_wanted():
+            return
+        runner._dynamic_runtime_profile = hook
+        logger.debug(
+            "[%s] concierge: dynamic runtime-profile resolver installed on the gateway runner",
+            getattr(self, "name", "discord"))
 
     def _concierge_register_slash(self, tree) -> None:
         """Add the ``/bot`` command group to the tree (Task 5.4).
@@ -1496,7 +1714,13 @@ class ConciergeDiscordMixin:
                 if category is not None:
                     kwargs["category"] = category
             created = await guild.create_text_channel(**kwargs)
-            return str(getattr(created, "id", ""))
+            channel_id = str(getattr(created, "id", ""))
+            # Suppress the create event's own auto-offer: this channel was
+            # created BY the hub (both /room create and /bot new's create
+            # plan ride this one helper), and the creating flow posts its
+            # own greeting/confirmation into it.
+            self._concierge_remember_hub_created_channel(channel_id)
+            return channel_id
         except Exception as e:
             logger.warning(
                 "[%s] concierge: channel creation failed (%s); falling back to "
@@ -2370,6 +2594,39 @@ class ConciergeDiscordMixin:
 
     # ── Task 5.5: channel-create / forum-post auto-offer ────────────────────
 
+    def _concierge_remember_hub_created_channel(self, channel_id) -> None:
+        """Record *channel_id* as JUST created by the hub (see
+        ``_HUB_CREATED_CHANNEL_TTL_SECONDS``): the create event's own
+        auto-offer is suppressed for it. Lazy state — the mixin must not
+        require an ``__init__``. Never raises: a failed remember only risks
+        one redundant picker."""
+        try:
+            cid = str(channel_id or "")
+            if not cid:
+                return
+            seen = getattr(self, "_concierge_hub_created_channels", None)
+            if seen is None:
+                seen = self._concierge_hub_created_channels = {}
+            seen[cid] = time.monotonic() + _HUB_CREATED_CHANNEL_TTL_SECONDS
+        except Exception:
+            pass
+
+    def _concierge_channel_is_hub_created(self, channel_id) -> bool:
+        """True while *channel_id* is inside the hub-created TTL window (an
+        expired entry is pruned here and stops suppressing). Never raises."""
+        try:
+            seen = getattr(self, "_concierge_hub_created_channels", None) or {}
+            cid = str(channel_id or "")
+            deadline = seen.get(cid)
+            if deadline is None:
+                return False
+            if time.monotonic() > deadline:
+                seen.pop(cid, None)
+                return False
+            return True
+        except Exception:
+            return False
+
     async def _concierge_on_guild_channel_create(self, channel) -> None:
         """``on_guild_channel_create``: a new channel in a managed category
         gets the blueprint picker posted into it (non-ephemeral — anyone in
@@ -2405,6 +2662,13 @@ class ConciergeDiscordMixin:
                 return
             chan_id = getattr(channel, "id", None)
             if chan_id is None:
+                return
+            if self._concierge_channel_is_hub_created(chan_id):
+                logger.debug(
+                    "[%s] concierge: new channel %s was created by the hub; "
+                    "skipping the bot picker (the creating flow posts its "
+                    "own greeting into it)",
+                    getattr(self, "name", "discord"), chan_id)
                 return
             payload = _concierge_payload("build_new_bot_response")()
             # The posted-in channel IS the destination: bind it, and let the

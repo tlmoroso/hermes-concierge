@@ -800,9 +800,9 @@ class _RecordingChannel:
 def _room_event(adapter, chat_id="100", channel=None, raw_id=123, **kw):
     """A MessageEvent whose source came from the REAL build_source — the room
     verdict is stamped exactly as production stamps it, then the event enters
-    the same ``handle_message`` the adapter dispatches through. ``raw_id`` is
-    the trigger message's Discord id: the room history window anchors its
-    fetch BEFORE it."""
+    the same runner-seam wrap (``_concierge_inbound_dispatch``) the live
+    dispatch path funnels through. ``raw_id`` is the trigger message's
+    Discord id: the room history window anchors its fetch BEFORE it."""
     from gateway.platforms.event import MessageEvent
 
     source = _source(adapter, chat_id=chat_id, **kw)
@@ -823,9 +823,20 @@ def _install_fake_turn_spawner(monkeypatch, adapter, order, *, fail_profiles=(),
     dispatch — the context payload each member TURN received, for the room
     history window's cross-member visibility contract."""
     async def _handler(event):
-        return None
+        # The wrap's 1:1 delegate — the live lane's runner handler. For an
+        # UNSTAMPED event this IS the dispatch (the turn handed to the
+        # runner); room member events never reach it (they record at the
+        # fake spawn below instead, exactly one record per event either way).
+        order.append(("dispatch", adapter._event_session_key(event),
+                      getattr(event.source, "profile", None)))
+        if contexts is not None:
+            contexts.append((getattr(event.source, "profile", None),
+                             getattr(event, "channel_context", None)))
 
-    adapter._message_handler = _handler
+    # Wire path (the live lane installs the runner handler through
+    # set_message_handler — its wrap is the seam the room stamp is
+    # consumed at).
+    adapter.set_message_handler(_handler)
 
     def _fake_start(event, session_key, *, interrupt_event=None):
         profile = getattr(event.source, "profile", None)
@@ -850,12 +861,16 @@ def _install_fake_turn_spawner(monkeypatch, adapter, order, *, fail_profiles=(),
 
 
 def _run_dispatch(adapter, event):
-    """Drive ``handle_message`` to completion on one fresh loop: await the
+    """Drive the runner-seam wrap to completion on one fresh loop: await the
     room fan-out driver when one was spawned, else the turn task(s) the
     dispatch itself created (both paths must finish inside the scenario so
-    the spawned tasks never outlive the loop)."""
+    the spawned tasks never outlive the loop). The live chain reaches this
+    wrap as ``_message_handler`` (installed by ``set_message_handler`` and
+    awaited by ``_process_message_background``); driving the wrap body
+    directly keeps the scenario free of the platform typing/delivery
+    plumbing around it."""
     async def _scenario():
-        await adapter.handle_message(event)
+        await adapter._concierge_inbound_dispatch(event)
         task = getattr(adapter, "_concierge_room_fanout_tasks", {}).get(
             str(event.source.chat_id))
         if task is not None:
@@ -925,8 +940,8 @@ def test_room_member_error_posts_unavailable_and_continues(concierge_rig, monkey
 
 
 def test_non_room_message_dispatches_normally(concierge_rig, monkeypatch):
-    """The override is a pure pass-through without the room marker: a BOUND
-    channel's message dispatches exactly once, to the bound bot's lane (the
+    """The wrap is a pure pass-through without the room marker: a BOUND
+    channel's message is delegated exactly once, to the bound bot's lane (the
     M5 single-bot path through the same seam)."""
     rig = concierge_rig
     _set_concierge_config(rig.root, enabled=True)
@@ -1354,12 +1369,13 @@ def test_room_history_line_shape_matches_standard_backfill(concierge_rig, monkey
 # ── Task 8.2: first-message account-connection nudges ──────────────────────
 #
 # The nudge rides the M5 seams: build_source decides (it already holds the
-# registry binding), handle_message posts (it is the one async dispatch seam
-# every message funnels through). The once-flag is the registry binding's
-# ``nudged_connections`` key (registry-persisted — a gateway restart never
-# re-nudges), and the probe is ``concierge.connections.account_probe`` —
-# CHEAP-LOCAL reads only (stat/which/env), verified acceptable on the hot
-# path: it runs at most once per binding, only for blueprints with connects.
+# registry binding), the set_message_handler wrap posts (it is the one async
+# dispatch seam every message funnels through). The once-flag is the
+# registry binding's ``nudged_connections`` key (registry-persisted — a
+# gateway restart never re-nudges), and the probe is
+# ``concierge.connections.account_probe`` — CHEAP-LOCAL reads only
+# (stat/which/env), verified acceptable on the hot path: it runs at most
+# once per binding, only for blueprints with connects.
 
 
 class _OrderChannel:
@@ -1483,7 +1499,7 @@ def test_configured_connects_never_stamp(concierge_rig, monkeypatch):
 def test_disabled_concierge_never_stamps_a_nudge(
         concierge_rig, monkeypatch):
     """Gate 1 covers the nudge too: concierge off means the stamp never
-    lands, so handle_message never posts — zero behavior change."""
+    lands, so the wrap never posts — zero behavior change."""
     rig = concierge_rig
     _set_concierge_config(rig.root, enabled=False)
     _bind_scheduler(rig.root)

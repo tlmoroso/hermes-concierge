@@ -8,10 +8,14 @@ target using the same ``ProfileRoute.matches`` predicate as inbound routing.
 """
 import asyncio
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import hermes_yaml as yaml
 
+# Module level (collection-time) import: home_io_guard activates per-test, and an in-test
+# import of gateway.run reads the bootstrap manifest under the guarded real home.
+import gateway.run as gateway_run
 from agent.secret_scope import is_multiplex_active, set_multiplex_active
 from cron.scheduler import _deliver_result
 from cron.scheduler_preflight import SharedRouteAdapters, _primary_profile_routes_for_current_home
@@ -403,3 +407,78 @@ def test_multiplex_origin_grant_requires_multiplex_process(tmp_path, monkeypatch
     finally:
         set_multiplex_active(previous_multiplex)
         reset_hermes_home_override(token)
+
+
+def test_drain_grants_origin_owner_when_bot_map_holds_only_local_adapter(tmp_path, monkeypatch):
+    """Live shape of the silent cross-profile delivery failure (job c4bcac5a9d5d, 2026-10-29):
+    the housekeeping DRAIN — the only sender for a queued agent-job delivery — refused the wrap
+    for a bot whose own map is LOCAL-ONLY. That map is not the empty one the concierge
+    accommodation covered: a served profile's session machinery creates its LOCAL adapter on
+    first use (gateway.session_local_recovery.local_adapter; the hub profile holds one live),
+    and with zero ``profile_routes`` the drain's ``routes or not profile_adapters`` gate read
+    the non-empty map as "has its own adapters" and sent the queued ORIGIN row through the raw
+    ``{LOCAL: ...}`` map — "platform 'discord' not configured/enabled", message never delivered.
+
+    has_credential_platform already judges a LOCAL-only map credentialless; the drain must wrap
+    EVERY credentialless map (queue rows never target LOCAL — ``deliver=local`` never enqueues),
+    so the origin grant reaches the transport-owning hub profile in this process."""
+    from cron import delivery_queue
+
+    token = _multiplex_env(tmp_path, monkeypatch, bot_name="bot-reminders-94d3")
+    bot_home = tmp_path / "root" / "profiles" / "bot-reminders-94d3"
+    hub = _primary_adapter()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(
+            multiplex_profiles=True,
+            _runtime_profile_homes=[("bot-reminders-94d3", bot_home)]),
+        adapters={},  # the launch profile owns no Discord adapter (credential skipped at boot)
+        _profile_adapters={
+            # the live bot shape: its own map holds ONLY the LOCAL session adapter
+            "bot-reminders-94d3": {Platform.LOCAL: object()},
+            "concierge-hub": {Platform.DISCORD: hub},
+        },
+        _profile_bot_platforms={"concierge-hub": {Platform.DISCORD}},
+    )
+
+    # The real queue row, under the bot's own home (the fire enqueues; the drain sends).
+    job = _origin_job()
+    job["id"] = "c4bcac5a9d5c"
+    job["enabled_toolsets"] = None
+    delivery_queue.enqueue("exec-c4bcac5a9d5c", job, "Time to stretch!")
+    # The live housekeeping thread runs UNscoped (its root drain sees the launch home, never
+    # the bot's queue); only the per-profile scope enters the bot home.
+    reset_hermes_home_override(token)
+
+    loop = MagicMock()
+    loop.is_running.return_value = True
+
+    def fake_run_coro(coro, _loop):
+        future = Future()
+        future.set_result(asyncio.run(coro))
+        return future
+
+    async def _standalone(platform, pconfig, chat_id, text, **kwargs):
+        return {"success": False, "error": "DISCORD_BOT_TOKEN is not set"}
+
+    gw_config = MagicMock()
+    gw_config.platforms = {}
+    gw_config.get_home_channel = lambda p: None
+
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with patch("gateway.config.load_gateway_config", return_value=gw_config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", _standalone), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            gateway_run._drain_restart_safe_cron_deliveries({}, loop, runner=runner)
+    finally:
+        set_multiplex_active(previous_multiplex)
+
+    assert hub.sent == ["456"], "the ORIGIN row must deliver through the hub's adapter"
+    token = set_hermes_home_override(str(bot_home))
+    try:
+        row = delivery_queue.get_status("exec-c4bcac5a9d5c")
+    finally:
+        reset_hermes_home_override(token)
+    assert row and row["status"] == "delivered", row

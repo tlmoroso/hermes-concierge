@@ -47,6 +47,16 @@ profile-scoped turn. The full chain:
    background task (`_start_session_processing`, base.py:3799 → `_process_message_background`,
    base.py:4371) which calls the installed
    message handler (`self._message_handler`, set at base.py:2227–2229, invoked at base.py:4387).
+   **Concierge note (2026-10-29 fix):** on the Discord adapter, `set_message_handler` is
+   overridden by the concierge mixin to install a WRAP as `_message_handler` —
+   `plugins/platforms/discord/concierge_mixin.py` `set_message_handler` →
+   `_concierge_inbound_dispatch`, which consumes the room-targets stamp (spawning the fan-out
+   driver instead of delegating), posts the Task 8.2 connect nudge before delegating, and
+   otherwise delegates 1:1 to the stored runner handler (fail-closed on any branch error).
+   That attribute is the one seam every live dispatch funnels through, whatever entry computed
+   the session key — the room fan-out must never live in a `handle_message` override again
+   (upstream's inbound refactor silently orphaned the previous one, and a room message ran the
+   hub lane instead: the 2026-10-29 live bug).
 7. **The handler IS the profile seam** — `gateway/run_adapters.py:1096` `_wire_adapter_handlers`
    installs `self._primary_message_handler()` (run_adapters.py:1454). Under multiplex this is
    `_make_default_profile_message_handler` (**run_adapters.py:1412–1424**):

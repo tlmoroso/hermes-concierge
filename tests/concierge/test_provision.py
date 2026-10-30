@@ -125,7 +125,53 @@ def test_create_bot_makes_profile_with_pinned_model_and_soul(concierge_home):
     assert cfg["model"]["default"] == "z-ai/glm-5.3-flash"
     assert cfg["model"]["provider"] == "nous"
     # toolset allowlist is the blueprint's exact toolsets, nothing more
-    assert cfg["toolsets"] == ["todo"]
+    # (todo + cronjob: todo_list holds the item, a one-shot cron job delivers it)
+    assert cfg["toolsets"] == ["todo", "cronjob"]
+
+
+def test_create_bot_seeds_platform_toolsets_for_the_discord_lane(concierge_home):
+    """Live bug (bot-reminders-94d3): a provisioned bot's Discord turns ran
+    with the FULL tool registry — terminal, browser, delegation, 17 toolsets —
+    instead of its blueprint allowlist. The gateway's Discord lane resolves
+    toolsets via hermes_cli.tools_config._get_platform_tools(config,
+    'discord') (gateway/run_turn.py::_resolve_enabled_toolsets_for_source),
+    which reads ``platform_toolsets.discord`` and falls back to the ~17-set
+    platform composite when that key is absent. The top-level ``toolsets``
+    seed governs only the CLI/local lane, so the blueprint allowlist never
+    reached the Discord turn. BOTH seeds must land: the platform key the
+    Discord lane actually reads, and the top-level key the CLI/local lane
+    reads."""
+    from concierge.blueprints import get_blueprint
+
+    for key in ("reminders", "researcher"):
+        bp = get_blueprint(key)
+        binding = _provisioned(concierge_home, key=key, channel_id=f"ch-{key}")
+        cfg = _yaml(
+            concierge_home / "profiles" / binding["profile"] / "config.yaml"
+        )
+        assert cfg["platform_toolsets"]["discord"] == list(bp.toolsets)
+        assert cfg["toolsets"] == list(bp.toolsets)
+
+
+def test_create_bot_seeds_platform_toolsets_for_the_cron_lane(concierge_home):
+    """Live bug (job c4bcac5a9d5d, bot-reminders-94d3): a tool-created cron job has
+    ``enabled_toolsets=None``, so the fire resolved its toolsets via
+    cron/scheduler.py::_resolve_cron_enabled_toolsets -> hermes_cli.tools_config.
+    _get_platform_tools(cfg, 'cron') — which reads ``platform_toolsets.cron`` and
+    fell back to the cron platform's ~17-set composite default ("tool_search
+    activated (tier 1): 17 core/visible tools kept"), bloating an unattended
+    single-tool-call bot's tick with terminal/browser/delegation tools. The
+    cron lane's platform key must be seeded exactly like the Discord lane's."""
+    from concierge.blueprints import get_blueprint
+
+    for key in ("reminders", "researcher"):
+        bp = get_blueprint(key)
+        binding = _provisioned(concierge_home, key=key, channel_id=f"cron-ch-{key}")
+        cfg = _yaml(
+            concierge_home / "profiles" / binding["profile"] / "config.yaml"
+        )
+        assert cfg["platform_toolsets"]["cron"] == list(bp.toolsets)
+        assert cfg["platform_toolsets"]["discord"] == list(bp.toolsets)
 
 
 def test_create_bot_binds_channel_and_is_idempotent_per_channel(concierge_home):

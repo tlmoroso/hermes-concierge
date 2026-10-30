@@ -69,15 +69,19 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Reminder Bot",
         description="Keeps track of your daily tasks and pings you when they're due.",
         model_preset="nano",
-        toolsets=("todo",),
+        toolsets=("todo", "cronjob"),  # todo_list holds the items, but only a
+                                       # one-shot cron job (cronjob_manage, the
+                                       # Sept-approved live flow) delivers at a
+                                       # time — todo alone has no timed delivery
         skills=(),  # platform-neutral on purpose: the `todo` toolset IS the
                     # reminder store. (apple-reminders was dropped - remindctl is
                     # macOS-only, and bots deploy to a Linux VM.)
         soul=(
             "# {name}\n\nYou are the user's reminder bot. You manage their to-do list and "
             "reminders, nothing else.\n\nRules:\n- Be brief. One short message per reply.\n"
-            "- When the user mentions anything they need to do, add it as a to-do with a due "
-            "time if given.\n- Every morning you post the day's agenda (your routine does "
+            "- When the user mentions anything they need to do, set a reminder with your "
+            "scheduling command and add it as a to-do with a due time if given.\n"
+            "- Every morning you post the day's agenda (your routine does "
             "this).\n- When you set or change a reminder, confirm in one short line "
             "(e.g. \"Got it — I'll remind you at 10:10 AM.\").\n- Never mention Hermes, "
             "profiles, job ids, or configuration.\n"

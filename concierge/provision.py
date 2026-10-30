@@ -534,7 +534,27 @@ def create_bot(
             config_seeds = {
                 "model.default": model.model,  # canonical pin (config.py::_normalize_root_model_keys)
                 "model.provider": model.provider,
-                "toolsets": list(bp.toolsets),  # top-level allowlist key
+                "toolsets": list(bp.toolsets),  # top-level allowlist key (CLI/local lane)
+                # The key the DISCORD lane actually reads: a bot's turns arrive
+                # through the hub's Discord adapter, and
+                # gateway/run_turn.py::_resolve_enabled_toolsets_for_source
+                # resolves them via hermes_cli.tools_config._get_platform_tools(
+                # config, 'discord') — which reads ``platform_toolsets.discord``
+                # and falls back to the platform's ~17-set default composite
+                # when the key is absent (live bug bot-reminders-94d3: a
+                # ``toolsets: [todo]`` bot ran terminal/browser/delegation).
+                # The top-level seed above never reaches that lane.
+                "platform_toolsets.discord": list(bp.toolsets),
+                # The key the CRON lane reads: a tool-created job carries
+                # enabled_toolsets=None, so its fire resolves toolsets via
+                # cron/scheduler.py::_resolve_cron_enabled_toolsets ->
+                # _get_platform_tools(cfg, 'cron'), which reads
+                # ``platform_toolsets.cron`` and falls back to the cron
+                # platform's ~17-set composite default — the live bloat of job
+                # c4bcac5a9d5d's tick ("tool_search activated (tier 1): 17
+                # core/visible tools kept" on a single-tool-call bot). Seed it
+                # next to the Discord lane's key.
+                "platform_toolsets.cron": list(bp.toolsets),
                 # On-rails bot behavior (live E2E 2026-09-27):
                 # - Low reasoning: with NO effort pinned, GLM-5.3-flash thinks
                 #   at the server default — a runaway 900s/2.78MB stream on a
