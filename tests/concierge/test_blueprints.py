@@ -48,6 +48,10 @@ def test_every_blueprint_toolset_is_a_real_non_composite_bundle():
                 "it re-expands to the full default tool range")
 
 
+def test_notes_soul_mentions_conventions():
+    assert "CONVENTIONS.md" in get_blueprint("notes").soul
+
+
 def test_get_blueprint_unknown_key_raises():
     with pytest.raises(KeyError, match="Known:"):
         get_blueprint("nope")
