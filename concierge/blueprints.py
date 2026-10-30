@@ -129,7 +129,11 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Researcher Bot",
         description="Finds things out and writes you a short, cited brief.",
         model_preset="core",
-        toolsets=("browser",),
+        # browser = local-CDP automation (Mac/desktop); web = API search+extract.
+        # A cloud VM has no local browser, so the researcher needs BOTH: web is
+        # the headless search path (Tool Gateway), browser stays for desktop
+        # installs. Two sets — still within the minimal-context invariant.
+        toolsets=("browser", "web"),
         skills=("grounded-citations",),
         soul=(
             "# {name}\n\nYou are the user's research bot. You answer questions with sources, "
