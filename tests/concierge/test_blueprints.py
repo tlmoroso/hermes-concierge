@@ -8,14 +8,44 @@ def test_catalog_has_the_five_launch_blueprints():
         assert key in CATALOG
 
 
-def test_every_blueprint_pins_a_known_preset_and_one_or_two_toolsets():
+def test_every_blueprint_pins_a_known_preset_and_minimal_toolsets():
     for bp in CATALOG.values():
         assert bp.model_preset in MODEL_PRESETS
-        assert 1 <= len(bp.toolsets) <= 2, f"{bp.key} must stay minimal (context bloat)"
+        # ≤3, not ≤2: CLI-skill bots (email_triage, scheduler) need terminal
+        # for the CLI their skill drives plus cronjob for their routine. The
+        # invariant's purpose is minimal contexts, not a hard two.
+        assert 1 <= len(bp.toolsets) <= 3, f"{bp.key} must stay minimal (context bloat)"
         assert bp.soul and "{name}" in bp.soul
         bp.soul.format(name="Test Bot")  # renders cleanly - no stray braces that break provisioning
         if bp.routine:
             assert bp.routine.schedule and bp.routine.prompt
+
+
+def test_cli_skill_blueprints_carry_the_bundles_their_skills_drive():
+    """Live-flagged gaps. notes drives the obsidian skill over the FILE tools
+    (read_file/write_file/patch/search_files) — its old ('hermes-cli',)
+    entry is a COMPOSITE (toolsets.py::_bundle) that re-expands to the full
+    ~17-set default range (hermes_cli/tools_config.py::_explicit_toolsets),
+    not the file bundle. email_triage and scheduler drive CLI skills
+    (himalaya, google-workspace's gws): a CLI runs through terminal, and
+    their routines need cronjob."""
+    assert get_blueprint("notes").toolsets == ("file",)
+    assert get_blueprint("email_triage").toolsets == ("todo", "cronjob", "terminal")
+    assert get_blueprint("scheduler").toolsets == ("todo", "cronjob", "terminal")
+
+
+def test_every_blueprint_toolset_is_a_real_non_composite_bundle():
+    """Every toolset entry names a real toolsets.py bundle — never a
+    ``hermes-*`` composite (those re-expand to the full default tool range
+    and defeat the blueprint allowlist)."""
+    from toolsets import TOOLSETS
+
+    for bp in CATALOG.values():
+        for ts in bp.toolsets:
+            assert ts in TOOLSETS, f"{bp.key}: unknown toolset {ts!r}"
+            assert not ts.startswith("hermes-"), (
+                f"{bp.key}: {ts!r} is a composite bundle — "
+                "it re-expands to the full default tool range")
 
 
 def test_get_blueprint_unknown_key_raises():

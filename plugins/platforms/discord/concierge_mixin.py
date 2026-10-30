@@ -1972,11 +1972,15 @@ class ConciergeDiscordMixin:
             guild_id=guild_id, category_id=category_id,
             name=_concierge_payload("room_channel_name")(topic))
         if created is None:
+            # The live 403 path ('Missing Permissions (50013)'): unlike
+            # /bot new there is no bind-the-invoking-channel fallback here —
+            # a room NEEDS its own channel, so the refusal is EPHEMERAL,
+            # actionable, and leaves the registry untouched (no partial room).
             await self._concierge_respond(
                 interaction,
-                "Couldn't create a channel for the room — a room needs its "
-                "own channel. Ask the server owner for the **Manage "
-                "Channels** permission, then try `/room create` again.",
+                "I couldn't create a channel — grant me the **Manage "
+                "Channels** permission (Server Settings → Roles), then run "
+                "/room create again.",
                 ephemeral=True)
             return
         try:

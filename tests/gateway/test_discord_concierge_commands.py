@@ -1551,9 +1551,11 @@ def test_room_create_selection_refusals(rig, monkeypatch):
 
 def test_room_create_refuses_when_channel_creation_denied(rig, monkeypatch):
     """A room NEEDS its own channel: unlike /bot new there is NO bind
-    fallback — creation refused means guidance copy, and the invoking
-    channel is never turned into a room."""
+    fallback (the live 403 'Missing Permissions (50013)' path) — the refusal
+    is EPHEMERAL, carries the grant-me-the-permission guidance, and aborts
+    with the registry untouched (no partial room)."""
     _bind_guild_bots(rig, "bot-reminders-a1b2", "bot-researcher-b2c3")
+    before = registry.load_registry()
 
     async def _refused_create(**kw):
         return None
@@ -1569,11 +1571,14 @@ def test_room_create_refuses_when_channel_creation_denied(rig, monkeypatch):
 
     _run(view.children[0].callback(pick))
 
-    text = pick.followup_log[-1][0]
-    assert "needs its own channel" in text
-    assert "Manage Channels" in text  # actionable guidance
+    text, _view, ephemeral = pick.followup_log[-1]
+    assert text == (
+        "I couldn't create a channel — grant me the **Manage Channels** "
+        "permission (Server Settings → Roles), then run /room create again.")
+    assert ephemeral is True
     assert registry.room_members("100") == []  # NOT bound as a room
     assert registry.get_binding("100") is None  # and not as a binding either
+    assert registry.load_registry() == before  # no partial room anywhere
 
 
 def test_room_add_round_trip(rig, monkeypatch):

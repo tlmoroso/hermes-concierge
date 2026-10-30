@@ -174,6 +174,41 @@ def test_create_bot_seeds_platform_toolsets_for_the_cron_lane(concierge_home):
         assert cfg["platform_toolsets"]["discord"] == list(bp.toolsets)
 
 
+def test_create_bot_seeds_discord_home_channel_from_hub_env(concierge_home):
+    """Live nag fix: the per-turn home-channel check
+    (gateway/run_turn_prepare.py) reads the TURNING profile's secrets/config
+    for DISCORD_HOME_CHANNEL / a configured home channel. Concierge bots
+    carry no DISCORD_* secrets by design (_seed_credentials strips channel
+    settings), and the launch config's platforms.discord.home_channel does
+    NOT reach the bot-scoped check — so every fresh bot nagged 'No home
+    channel is set for Discord' on its first turn. Provision must carry the
+    hub's home channel into the BOT's config as
+    platforms.discord.home_channel."""
+    (concierge_home / ".env").write_text(
+        "DISCORD_HOME_CHANNEL=123\nOPENAI_API_KEY=sk-x\n"
+    )
+    binding = _provisioned(concierge_home)
+    cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
+    # PlatformConfig.from_dict materializes home_channel ONLY from the dict
+    # shape (a bare string is silently dropped) — the seed must match
+    # persist_home_channel's written form, and it must LOAD as a HomeChannel.
+    assert cfg["platforms"]["discord"]["home_channel"] == {
+        "platform": "discord", "chat_id": "123", "name": "Home"}
+    from gateway.config import PlatformConfig, Platform
+    pc = PlatformConfig.from_dict(cfg["platforms"]["discord"])
+    assert pc.home_channel is not None and pc.home_channel.chat_id == "123"
+
+
+def test_create_bot_without_hub_home_channel_seeds_no_key(concierge_home):
+    """No hub DISCORD_HOME_CHANNEL -> the platforms.discord.home_channel key
+    is absent from the bot's config (never a fabricated default; the minimal
+    fresh-profile config stays minimal)."""
+    (concierge_home / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+    binding = _provisioned(concierge_home)
+    cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
+    assert cfg.get("platforms", {}).get("discord", {}).get("home_channel") is None
+
+
 def test_create_bot_binds_channel_and_is_idempotent_per_channel(concierge_home):
     binding = _provisioned(concierge_home)
     assert registry.get_binding("123")["profile"] == binding["profile"]
@@ -647,6 +682,57 @@ def test_create_bot_copies_blueprint_skills_only(concierge_home):
     profile_skills = concierge_home / "profiles" / binding["profile"] / "skills"
     assert (profile_skills / "google-workspace" / "SKILL.md").exists()
     assert not (profile_skills / "decoy").exists()
+
+
+def test_create_bot_resolves_skills_from_category_subdirs(concierge_home):
+    """Live gap: bundled skills are CATEGORIZED (skills/research/, skills/
+    productivity/, ...) — the live provision logged 'skill grounded-citations
+    not found in <hub>/skills/grounded-citations — skipping' while the skill
+    lived at skills/research/grounded-citations. Resolution tries the top
+    level first, then category subdirs (first hit wins, sorted glob)."""
+    src = concierge_home / "skills"
+    (src / "research" / "grounded-citations").mkdir(parents=True)
+    (src / "research" / "grounded-citations" / "SKILL.md").write_text(
+        "---\nname: grounded-citations\n---\n"
+    )
+    binding = _provisioned(concierge_home, key="researcher", channel_id="789")
+    profile_skills = concierge_home / "profiles" / binding["profile"] / "skills"
+    assert (profile_skills / "grounded-citations" / "SKILL.md").exists()
+
+
+def test_top_level_skill_dir_wins_over_category_subdir(concierge_home):
+    """Deterministic precedence: a top-level <skill>/ dir beats a same-named
+    dir in a category subdir (first hit wins)."""
+    src = concierge_home / "skills"
+    for rel in ("google-workspace", "productivity/google-workspace"):
+        d = src / rel
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: google-workspace\nsource: {rel}\n---\n"
+        )
+    binding = _provisioned(concierge_home, key="scheduler", channel_id="321")
+    copied = (
+        concierge_home / "profiles" / binding["profile"]
+        / "skills" / "google-workspace" / "SKILL.md"
+    ).read_text()
+    assert "source: google-workspace" in copied
+
+
+def test_missing_skill_warns_and_skips_but_provision_succeeds(
+        concierge_home, caplog):
+    """A skill absent from both the top level and every category subdir
+    warns and is skipped — never a provision failure (the bot is still
+    created and bound)."""
+    import logging
+
+    (concierge_home / "skills" / "decoy").mkdir(parents=True)
+    with caplog.at_level(logging.WARNING, logger="concierge.provision"):
+        binding = _provisioned(concierge_home, key="researcher", channel_id="654")
+    assert registry.get_binding("654") is not None  # provisioned anyway
+    profile_skills = concierge_home / "profiles" / binding["profile"] / "skills"
+    assert not (profile_skills / "grounded-citations").exists()
+    assert "grounded-citations" in caplog.text
+    assert "skipping" in caplog.text
 
 
 def test_retire_bot_unbinds_and_pauses_routines(concierge_home):

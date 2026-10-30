@@ -15,11 +15,9 @@ tests run the REAL resolver against the REAL provisioned bot config and
 assert it yields exactly the blueprint's toolsets — they fail RED on a
 provision that seeds only the top-level key.
 
-The ``notes`` blueprint is deliberately absent from the parametrization: its
-``hermes-cli`` entry is a COMPOSITE name, which ``_explicit_toolsets``
-expands back to the full configurable set — a separate blueprint-catalog
-issue (flagged, not fixed here; changing blueprints beyond the reminders
-cronjob need is out of scope for this bug).
+Since the notes blueprint moved from the ``hermes-cli`` COMPOSITE to the
+plain ``file`` bundle, EVERY blueprint's entries are plain bundle names —
+all five join the exact parametrization.
 """
 
 from pathlib import Path
@@ -34,7 +32,7 @@ from concierge.blueprints import CATALOG
 
 # Blueprints whose toolset entries are plain bundle names — the resolver
 # yields them back exactly once platform_toolsets.discord is seeded.
-_EXACT_BLUEPRINTS = [key for key in CATALOG if key != "notes"]
+_EXACT_BLUEPRINTS = list(CATALOG)
 
 
 @pytest.fixture

@@ -102,7 +102,8 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Scheduler Bot",
         description="Reports on upcoming meetings and events so you always know what's next.",
         model_preset="nano",
-        toolsets=("todo",),
+        # gws is a CLI: terminal runs it, cronjob drives the daily routine.
+        toolsets=("todo", "cronjob", "terminal"),
         skills=("google-workspace",),
         soul=(
             "# {name}\n\nYou are the user's scheduler bot. You know their calendar and "
@@ -150,7 +151,8 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Email Triage Bot",
         description="Watches your inbox for emails that need action from you and turns them into to-dos.",
         model_preset="nano",
-        toolsets=("todo",),
+        # himalaya is a CLI: terminal runs it, cronjob drives the sweep.
+        toolsets=("todo", "cronjob", "terminal"),
         skills=("email-inbox-triage", "himalaya"),
         soul=(
             "# {name}\n\nYou are the user's email-triage bot. You scan their inbox for "
@@ -184,9 +186,12 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         title="Notes Bot",
         description="Keeps notes for you and remembers people, meetings, and details.",
         model_preset="nano",  # capture is extraction; bump to core if E2E note quality disappoints
-        toolsets=("hermes-cli",),  # the bundle that carries the file tools (read_file/
-                                   # write_file/patch/search_files) the obsidian skill
-                                   # drives
+        # The FILE bundle is what the obsidian skill actually drives
+        # (read_file/write_file/patch/search_files). The old ('hermes-cli',)
+        # entry was a COMPOSITE (toolsets.py::_bundle) that re-expanded to the
+        # full ~17-set default range (hermes_cli/tools_config.py::
+        # _explicit_toolsets) — the opposite of an allowlist.
+        toolsets=("file",),
         skills=("obsidian",),  # filesystem-first vault work; apple-notes is macOS-only
                                # and bots deploy to Linux - obsidian is the cloud choice
         soul=(

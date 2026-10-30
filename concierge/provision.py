@@ -86,7 +86,7 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 from hermes_yaml import safe_dump as _yaml_safe_dump
 from hermes_yaml import safe_load as _yaml_safe_load
@@ -217,14 +217,35 @@ def _seed_profile_config(profile_dir: Path, updates: dict) -> None:
     atomic_write_text(cfg_path, _yaml_safe_dump(cfg, sort_keys=False))
 
 
+def _resolve_skill_source(source_skills_dir: Path, skill: str) -> Optional[Path]:
+    """Resolve a blueprint skill's source dir: the TOP level first, then
+    CATEGORY SUBDIRS — bundled skills are categorized (skills/research/,
+    skills/apple/, skills/productivity/, ...), so a flat ``<root>/<skill>``
+    probe alone misses most of the catalog (live evidence: 'skill
+    grounded-citations not found' while it lived at
+    skills/research/grounded-citations). First hit wins; the subdir scan is
+    a sorted glob, so a name collision across categories resolves
+    deterministically."""
+    root = Path(source_skills_dir)
+    direct = root / skill
+    if direct.is_dir():
+        return direct
+    for candidate in sorted(root.glob(f"*/{skill}")):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def _install_skills(profile_dir: Path, skills: tuple, source_skills_dir: Path) -> None:
     dest_root = profile_dir / "skills"
     dest_root.mkdir(parents=True, exist_ok=True)
     for skill in skills:
-        src = Path(source_skills_dir) / skill
-        if not src.is_dir():
+        src = _resolve_skill_source(source_skills_dir, skill)
+        if src is None:
             logger.warning(
-                "concierge: skill '%s' not found in %s — skipping", skill, src
+                "concierge: skill '%s' not found in %s (top level or a "
+                "category subdir) — skipping",
+                skill, source_skills_dir,
             )
             continue
         dst = dest_root / skill
@@ -355,6 +376,34 @@ def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
             bot_cfg[key] = raw[key]
     atomic_json_write(profile_dir / "honcho.json", bot_cfg, mode=0o600)
     return True
+
+
+def _hub_discord_home_channel() -> Optional[str]:
+    """The hub's DISCORD_HOME_CHANNEL from the hub .env (the same file
+    ``_seed_credentials`` copies), or None when unset/unreadable.
+
+    Read from the HUB's file, never the bot's copy: channel settings are
+    deliberately stripped from the bot's .env (profiles are credential
+    islands and a copied DISCORD_* key would hand the bot the hub's
+    platform identity), so the home channel travels as CONFIG — the
+    per-turn check (gateway/run_turn_prepare.py) reads the TURNING
+    profile's config for a configured home channel, and concierge bots
+    carry no DISCORD_* secrets by design.
+    """
+    hub_env = get_hermes_home() / ".env"
+    if not hub_env.is_file():
+        return None
+    try:
+        from agent.secret_scope import load_env_file
+
+        value = (load_env_file(hub_env).get("DISCORD_HOME_CHANNEL") or "").strip()
+    except Exception:
+        logger.warning(
+            "concierge: hub .env unreadable — bot home-channel seed skipped",
+            exc_info=True,
+        )
+        return None
+    return value or None
 
 
 def _seed_credentials(profile_dir: Path) -> dict[str, list]:
@@ -585,6 +634,23 @@ def create_bot(
                 "display.platforms.discord.long_running_notifications": False,
                 "display.platforms.discord.interim_assistant_messages": False,
             }
+            # The per-turn home-channel check reads the TURNING profile's
+            # config; the launch config's platforms.discord.home_channel does
+            # NOT reach the bot-scoped check (verified live: bots provisioned
+            # after the launch-config fix still got the 'No home channel is
+            # set for Discord' notice). Seed the hub's home channel into the
+            # BOT's config when it has one; skip the key when it doesn't.
+            hub_home_channel = _hub_discord_home_channel()
+            if hub_home_channel:
+                # PlatformConfig.from_dict only materializes home_channel
+                # from the DICT shape (HomeChannel.from_dict; a bare string
+                # is silently dropped — gateway/config.py) — and
+                # persist_home_channel writes exactly this shape. Match it.
+                config_seeds["platforms.discord.home_channel"] = {
+                    "platform": "discord",
+                    "chat_id": str(hub_home_channel),
+                    "name": "Home",
+                }
             # 5) long-lived memory: Honcho — SYNTHESIZED from a static service
             #    key (never a byte-copy of the hub's OAuth-bearing file; see
             #    _install_honcho). The install runs BEFORE the config seed
