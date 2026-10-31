@@ -200,7 +200,7 @@ and END THE TURN.
    APPROVED DESIGN (2026-10-30, NOT BUILT): Zettelkasten method, Syncthing
    sync (multi-user reproducible), vault at a neutral path (`~/hermes-vault`,
    not Documents/iCloud), NO pre-defined sections (MOCs emerge from topic
-   clusters). Full spec: `concierge/NOTES_BOT_HANDOFF.md`.
+   clusters). Full spec: `concierge/handoffs/NOTES_BOT_HANDOFF.md`.
 2. **VM hardening:** gateway runs as root (installer's LXC-style override);
    consider re-homing under a dedicated user + enabling Hetzner automated
    backups (console, ~€0.90/mo, 7 rolling days) as the second backup layer.

@@ -215,6 +215,21 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
                                    # everyone else - together they are the memory
         connects=(),
     ),
+    BotBlueprint(
+        key="developer",
+        title="Developer Bot",
+        description="Repo work in a per-user sandbox (admin-only).",
+        model_preset="core",
+        toolsets=("file", "terminal", "web"),
+        skills=(),
+        soul=(
+            "# {name}\n\nYou are the user's developer assistant. You work in a per-user "
+            "sandbox/worktree; never touch the live checkout. Be brief.\n"
+            "- Never mention Hermes, profiles, job ids, or configuration.\n"
+        ),
+        memory_provider=None,
+        connects=(),
+    ),
 )}
 
 

@@ -1295,6 +1295,10 @@ class ConciergeDiscordMixin:
 
         @discord.app_commands.describe(bot="The bot to retire (from /bot list)")
         async def _retire(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_retire(interaction, bot)
 
         async def _list(interaction: discord.Interaction) -> None:
@@ -1319,6 +1323,16 @@ class ConciergeDiscordMixin:
         group.add_command(discord.app_commands.Command(
             name="retire", description="Retire a bot (pauses it everywhere)",
             callback=_retire))
+        async def _category(interaction: discord.Interaction, user: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
+            await self._concierge_cmd_category(interaction, user)
+        _category.__name__ = "concierge_bot_category"
+        group.add_command(discord.app_commands.Command(
+            name="category", description="Create a private category for a user (admin-only)",
+            callback=_category))
         try:
             tree.add_command(group)
         except Exception:
@@ -1347,13 +1361,25 @@ class ConciergeDiscordMixin:
 
         @discord.app_commands.describe(bot="The bot to add (from /bot list)")
         async def _room_add(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_add(interaction, bot)
 
         @discord.app_commands.describe(bot="The bot to remove")
         async def _room_remove(interaction: discord.Interaction, bot: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_remove(interaction, bot)
 
         async def _room_disband(interaction: discord.Interaction):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
             await self._concierge_cmd_room_disband(interaction)
 
         _room_create.__name__ = "concierge_room_create"
@@ -1387,6 +1413,10 @@ class ConciergeDiscordMixin:
                 kind="Optional: the account to connect (e.g. email, calendar)")
             async def _connect(interaction: discord.Interaction,
                                kind: str | None = None):
+                from concierge.auth_tiers import is_admin
+                if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                    await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                    return
                 await self._concierge_cmd_connect(interaction, kind)
 
             _connect.__name__ = "concierge_connect"
@@ -1402,6 +1432,44 @@ class ConciergeDiscordMixin:
                 "the concierge /connect was not registered")
 
     # ── /bot new: picker → provision (Tasks 5.4 + 5.7 chained) ──────────────
+
+    async def _concierge_cmd_category(self, interaction, user: str) -> None:
+        """Create a private Discord category for a user (admin-only)."""
+        import discord
+        await self._concierge_defer(interaction, ephemeral=True)
+        guild = getattr(interaction, "guild", None)
+        if guild is None:
+            await self._concierge_respond(interaction, "Must be used in a server.", ephemeral=True)
+            return
+        target_id = user.strip().lstrip("<@").rstrip(">").strip()
+        try:
+            target_id_int = int(target_id)
+        except ValueError:
+            await self._concierge_respond(interaction, "Invalid user id.", ephemeral=True)
+            return
+        try:
+            member = guild.get_member(target_id_int) or await guild.fetch_member(target_id_int)
+        except Exception:
+            member = None
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        if member is not None:
+            overwrites[member] = discord.PermissionOverwrite(view_channel=True, manage_channels=True)
+        for m in getattr(guild, "members", []):
+            if getattr(m, "guild_permissions", None) and m.guild_permissions.administrator:
+                overwrites[m] = discord.PermissionOverwrite(view_channel=True, manage_channels=True)
+        try:
+            category = await guild.create_category(
+                name=f"{member.display_name if member else target_id}-private",
+                overwrites=overwrites,
+            )
+        except Exception as e:
+            await self._concierge_respond(interaction, f"Failed to create category: {e}", ephemeral=True)
+            return
+        await self._concierge_respond(
+            interaction, f"Created private category '{category.name}' (id {category.id}).",
+            ephemeral=True)
 
     async def _concierge_cmd_new(self, interaction) -> None:
         """Ephemeral blueprint picker; the selection provisions the bot into

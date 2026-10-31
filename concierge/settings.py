@@ -19,6 +19,7 @@ class ConciergeSettings:
     default_provider_group: Optional[str] = None
     provider_groups: dict[str, dict] = field(default_factory=dict)
     location_channel_id: Optional[str] = None
+    multi_user: bool = False
 
 
 def concierge_settings(cfg: Optional[dict] = None) -> ConciergeSettings:
@@ -38,4 +39,5 @@ def concierge_settings(cfg: Optional[dict] = None) -> ConciergeSettings:
         provider_groups=dict(merged["provider_groups"]),
         location_channel_id=(str(merged["location_channel_id"])
                              if merged.get("location_channel_id") else None),
+        multi_user=bool(merged.get("multi_user", False)),
     )
