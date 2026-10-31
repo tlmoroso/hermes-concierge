@@ -66,3 +66,14 @@ Use `patch` for focused note changes when the current content gives you stable c
 ## Wikilinks
 
 Obsidian links notes with `[[Note Name]]` syntax. When creating notes, use these to link related content.
+
+## Vault lint
+
+Use file tools to audit the vault periodically (or before answering "what do I know about X"):
+
+1. List all notes: `search_files` with `target: "files"`, `pattern: "*.md"`, under the vault path.
+2. For each note, `read_file` and check frontmatter has `created`, `type`, `tags`; `type` is one of `zettel`, `moc`, `person`, `literature`.
+3. Check each note contains at least one `[[wikilink]]` (Home.md is exempt).
+4. Check every `[[link]]` resolves to an existing note file (no broken links).
+5. Check MOCs: a MOC's member list should match the notes that link to it; update MOCs on every domain write.
+6. Report orphans (zero inbound links) unless just created. Report, do not auto-rewrite.
