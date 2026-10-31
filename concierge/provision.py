@@ -378,20 +378,6 @@ def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
     return True
 
 
-def _concierge_multi_user() -> bool:
-    """Whether the launch config has concierge.multi_user enabled."""
-    try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config() or {}
-        section = cfg.get("concierge") if isinstance(cfg, dict) else None
-        if isinstance(section, dict):
-            return bool(section.get("multi_user", False))
-    except Exception:
-        pass
-    return False
-
-
 def _hub_discord_home_channel() -> Optional[str]:
     """The hub's DISCORD_HOME_CHANNEL from the hub .env (the same file
     ``_seed_credentials`` copies), or None when unset/unreadable.
@@ -675,7 +661,6 @@ def create_bot(
             #    about OAuth re-login is not.
             honcho_installed = (
                 bp.memory_provider == "honcho"
-                and not _concierge_multi_user()
                 and _install_honcho(profile_dir, profile_name)
             )
             if honcho_installed:
