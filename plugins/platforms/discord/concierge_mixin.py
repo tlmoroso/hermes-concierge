@@ -1653,7 +1653,8 @@ class ConciergeDiscordMixin:
             binding = await asyncio.to_thread(
                 provision.create_bot, blueprint_key,
                 channel_id=str(channel_id), guild_id=guild_id,
-                provider_group=group)
+                provider_group=group,
+                user_id=str(getattr(getattr(interaction, "user", None), "id", "") or "") or None)
             title = self._concierge_blueprint_title(blueprint_key)
             already = bool(binding.get("already_provisioned"))
             message = (

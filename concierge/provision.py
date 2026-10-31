@@ -540,6 +540,7 @@ def create_bot(
     provider_group: Optional[dict] = None,
     source_skills_dir: Optional[Path] = None,
     display_name: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> dict:
     """Create (or return the existing) bot bound to ``channel_id``.
 
@@ -673,6 +674,15 @@ def create_bot(
                 # without this key the plugin never loads and the bot remembers
                 # nothing across sessions.
                 config_seeds["memory.provider"] = "honcho"
+            # Per-user sandbox (multi-user): when a user_id is provided, pin the
+            # bot's terminal.cwd to a per-user workspace so tool-using bots
+            # (developer) never share or clobber another user's files. Created
+            # lazily by the terminal backend; the path is namespaced by user.
+            if user_id:
+                import os as _os
+                _home = Path(_os.path.expanduser("~"))
+                _ws = _home / ".hermes" / "workspaces" / str(user_id)
+                config_seeds["terminal.cwd"] = str(_ws)
             _seed_profile_config(profile_dir, config_seeds)
 
             # 3) SOUL.md from the blueprint template. The {name} is the bot's own
