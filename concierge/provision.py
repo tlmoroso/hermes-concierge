@@ -378,6 +378,20 @@ def _install_honcho(profile_dir: Path, profile_name: str) -> bool:
     return True
 
 
+def _concierge_multi_user() -> bool:
+    """Whether the launch config has concierge.multi_user enabled."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        section = cfg.get("concierge") if isinstance(cfg, dict) else None
+        if isinstance(section, dict):
+            return bool(section.get("multi_user", False))
+    except Exception:
+        pass
+    return False
+
+
 def _hub_discord_home_channel() -> Optional[str]:
     """The hub's DISCORD_HOME_CHANNEL from the hub .env (the same file
     ``_seed_credentials`` copies), or None when unset/unreadable.
@@ -723,7 +737,11 @@ def create_bot(
             #    a job runs with the .env/config/skills of the profile whose store holds
             #    it; cross-profile callers must scope with use_cron_store(). Creating the
             #    job in the hub's store would run it with the HUB's soul/skills.
-            if bp.routine:
+            #    In multi-user (shared-channel) mode the routine posts into a channel
+            #    seen by every user, so a blueprint-level routine is skipped to avoid
+            #    leaking one user's agenda to others; per-user reminders are still
+            #    available via the cronjob tool (delivered to the caller's own space).
+            if bp.routine and not _concierge_multi_user():
                 from cron.jobs import create_job
 
                 with use_cron_store(profile_dir):
