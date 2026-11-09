@@ -317,6 +317,17 @@ class GatewayVoiceMixin:
         # #106019): drop the pin so the seam re-resolves for THIS speaker.
         from gateway.session_identity import clear_identity
         clear_identity(source)
+        # The /voice join copy is a serialization (to_dict) and clear_identity just dropped
+        # the stored routing result, so neither the registry's room-targets stamp (wire-
+        # invisible by design) nor its bot binding survives to the canonicalize below. One
+        # duck-typed hook lets the adapter restate them from the live registry — the same
+        # per-message verdicts a typed message in the linked channel gets. A missing hook (a
+        # non-concierge adapter) or a failure leaves the source unstamped and the utterance
+        # takes normal delegation: fail-closed, intake never breaks.
+        restate = getattr(adapter, "_restate_voice_routing_stamps", None)
+        if callable(restate):
+            with suppress(Exception):
+                restate(source)
         if self._canonicalize(source, transport_profile=getattr(adapter, "_owner_profile", None)) is None:
             from gateway.parked_route_refusal import drop_rejected_route
             drop_rejected_route(adapter, source)  # a parked target is refused in the voice text channel

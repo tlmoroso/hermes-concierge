@@ -200,9 +200,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Wire-invisible, process-local marker: the ordered room members a source's
-# event must fan out to (stamped by build_source, consumed by the
-# set_message_handler wrap). Never serialized (SessionSource.to_dict reads
-# declared fields only).
+# event must fan out to (applied by the registry-verdict tail,
+# ``ConciergeVoiceMixin._concierge_apply_registry_verdict`` in the
+# concierge_voice sibling — reached from BOTH build_source and the
+# voice-ingress restamp hook — and consumed by the set_message_handler
+# wrap). Never serialized (SessionSource.to_dict reads declared fields
+# only).
 _ROOM_TARGETS_ATTR = "_concierge_room_targets"
 
 # Wire-invisible, process-local marker for the Task 8.2 connection nudge:
@@ -212,6 +215,15 @@ _ROOM_TARGETS_ATTR = "_concierge_room_targets"
 # set_message_handler wrap). Same discipline as _ROOM_TARGETS_ATTR: never
 # serialized.
 _CONCIERGE_CONNECT_NUDGE_ATTR = "_concierge_connect_nudge"
+
+# Voice-relay stamp (Task 3): the member profile a fan-out lane turn runs
+# for — set by _concierge_run_member_turn on the member event AFTER the
+# dataclasses.replace clones (plain attrs do not survive a replace), read
+# by the auto-TTS seam overrides in ConciergeVoiceMixin to decide whether
+# the lane's answer is spoken verbatim or as an auxiliary-LLM summary
+# (concierge.voice_relay). Same discipline as _ROOM_TARGETS_ATTR:
+# wire-invisible, process-local, never serialized.
+_VOICE_RELAY_ATTR = "_concierge_voice_relay_member"
 
 # Circuit breaker on waiting for ONE member's turn: generous vs a normal
 # agent turn (minutes), bounded vs a wedged one (which would silently stop
@@ -272,57 +284,23 @@ def _concierge_enabled_from_config(runner) -> bool:
         return False
 
 
-def _profile_exists(profile: str) -> tuple[bool, str | None]:
-    """Live (non-tombstoned) profile check — the same primitive
-    ``profile_exists`` gives ``_profile_name_for_source``'s served-set gate,
-    without the O(profiles) ``profiles_to_serve`` scan per inbound event.
-
-    Returns ``(exists, stat_error)``. ``stat_error`` is non-None when the check
-    itself FAILED (OSError: EACCES, EIO, a stalled mount) — a different incident
-    from a cleanly-absent profile, and the caller must say so instead of
-    recommending "re-provision". Invalid names (path traversal, reserved ids in
-    a hand-edited registry) are NOT I/O failures: ``normalize_profile_name``
-    raises ValueError inside ``profile_exists`` and the answer is simply
-    "does not exist" — the same verdict ``_profile_name_for_source``'s
-    served-set gate would give.
-
-    The failure verdict needs an explicit ``os.stat`` probe:
-    ``profile_exists`` checks liveness with ``Path.is_dir()``/``is_file()``,
-    which swallow OSError (EACCES reads as "absent" on 3.12+), so without the
-    probe the stat_error branch — and the operator-facing
-    "could not be checked" diagnosis — could never fire.
-    """
-    import os
-
-    try:
-        from hermes_cli.profiles import get_profile_dir, profile_exists
-
-        try:
-            profile_dir = get_profile_dir(profile)  # ValueError → invalid name
-        except ValueError:
-            return False, None
-        try:
-            os.stat(profile_dir)
-        except FileNotFoundError:
-            return False, None  # clean absence: the retired-bot diagnosis
-        except OSError as exc:
-            return False, repr(exc)  # the check failed: EACCES, EIO, ...
-        return profile_exists(profile), None
-    except OSError as exc:
-        return False, repr(exc)
-    except Exception:
-        return False, None
-
-
 class ConciergeDiscordMixin:
     """``build_source`` override carrying the concierge routing verdict.
 
     Mounted ahead of ``BasePlatformAdapter`` in the Discord adapter's MRO
-    (``class DiscordAdapter(DiscordMediaMixin, ConciergeDiscordMixin,
-    BasePlatformAdapter)``) so the override applies to EVERY ingress path that
-    builds a source — plain messages, slash commands, platform events — with
-    zero changes at the call sites. Duck-typed: the mixin only calls
-    ``super()`` and its own helpers, so it composes with any base providing
+    (``class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin,
+    ConciergeDiscordMixin, ConciergeVoiceMixin, …, BasePlatformAdapter)``)
+    so the override applies to EVERY ingress path that builds a source —
+    plain messages, slash commands, platform events — with zero changes at
+    the call sites. NOT self-contained: it MOUNTS TOGETHER with
+    ``ConciergeVoiceMixin`` (the concierge_voice sibling, which owns the
+    registry-verdict machinery) and reaches the shared
+    helpers — ``_concierge_registry_or_none``,
+    ``_concierge_apply_registry_verdict`` — through ``self``, which the
+    MRO resolves onto the companion mixin at call time (companion methods
+    are declared here only as ``Any``-typed names). ``build_source`` and
+    ``_concierge_route_for_source`` therefore REQUIRE that companion in
+    the bases; the pair composes with any base providing
     ``build_source``.
 
     Warning dedup: the fail-closed WARNINGs (ghost binding, unreadable
@@ -395,52 +373,8 @@ class ConciergeDiscordMixin:
         # message, not one per section). None = unreadable; degrade to the
         # hub with the warn-once posture below.
         reg = self._concierge_registry_or_none(source)
-        profile = None
         if reg is not None:
-            # Task 7.3 call order: the ROOM lookup runs FIRST — a channel is
-            # a room XOR a binding (registry invariant), so at most one can
-            # match; an empty room verdict falls through to the single-bot
-            # binding lookup below.
-            room_targets = self._concierge_room_targets_from_registry(source, reg)
-            if room_targets:
-                setattr(source, _ROOM_TARGETS_ATTR, tuple(room_targets))
-                return source
-            profile = self._concierge_profile_from_registry(source, reg)
-        if profile is None:
-            return source  # unbound channel: the hub answers, no re-home
-        exists, stat_error = _profile_exists(profile)
-        if stat_error is not None:
-            # The check FAILED (EACCES, EIO, stalled mount) — not "retired
-            # bot". Routing fail-closed either way, but the operator action
-            # is "fix the filesystem/gateway user", never "re-provision or
-            # unbind", which would destroy a healthy binding over a transient
-            # or environmental fault.
-            self._concierge_warn_once(
-                ("stat", str(source.chat_id), profile),
-                "[%s] Concierge binding for channel %s points at profile %r "
-                "which could not be checked (%s); routing to the hub instead "
-                "— investigate the profile directory/permissions before "
-                "re-provisioning or unbinding",
-                getattr(self, "name", "discord"), source.chat_id, profile,
-                stat_error)
-            return source
-        if not exists:
-            self._concierge_warn_once(
-                ("ghost", str(source.chat_id), profile),
-                "[%s] Concierge binding for channel %s points at profile %r "
-                "which does not exist (bot retired?); routing to the hub "
-                "instead — re-provision or unbind the channel",
-                getattr(self, "name", "discord"), source.chat_id, profile)
-            return source
-
-        source.profile = profile
-        logger.debug(
-            "[%s] Concierge: channel %s routed to bot profile %s",
-            getattr(self, "name", "discord"), source.chat_id, profile)
-        # Task 8.2: the nudge decision rides the SAME registry read the
-        # routing verdict came from — the binding is already in hand, so no
-        # second registry read and (for connectless blueprints) no probe.
-        self._concierge_stamp_connect_nudge(source, reg, profile)
+            self._concierge_apply_registry_verdict(source, reg)
         return source
 
     # ── Task 8.2: account-connection nudges (decision at build_source) ─────
@@ -510,88 +444,6 @@ class ConciergeDiscordMixin:
                 "[%s] concierge: connection-nudge decision failed; "
                 "message routing proceeds without a nudge",
                 getattr(self, "name", "discord"), exc_info=True)
-
-    def _concierge_registry_or_none(self, source):
-        """ONE registry read for the whole routing decision (rooms + bindings
-        share it), or ``None`` when the registry is unreadable — degrade to
-        the hub, message intake keeps working, ONE warning per channel (the
-        M5b cardinality contract, unchanged)."""
-        try:
-            from concierge import registry
-
-            return registry.load_registry()
-        except Exception:
-            self._concierge_warn_once(
-                ("registry", str(getattr(source, "chat_id", "?")), ""),
-                "[%s] concierge registry unreadable; per-channel routing "
-                "skipped for channel %s",
-                getattr(self, "name", "discord"), getattr(source, "chat_id", "?"),
-                exc_info=True)
-            return None
-
-    def _concierge_profile_from_registry(self, source, reg) -> str | None:
-        """Single-bot verdict's profile for *source* from a LOADED registry
-        (the M5b ``resolve_target_profile`` call, fed the shared read)."""
-        from concierge.routing import resolve_target_profile
-
-        verdict = resolve_target_profile(
-            reg.get("bindings") or {},
-            channel_id=source.chat_id,
-            parent_channel_id=source.parent_chat_id,
-            author_is_bot=source.is_bot,
-        )
-        return verdict.profile if verdict.routed else None
-
-    def _concierge_room_targets_from_registry(self, source, reg) -> list[str]:
-        """Task 7.3 room verdict: the ordered member profiles this source's
-        event must fan out to; ``[]`` when the channel is not a room, the
-        message is bot-authored (anti-loop, pure layer), or every member was
-        filtered out. Threads/forum posts inherit the parent channel's room
-        (binding parity). Ghost members are skipped with the binding path's
-        warn-once/fail-closed posture — a retired member never runs, and the
-        live members still answer."""
-        from concierge.routing import resolve_room_targets
-
-        rooms = reg.get("rooms")
-        if not isinstance(rooms, dict):
-            return []
-        room = rooms.get(str(getattr(source, "chat_id", "") or ""))
-        if not isinstance(room, dict):
-            parent = getattr(source, "parent_chat_id", None)
-            room = rooms.get(str(parent)) if parent is not None else None
-        if not isinstance(room, dict):
-            return []
-        targets = resolve_room_targets(
-            room.get("members"),
-            author_is_bot=bool(getattr(source, "is_bot", False)),
-            # v1 mention semantics: see the module docstring — the shared
-            # Discord identity cannot name a member, so mentioned_profiles
-            # stays empty (no mention and @shared-bot are both broadcasts).
-        )
-        channel_id = str(getattr(source, "chat_id", "?"))
-        live = []
-        for member in targets:
-            exists, stat_error = _profile_exists(member)
-            if stat_error is not None:
-                self._concierge_warn_once(
-                    ("room-stat", channel_id, member),
-                    "[%s] Concierge room member %r for channel %s could not "
-                    "be checked (%s); skipping it for this fan-out — "
-                    "investigate the profile directory/permissions before "
-                    "re-provisioning",
-                    getattr(self, "name", "discord"), member, channel_id,
-                    stat_error)
-                continue
-            if not exists:
-                self._concierge_warn_once(
-                    ("room-ghost", channel_id, member),
-                    "[%s] Concierge room member %r for channel %s does not "
-                    "exist (bot retired?); skipping it — remove it with "
-                    "/room remove",
-                    getattr(self, "name", "discord"), member, channel_id)
-                continue
-            live.append(member)
-        return live
 
     # ── Task 7.3/8.2 EXECUTION: the runner's message-handler seam ──────────
     #
@@ -886,6 +738,11 @@ class ConciergeDiscordMixin:
         member_event.media_types = list(member_event.media_types or [])
         member_event.media_text_inlined = list(member_event.media_text_inlined or [])
         member_event.metadata = dict(member_event.metadata or {})
+        # The voice-relay stamp goes on AFTER the replaces (plain attrs do
+        # not survive dataclasses.replace): the auto-TTS seam in
+        # ConciergeVoiceMixin reads it to tell a member-lane voice event
+        # from the hub's own spoken turn and relay the answer as a summary.
+        setattr(member_event, _VOICE_RELAY_ATTR, member)
         await super().handle_message(member_event)
         await self._concierge_wait_for_member_turn(member_event)
 

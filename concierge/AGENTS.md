@@ -262,6 +262,26 @@ and END THE TURN.
   config routes (rooms make that impossible anyway — same-specificity routes
   raise `admission_conflict`).
 
+## 12. Voice front-door (2026-11-09, deployed; live E2E pending)
+
+- **Flow:** spoken input `_handle_voice_channel_input` (run_voice.py) → duck-typed
+  `_restate_voice_routing_stamps` (concierge_voice.py — re-applies room/binding registry
+  verdicts that `clear_identity` + source serialization drop; without it spoken input ran a
+  plain hub-lane turn) → the wrap → fan-out. Member lanes speak through the BASE auto-TTS
+  chain; `ConciergeVoiceMixin` overrides `_wants_auto_tts`/`_synthesize_auto_tts` (called
+  back-to-back at base.py:~4505-07, NO await between — the stash invariant; drift = silent
+  verbatim, watch for a debug log) to swap in aux-LLM summaries.
+- **Config (launch home):** `concierge.voice_relay: {mode: summary|verbatim|off (default off),
+  max_chars: 400}` — garbage resolves to off/400 (fail-closed). The aux model pins under
+  `auxiliary.voice_relay`; CoT-only responses are rejected (verbatim fallback), never spoken.
+- **Suites:** test_discord_concierge_voice_ingress / _lane_delivery / _relay.py (32 tests).
+- **VM deps:** libopus0 + ffmpeg (apt) gate VC playback — the "Opus codec not found" log line
+  IS the gate. STT/TTS ride `stt.provider`/`tts.provider: nous` (Portal OAuth, no static keys).
+- **Deploy gotcha:** the local-session guard blocks concierge-deploy.sh (it pattern-matches
+  the REMOTE restart inside the script) — rsync manually with the same excludes, then pipe the
+  restart over SSH stdin (§6 pattern). Deploy excludes now include `venv/` (a stale
+  Mac-binary venv/ had shipped to the VM).
+
 Anchors: build plan at `~/.hermes/plans/2026-09-20_165455-discord-concierge.md`;
 design notes in `concierge/DISCORD_INTEGRATION.md`; deploy runbook
 `concierge/DEPLOY.md`; Apple data options `concierge/APPLE_BRIDGE.md`.

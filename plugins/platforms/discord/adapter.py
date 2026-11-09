@@ -1303,10 +1303,11 @@ from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 from plugins.platforms.discord.concierge_mixin import ConciergeDiscordMixin
+from plugins.platforms.discord.concierge_voice import ConciergeVoiceMixin
 
 
-class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDiscordMixin, DiscordThreadTitlesMixin,
-                     DiscordVoiceInfoMixin, DiscordSlashAuthMixin, BasePlatformAdapter):
+class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDiscordMixin, ConciergeVoiceMixin,
+                     DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
     MAX_MESSAGE_LENGTH = 2000
