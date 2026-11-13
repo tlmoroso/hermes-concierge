@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from plugins.platforms.discord.concierge_mixin import (
+    _CONCIERGE_ORCHESTRATOR_ATTR,
     _ROOM_TARGETS_ATTR,
     _VOICE_RELAY_ATTR,
     _concierge_enabled_from_config,
@@ -186,7 +187,13 @@ class ConciergeVoiceMixin:
             delattr(source, _ROOM_TARGETS_ATTR)
         profile = self._concierge_profile_from_registry(source, reg)
         if profile is None:
-            return  # unbound channel: the hub answers, no re-home
+            # Orchestrator redesign (design §4): no binding/room verdict — but
+            # the author may have their OWN orchestrator. The re-home needs
+            # the channel's category, which lives on the EVENT, not the
+            # source, so the verdict tail only STAMPS the process-local
+            # orchestrator attr; the set_message_handler wrap consumes it.
+            self._concierge_stamp_orchestrator_fallback(source, reg)
+            return  # unbound channel: the hub answers until the wrap re-homes
         exists, stat_error = _profile_exists(profile)
         if stat_error is not None:
             # The check FAILED (EACCES, EIO, stalled mount) — not "retired
@@ -220,6 +227,62 @@ class ConciergeVoiceMixin:
         # second registry read and (for connectless blueprints) no probe.
         self._concierge_stamp_connect_nudge(source, reg, profile)
 
+    def _concierge_stamp_orchestrator_fallback(self, source, reg) -> None:
+        """Stamp the author's orchestrator profile on *source* (the
+        process-local ``_CONCIERGE_ORCHESTRATOR_ATTR`` marker, the
+        ``_ROOM_TARGETS_ATTR`` discipline: wire-invisible, never serialized)
+        when the registry's USERS section gives the author a LIVE
+        orchestrator and no binding/room verdict claimed the channel (this
+        tail only runs on the unbound path — a bound or room channel never
+        sees it). The WRAP consumes the stamp: it re-homes
+        ``source.profile`` before delegation when the channel sits in a
+        managed category, and admission confirms via the users section
+        (branch (c) of ``_concierge_dynamic_runtime_profile``).
+
+        Anti-loop and fail-closed, the binding path's exact posture:
+        bot-authored sources never get the stamp (a bot's own message must
+        not route to the orchestrator), and a dead or uncheckable
+        orchestrator warns ONCE and leaves the source unstamped — today's
+        hub behavior, unchanged."""
+        if getattr(source, "is_bot", False):
+            return
+        users = reg.get("users")
+        if not isinstance(users, dict):
+            return
+        user_id = str(getattr(source, "user_id", "") or "")
+        if not user_id:
+            return
+        entry = users.get(user_id)
+        orchestrator = (entry.get("orchestrator")
+                        if isinstance(entry, dict) else None)
+        if not isinstance(orchestrator, str) or not orchestrator.strip():
+            return
+        exists, stat_error = _profile_exists(orchestrator)
+        if stat_error is not None:
+            self._concierge_warn_once(
+                ("orchestrator-stat", user_id, orchestrator),
+                "[%s] Concierge orchestrator for user %s (profile %r) could "
+                "not be checked (%s); leaving the channel on the hub — "
+                "investigate the profile directory/permissions before "
+                "re-provisioning",
+                getattr(self, "name", "discord"), user_id, orchestrator,
+                stat_error)
+            return
+        if not exists:
+            self._concierge_warn_once(
+                ("orchestrator-ghost", user_id, orchestrator),
+                "[%s] Concierge orchestrator for user %s points at profile "
+                "%r which does not exist (bot retired?); routing to the hub "
+                "instead — re-provision or repair the users entry",
+                getattr(self, "name", "discord"), user_id, orchestrator)
+            return
+        setattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, orchestrator)
+        logger.debug(
+            "[%s] Concierge: unbound channel %s stamped for the author's "
+            "orchestrator %s (consumed by the inbound wrap)",
+            getattr(self, "name", "discord"),
+            getattr(source, "chat_id", "?"), orchestrator)
+
     def _restate_voice_routing_stamps(self, source) -> None:
         """Restate the concierge routing verdicts on a voice-ingress source.
 
@@ -234,6 +297,29 @@ class ConciergeVoiceMixin:
         gets). Same gates as ``build_source``; never raises: a failure leaves
         the source unstamped and the utterance takes the normal delegation
         path (fail-closed, intake never breaks).
+
+        Speaker→orchestrator lane (design §5, admission reconciliation):
+        the normal registry verdict runs FIRST — a binding or room verdict
+        claims the channel exactly as for typed input (a user speaking in
+        a worker's channel is talking to that worker; design: binding
+        routing untouched) — and the lane AFTER it consumes the verdict
+        tail's EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp: spoken
+        input from a user with a live orchestrator runs as their
+        orchestrator when the channel owns no conversation of its own
+        (unbound); bound and room channels keep their existing routing.
+        The order is what admission reconciles with BY CONSTRUCTION — the
+        stamp exists only on an unbound, non-room channel, exactly the
+        shape branch (c) of ``_concierge_dynamic_runtime_profile``
+        confirms; re-homing a bound or room channel to the orchestrator
+        would leave a profile admission refuses (``profile_mismatch`` —
+        the utterance DROPPED, the one outcome the routing invariants
+        forbid). No category check for the voice lane (controller
+        decision: spoken input is user-scoped, not channel-scoped — the
+        user's orchestrator is the front door for all their spoken input
+        in unbound channels, regardless of category). Relay rationale:
+        the orchestrator's own final turn already contains the
+        dispatched-and-summarized worker results, so the existing relay at
+        the base auto-TTS seam speaks the right answer — no relay changes.
         """
         runner = getattr(self, "gateway_runner", None)
         if not _concierge_enabled_from_config(runner):
@@ -250,7 +336,71 @@ class ConciergeVoiceMixin:
         self._concierge_wire_dynamic_router(runner)
         reg = self._concierge_registry_or_none(source)
         if reg is not None:
+            # The normal registry verdict FIRST (design §5, admission
+            # reconciliation): a binding or room verdict claims the channel
+            # exactly as for typed input, and only its no-verdict tail
+            # stamps the orchestrator — the lane below consumes that stamp,
+            # never a second users-section read or liveness pass.
             self._concierge_apply_registry_verdict(source, reg)
+            self._concierge_voice_orchestrator_lane(source)
+
+    def _concierge_voice_orchestrator_lane(self, source) -> None:
+        """The speaker→orchestrator lane of the voice restamp (design §5):
+        consume the verdict tail's EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR``
+        stamp — placed by ``_concierge_apply_registry_verdict`` exactly when
+        NO binding/room verdict claimed the channel AND the author has a
+        LIVE orchestrator (the stamp tail's own liveness posture and warn
+        keys — no new lookups here) — and re-home ``source.profile`` to it:
+        spoken input from a user with a live orchestrator runs as their
+        orchestrator when the channel owns no conversation of its own
+        (unbound); bound and room channels keep their existing routing
+        (design: binding routing untouched).
+
+        Admission reconciles BY CONSTRUCTION: the stamp exists only on an
+        unbound, non-room channel — exactly the shape branch (c) of
+        ``_concierge_dynamic_runtime_profile`` confirms — so a re-home to
+        a profile admission refuses (the ``profile_mismatch`` drop a
+        pre-verdict re-home could produce on a bound or room channel) is
+        impossible. No category check: spoken input is user-scoped, not
+        channel-scoped (controller decision) — the user's orchestrator is
+        the front door for all their spoken input in unbound channels,
+        regardless of category.
+
+        The stamp implies NO room-targets stamp (the verdict tail stamps
+        the orchestrator only on its no-verdict branch, after clearing any
+        stale room stamp), so the lane has nothing to clear; the stamp
+        itself STAYS on the source — the wrap's fallback re-home is
+        idempotent (same profile). Bot-authored sources never carry the
+        stamp (the tail's own anti-loop guard, mirrored here); NEVER raises
+        — a failure inside the lane leaves the routing as the verdict left
+        it (fail-closed: the wrap's fallback can still re-home, else the
+        hub answers — intake never breaks).
+        """
+        try:
+            if getattr(source, "is_bot", False):
+                return  # a bot's own utterance never claims a lane
+            orchestrator = getattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, None)
+            if not isinstance(orchestrator, str) or not orchestrator.strip():
+                # No stamp: a binding/room verdict claimed the channel, or
+                # the author has no LIVE orchestrator (the stamp tail already
+                # warned once for the dead/uncheckable cases) — today's
+                # routing stands.
+                return
+            source.profile = orchestrator
+            logger.debug(
+                "[%s] Concierge: spoken input from user %s routed to their "
+                "orchestrator %s (personal voice lane, unbound channel)",
+                getattr(self, "name", "discord"),
+                str(getattr(source, "user_id", "") or "?"), orchestrator)
+        except Exception:
+            # Fail-closed, the hook's own contract: a failure inside the
+            # lane leaves the source as the verdict left it — the wrap's
+            # orchestrator fallback can still re-home (managed categories),
+            # else the hub answers. Intake never breaks.
+            logger.debug(
+                "[%s] Concierge: speaker-to-orchestrator voice re-home "
+                "failed; leaving the verdict's routing in place",
+                getattr(self, "name", "discord"), exc_info=True)
 
     def _concierge_registry_or_none(self, source):
         """ONE registry read for the whole routing decision (rooms + bindings

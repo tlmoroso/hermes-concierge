@@ -201,8 +201,12 @@ def test_picker_still_offered_for_a_text_channel(rig):
     _run(rig.adapter._concierge_on_guild_channel_create(_TextChannel()))
 
     assert len(sends) == 1
+    # The six WORKER blueprints in CATALOG order; the orchestrator is
+    # absent by design (blueprint_choices excludes it — auto-provisioned
+    # per user, never picked into a channel).
     assert [o.value for o in sends[0][1].children[0].options] == [
-        "reminders", "scheduler", "researcher", "email_triage", "notes"]
+        "reminders", "scheduler", "researcher", "email_triage", "notes",
+        "developer"]
 
 
 # ── B) thread provision: in-thread greeting + seed turn ────────────────────

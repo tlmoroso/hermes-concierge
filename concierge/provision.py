@@ -74,6 +74,22 @@ just now" from "was already there" — the operator CLI prints "Already
 provisioned" instead of "Created" off this flag. Response metadata only:
 ``bind_channel`` writes just its own keys, so the flag never reaches the
 registry (nor any other reader of stored bindings).
+
+T3 (orchestrator redesign): USER-KEYED provisioning. ``create_bot`` takes
+``user_id`` alone (a channel-less, user-owned bot — the per-user
+orchestrator and workers, keyed by the registry's users section) or
+together with ``channel_id``; provisions serialize under a PER-USER lock
+(``user:<id>``, the same fail-closed machinery as the channel lock); the
+users-section bookkeeping is transactional with the profile (rollback and
+retire both clean it); reprovision parity retires a replaced user-owned
+profile exactly like the channel path retires a replaced bot; an
+orchestrator SWAP (reprovision parity or the both-given adopt path)
+preserves the users entry's home_channel/guild_id/workers — only the
+orchestrator field changes, via the registry's targeted clear_orchestrator
+(a whole-entry removal would wipe live workers' records); blueprint
+routines attach for user-owned bots even in multi-user mode (their routine
+cannot leak another user's data), delivering to the bot's channel or the
+user's home channel — deferred, never null-origin, when neither is known.
 """
 
 from __future__ import annotations
@@ -536,6 +552,17 @@ def _rollback_failed_provision(profile_name: str) -> None:
             "routine(s) — deleting the profile anyway",
             profile_name, exc_info=True)
     try:
+        # T3: a user-owned provision wrote users-section bookkeeping BEFORE
+        # the failing step — undo it with the profile, or a stale ownership
+        # record would point at a bot that does not exist (and idempotence
+        # would return the ghost forever).
+        _remove_user_ownership(profile_name)
+    except Exception:
+        logger.error(
+            "concierge: rollback of failed provision %s could not clean its "
+            "users-section ownership — remove the users entries pointing at "
+            "it via the registry", profile_name, exc_info=True)
+    try:
         from hermes_cli.profiles import delete_profile as _delete_profile
 
         _delete_profile(profile_name, yes=True)
@@ -546,35 +573,200 @@ def _rollback_failed_provision(profile_name: str) -> None:
             profile_name, profile_name, exc_info=True)
 
 
+def _remove_user_ownership(profile_name: str) -> None:
+    """Remove every users-section record pointing at ``profile_name`` (the
+    retire and rollback paths share this), TARGETED per ownership shape: a
+    user whose ``orchestrator`` IS the profile gets a targeted clear
+    (registry.clear_orchestrator — ``workers``/``guild_id``/``created``
+    survive because the worker PROFILES stay alive when an orchestrator is
+    retired or swapped; the entry is removed entirely only when no workers
+    remain); a workers-map VALUE pointing at the profile drops that worker
+    record only (registry.remove_user_worker). Tolerant by construction: a
+    bot no user owns (a v1 channel bot, or an already-clean registry) is a
+    no-op, and missing entries are no-ops."""
+    for user_id, entry in registry.list_users().items():
+        if entry.get("orchestrator") == profile_name:
+            registry.clear_orchestrator(user_id)
+        for key, profile in (entry.get("workers") or {}).items():
+            if profile == profile_name:
+                registry.remove_user_worker(user_id, key)
+
+
+def _user_owner_of(profile_name: str) -> Optional[str]:
+    """The user id that owns ``profile_name`` (its orchestrator or one of its
+    workers-map values), or None for a bot nobody owns (v1 channel bots)."""
+    for user_id, entry in registry.list_users().items():
+        if entry.get("orchestrator") == profile_name:
+            return user_id
+        if any(p == profile_name for p in (entry.get("workers") or {}).values()):
+            return user_id
+    return None
+
+
+def _record_user_bookkeeping(
+    blueprint_key: str, user_id, profile_name: str,
+    *, guild_id: Optional[str] = None,
+) -> dict:
+    """Write the users-section ownership record for a user-owned provision.
+
+    - orchestrator: ``registry.set_user`` (home_channel stays None — the
+      bootstrap flow creates the channel and fills it in later, not
+      provision).
+    - worker: ``registry.set_user_worker`` — which REQUIRES the user's entry
+      to exist (set_user is the only creation path, the registry's own
+      contract). A stray worker write for an unknown user raises instead of
+      silently no-oping: a dropped ownership record breaks user-keyed
+      idempotence and would double-build the bot on the next call.
+
+    Reprovision parity (the channel path retires a replaced bot; the user
+    path retires a replaced profile): an orchestrator reprovision retires +
+    DELETES the user's previous orchestrator before set_user overwrites the
+    entry; a worker reprovision retires + deletes the old worker profile and
+    overwrites the workers-map entry.
+
+    An orchestrator SWAP (reprovision parity, or the both-given adopt path
+    where the channel's orchestrator differs from the user's) PRESERVES the
+    previous entry's ``home_channel``/``guild_id``/``workers`` — only the
+    ``orchestrator`` field changes. The previous entry is captured BEFORE
+    the retire (the retire's targeted clear drops ``home_channel`` with the
+    orchestrator it routed, and removes the entry outright when there were
+    no workers), and the fresh set_user write re-seeds the preserved
+    scalars plus every worker record: the channel is still the user's home
+    channel (its binding is being rebound to the new profile by this same
+    provision), and each worker record still names a live profile — wiping
+    either is the exact double-build the user-keyed idempotence exists to
+    prevent. Returns the ownership record the caller returns for a
+    channel-less provision: the registry user entry (orchestrator) or
+    ``{profile, blueprint}`` (worker) — shape-compatible with create_bot's
+    user-keyed idempotent returns.
+    """
+    if blueprint_key == "orchestrator":
+        previous = registry.get_user(user_id)
+        replaced = registry.orchestrator_for_user(user_id)
+        if replaced is not None and replaced != profile_name:
+            retire_bot(replaced, delete_profile=True)
+        if previous is not None:
+            entry = registry.set_user(
+                user_id, orchestrator=profile_name,
+                home_channel=previous.get("home_channel"),
+                guild_id=previous.get("guild_id") or guild_id)
+            for worker_key, worker_profile in (previous.get("workers")
+                                               or {}).items():
+                registry.set_user_worker(user_id, worker_key, worker_profile)
+            return entry
+        return registry.set_user(
+            user_id, orchestrator=profile_name, guild_id=guild_id)
+    if registry.get_user(user_id) is None:
+        raise ValueError(
+            f"cannot provision a per-user {blueprint_key!r} worker for user "
+            f"{user_id!r}: the user has no registry entry — provision their "
+            f"orchestrator first (create_bot('orchestrator', user_id=...))")
+    replaced = registry.worker_for_user(user_id, blueprint_key)
+    if replaced is not None and replaced != profile_name:
+        retire_bot(replaced, delete_profile=True)
+    registry.set_user_worker(user_id, blueprint_key, profile_name)
+    return {"profile": profile_name, "blueprint": blueprint_key}
+
+
 def create_bot(
     blueprint_key: str,
     *,
-    channel_id: str,
+    channel_id: Optional[str] = None,
     guild_id: Optional[str] = None,
     provider_group: Optional[dict] = None,
     source_skills_dir: Optional[Path] = None,
     display_name: Optional[str] = None,
     user_id: Optional[str] = None,
 ) -> dict:
-    """Create (or return the existing) bot bound to ``channel_id``.
+    """Create (or return the existing) bot for a channel, a user, or both.
 
-    Idempotent per channel: a channel never gets two bots. The whole
-    check-create-bind sequence runs under a per-channel provision lock — the
-    idempotence check is read-then-act, and two concurrent provisions of one
-    channel (a double-clicked picker, a gateway handler racing the CLI) would
-    both pass it and orphan the loser's routine (TOCTOU). Re-provisioning a
-    channel with a DIFFERENT blueprint retires and DELETES the old bot first —
-    its binding is being replaced, so a parked-paused profile would leak one
-    orphan per reprovision. The provision itself is TRANSACTIONAL: any failure
-    after the profile exists rolls the whole bot back and re-raises the
-    original error — a half-built bot whose routine still fires is worse than
-    a clean failure the user can retry. Returns the binding, annotated with
-    ``already_provisioned: True`` when the channel's existing bot (same
-    blueprint) was returned as-is instead of being created.
+    Three provisioning modes (orchestrator redesign, T3):
+
+    - ``channel_id`` only — the v1 channel-bound bot, EXACT v1 behavior:
+      idempotent per channel under the per-channel provision lock, binding
+      written LAST, reprovision with a different blueprint retires and
+      DELETES the old bot.
+    - ``user_id`` only — a USER-OWNED, channel-less bot (the per-user
+      orchestrator and workers): NO binding is written. Idempotence keys by
+      USER — one orchestrator per user; one worker per (user, blueprint) —
+      under a PER-USER provision lock (``user:<id>``: the same fail-closed
+      machinery as the channel lock, a different key, so two concurrent
+      provisions of one user can no more double-build a bot than two of one
+      channel could). The return is the ownership record: the registry user
+      entry for an orchestrator, ``{profile, blueprint}`` for a worker —
+      annotated ``already_provisioned: True`` when the existing bot was
+      returned as-is instead of being created (response metadata only; the
+      registry never persists the flag).
+    - both — user-owned AND channel-bound: the v1 binding flow PLUS the
+      users-section bookkeeping. When the channel already has this
+      blueprint's bot, the user's ownership is recorded against the EXISTING
+      profile (adopt) and the v1 idempotent binding is returned. When the
+      user already owns a DIFFERENT profile of this blueprint, reprovision
+      parity applies: the replaced profile is retired and DELETED, exactly
+      like the channel path retires a replaced bot (a parked-paused profile
+      would leak one orphan per reprovision).
+    - neither — ValueError (operator-actionable: both modes are named).
+
+    ``user_id`` (the Discord author id) names TWO things now: the per-user
+    ``terminal.cwd`` sandbox (seeded below) and the users-section ownership
+    record the registry consumes for per-user routing and idempotence.
+
+    The provision stays TRANSACTIONAL: any failure after the profile exists
+    rolls the whole bot back — profile, routine AND users entry — and
+    re-raises the original error.
     """
-    with _channel_provision_lock(channel_id):
-        existing = registry.get_binding(channel_id)
+    if channel_id is None and user_id is None:
+        raise ValueError(
+            "create_bot needs a target: pass channel_id (channel-bound "
+            "bot), user_id (user-owned, channel-less bot), or both "
+            "(user-owned bot bound to a channel)"
+        )
+    # Provision locks: the read-then-act idempotence checks below live
+    # INSIDE them (TOCTOU — the channel lock's rationale, now keyed per user
+    # as well: the lock path helper hashes the colon-bearing ``user:<id>``
+    # key, so per-user locks stay distinct and confined). Both given ->
+    # BOTH locks, channel first: a fixed global order (every both-given
+    # provision takes channel-then-user), so no cycle can form between
+    # concurrent modes.
+    with contextlib.ExitStack() as _locks:
+        if channel_id is not None:
+            _locks.enter_context(_channel_provision_lock(str(channel_id)))
+        if user_id is not None:
+            _locks.enter_context(_channel_provision_lock(f"user:{user_id}"))
+
+        # Idempotence, user key (channel-less mode only): one orchestrator
+        # per user, one worker per (user, blueprint). Any stored orchestrator
+        # profile is by construction the SAME blueprint lineage —
+        # ``orchestrator`` is the only key that ever writes the users entry's
+        # orchestrator field — so an existing orchestrator is always returned
+        # as-is, never rebuilt.
+        if channel_id is None:
+            if blueprint_key == "orchestrator":
+                owned = registry.orchestrator_for_user(user_id)
+                if owned is not None:
+                    entry = registry.get_user(user_id) or {}
+                    return {**entry, "already_provisioned": True}
+            else:
+                owned = registry.worker_for_user(user_id, blueprint_key)
+                if owned is not None:
+                    return {"profile": owned,
+                            "blueprint": blueprint_key,
+                            "already_provisioned": True}
+
+        # Idempotence + reprovision, channel key (v1 flow, channel-bound
+        # modes — byte-for-byte v1 when user_id is None).
+        existing = (registry.get_binding(channel_id)
+                   if channel_id is not None else None)
         if existing and existing["blueprint"] == blueprint_key:
+            if user_id is not None:
+                # Both given and the channel already has this blueprint's
+                # bot: the both-given contract is user-owned AND
+                # channel-bound, so the user's ownership lands on the
+                # EXISTING profile (reprovision parity applies to one they
+                # already owned) before the v1 idempotent return.
+                _record_user_bookkeeping(
+                    blueprint_key, user_id, existing["profile"],
+                    guild_id=guild_id)
             return {**existing, "already_provisioned": True}
         if existing:
             # Reprovision with a different blueprint: retire AND delete — the
@@ -692,10 +884,13 @@ def create_bot(
             # bot's terminal.cwd to a per-user workspace so tool-using bots
             # (developer) never share or clobber another user's files. Created
             # lazily by the terminal backend; the path is namespaced by user.
-            if user_id:
-                import os as _os
-                _home = Path(_os.path.expanduser("~"))
-                _ws = _home / ".hermes" / "workspaces" / str(user_id)
+            # Path.home (never os.path.expanduser("~")): Path.home is the
+            # resolution the test rig patches (the repo-wide convention for
+            # home-anchored call sites) — expanduser reads the raw HOME env
+            # and would anchor the seed on the REAL home under a patched one.
+            # Production behavior is identical.
+            if user_id is not None:
+                _ws = Path.home() / ".hermes" / "workspaces" / str(user_id)
                 config_seeds["terminal.cwd"] = str(_ws)
             _seed_profile_config(profile_dir, config_seeds)
 
@@ -732,6 +927,24 @@ def create_bot(
             #     don't 429 together and routines survive a provider outage
             _copy_resilience_config(profile_dir)
 
+            # 5d) users-section bookkeeping (user-owned modes): the ownership
+            #     record, written BEFORE the routine/bind steps so a later
+            #     failure rolls it back with the profile (the transactional
+            #     rollback cleans users entries pointing at the profile).
+            #     Reprovision parity — retire+delete a replaced user-owned
+            #     profile — lives in the helper.
+            user_record = None
+            if user_id is not None:
+                user_record = _record_user_bookkeeping(
+                    blueprint_key, user_id, profile_name, guild_id=guild_id)
+                # Channel-less WORKER mode has no binding to carry the
+                # guild_id — persist it to the user entry instead (the
+                # orchestrator's set_user write already does). Idempotent: a
+                # None guild_id never overwrites a stored value.
+                if (channel_id is None and blueprint_key != "orchestrator"
+                        and guild_id is not None):
+                    registry.update_user(user_id, guild_id=guild_id)
+
             # 6) routine -> namespaced cron job IN THE BOT PROFILE'S OWN cron store.
             #    cron/jobs.py header: each profile owns <profile_home>/cron/jobs.json and
             #    a job runs with the .env/config/skills of the profile whose store holds
@@ -741,31 +954,53 @@ def create_bot(
             #    seen by every user, so a blueprint-level routine is skipped to avoid
             #    leaking one user's agenda to others; per-user reminders are still
             #    available via the cronjob tool (delivered to the caller's own space).
-            if bp.routine and not _concierge_multi_user():
-                from cron.jobs import create_job
+            #    T3 (design §6): a USER-OWNED bot never skips — its routine serves one
+            #    user and cannot leak another's agenda. The routine's origin is the
+            #    bot's DELIVERY channel: the bound channel when one is given, else the
+            #    user's home channel; with NO delivery channel known (a channel-less
+            #    orchestrator before bootstrap) the routine is DEFERRED — skipped
+            #    with one debug log, never a job with a null origin (the bootstrap
+            #    path attaches it once the home channel exists).
+            if bp.routine and (user_id is not None or not _concierge_multi_user()):
+                origin_channel = (
+                    str(channel_id) if channel_id is not None
+                    else registry.home_channel_for_user(user_id))
+                if origin_channel:
+                    from cron.jobs import create_job
 
-                with use_cron_store(profile_dir):
-                    create_job(
-                        prompt=bp.routine.prompt,
-                        schedule=bp.routine.schedule,
-                        name=f"[bot:{profile_name}] {bp.routine.name}",
-                        model=model.model,
-                        provider=model.provider,
-                        enabled_toolsets=list(bp.toolsets),
-                        monitor_script=bp.routine.monitor,  # None = always run (default)
-                        deliver="origin",
-                        origin={"platform": "discord", "chat_id": str(channel_id)},
-                    )
+                    with use_cron_store(profile_dir):
+                        create_job(
+                            prompt=bp.routine.prompt,
+                            schedule=bp.routine.schedule,
+                            name=f"[bot:{profile_name}] {bp.routine.name}",
+                            model=model.model,
+                            provider=model.provider,
+                            enabled_toolsets=list(bp.toolsets),
+                            monitor_script=bp.routine.monitor,  # None = always run (default)
+                            deliver="origin",
+                            origin={"platform": "discord", "chat_id": origin_channel},
+                        )
+                else:
+                    logger.debug(
+                        "concierge: bot %s (user %s) has routine %r but no "
+                        "delivery channel yet — routine deferred until a home "
+                        "channel exists",
+                        profile_name, user_id, bp.routine.name)
 
-            # 7) bind LAST: until this succeeds, the profile is uncommitted —
-            #    any failure above (or in the bind itself) rolls it all back.
-            return registry.bind_channel(
-                channel_id,
-                profile=profile_name,
-                blueprint=bp.key,
-                guild_id=guild_id,
-                provider_group=(provider_group or {}).get("name"),
-            )
+            # 7) bind LAST (channel-bound modes): until this succeeds, the
+            #    profile is uncommitted — any failure above (or in the bind
+            #    itself) rolls it all back. A channel-less user-owned bot has
+            #    nothing to bind: its commit pointer is the users entry
+            #    written at 5d, and the return is the ownership record.
+            if channel_id is not None:
+                return registry.bind_channel(
+                    channel_id,
+                    profile=profile_name,
+                    blueprint=bp.key,
+                    guild_id=guild_id,
+                    provider_group=(provider_group or {}).get("name"),
+                )
+            return user_record
         except BaseException:
             _rollback_failed_provision(profile_name)
             raise
@@ -787,6 +1022,11 @@ def retire_bot(profile_name: str, *, delete_profile: bool = False) -> None:
     scheduler's invariants (next_run_at not cleared, terminal-state guard)
     are enforced by cron itself. A missing profile dir is tolerated: unbinding
     still happens, and there is no store to pause.
+
+    T3: a USER-OWNED bot has a second commit pointer — its users-section
+    entry — removed LAST (step 4), after pause/delete/unbind, so a mid-retire
+    crash always leaves a state a retry can finish and no stale ownership
+    record can outlive the bot.
     """
     try:
         profile_dir = get_profile_dir(profile_name)
@@ -818,9 +1058,23 @@ def retire_bot(profile_name: str, *, delete_profile: bool = False) -> None:
     for channel_id in registry.channels_for_profile(profile_name):
         registry.unbind_channel(channel_id)
 
+    # 4) USERS ownership LAST (T3): with the bot quiesced, deleted and
+    #    unbound, the users-section records are the last commit pointers —
+    #    remove them so no stale ownership (or user-keyed idempotence hit)
+    #    survives the retire. Tolerant: a bot no user owns is a no-op.
+    _remove_user_ownership(profile_name)
+
 
 def bot_status(profile_name: str) -> dict:
-    """One bot's channels + routine state, for /bot list."""
+    """One bot's channels + routine state, for /bot list.
+
+    T3: a USER-OWNED profile additionally reports ``user_id`` (the owning
+    user, found via a registry users scan) and ``channel_less`` (True when no
+    channel is bound — a live per-user worker before its first dispatch, or
+    an orchestrator before bootstrap; ``channels`` already reflects ``[]``).
+    A bot nobody owns (v1 channel bots) keeps the exact v1 shape — consumers
+    only ever see additive keys.
+    """
     try:
         profile_dir = get_profile_dir(profile_name)
         from cron import jobs as cron_jobs
@@ -833,10 +1087,16 @@ def bot_status(profile_name: str) -> dict:
             ]
     except Exception:
         jobs = []
-    return {
+    channels = registry.channels_for_profile(profile_name)
+    status = {
         "profile": profile_name,
-        "channels": registry.channels_for_profile(profile_name),
+        "channels": channels,
         "routines": [
             {"name": j["name"], "paused": not j.get("enabled", True)} for j in jobs
         ],
     }
+    owner = _user_owner_of(profile_name)
+    if owner is not None:
+        status["user_id"] = owner
+        status["channel_less"] = not channels
+    return status

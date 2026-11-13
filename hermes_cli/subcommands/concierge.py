@@ -18,19 +18,30 @@ def build_concierge_parser(subparsers, *, cmd_concierge: Callable) -> None:
         help="Manage Concierge bots (Discord per-channel helper bots)",
         description=(
             "Provision and retire Concierge bots: opinionated helper profiles "
-            "bound to a Discord channel, with their routine and persona set "
-            "up from a blueprint catalog."
+            "either bound to a Discord channel or owned per-user (channel-less "
+            "until first dispatch), with their routine and persona set up "
+            "from a blueprint catalog."
         ),
     )
     sub = parser.add_subparsers(dest="concierge_action")
 
     new_sub = sub.add_parser(
-        "new", aliases=["create"], help="Provision a bot from a blueprint into a channel"
+        "new", aliases=["create"],
+        help="Provision a bot from a blueprint into a channel or for a user"
     )
     new_sub.add_argument("blueprint", help="Blueprint key (see `hermes concierge list`)")
     new_sub.add_argument(
-        "--channel", required=True,
-        help="Discord channel id the bot is bound to (its routine posts here)"
+        "--channel", default=None,
+        help="Discord channel id the bot is bound to (channel-bound mode; "
+             "its routine posts here). Either --channel or --user is required."
+    )
+    new_sub.add_argument(
+        "--user", default=None, dest="user",
+        help="Discord user id: provisions a per-user bot — a channel-less "
+             "worker, or an orchestrator when the blueprint is "
+             "'orchestrator' (the personal channel is created on first "
+             "Discord contact). Use with --channel for a user-owned bot "
+             "that is also channel-bound."
     )
     new_sub.add_argument("--guild", default=None, help="Discord guild id (provider-group matching)")
     new_sub.add_argument(

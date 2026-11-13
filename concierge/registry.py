@@ -13,7 +13,12 @@ logged, and the registry starts empty. Shape:
          "guild_id": "...", "provider_group": null, "created_at": "..."}},
      "rooms": {"<channel_id>": {
          "members": ["bot-reminders-a1b2", "bot-scheduler-c3d4"],
-         "created_at": "..."}}}
+         "created_at": "..."}},
+     "users": {"<discord_user_id>": {
+         "orchestrator": "bot-orchestrator-a1b2",
+         "home_channel": "<channel_id or null>", "guild_id": "<guild or null>",
+         "created": "...",
+         "workers": {"<blueprint_key>": "bot-researcher-c3d4"}}}}
 
 A ROOM is one channel bound to SEVERAL member profiles (Task 7.1; desktop
 Bot Mode parity, capped at MAX_ROOM_MEMBERS). A channel is a room XOR a
@@ -22,6 +27,12 @@ raises on a room channel, create_room/add_to_room raise on a bound one) so
 neither side can silently strand the other's routing. Rooms ride the same
 file, the same flock and the same corruption machinery as bindings; a
 registry written before rooms existed (no "rooms" key) loads fine.
+
+A USER entry (orchestrator redesign, T1) is the per-user record the
+orchestrator flow consumes: which orchestrator profile speaks for a Discord
+user, their home channel/guild, and the channel-less worker bots they own.
+Users ride the same file, lock and corruption machinery too; a registry
+written before users existed (no "users" key) loads with users = {}.
 """
 
 from __future__ import annotations
@@ -58,16 +69,27 @@ __all__ = [
     "add_to_room",
     "bind_channel",
     "channels_for_profile",
+    "clear_orchestrator",
     "create_room",
     "get_binding",
+    "get_user",
+    "home_channel_for_user",
     "list_bindings",
+    "list_users",
     "load_registry",
     "mark_connections_nudged",
     "nudged_connections",
+    "orchestrator_for_user",
     "registry_path",
     "remove_from_room",
+    "remove_user",
+    "remove_user_worker",
     "room_members",
+    "set_user",
+    "set_user_worker",
     "unbind_channel",
+    "update_user",
+    "worker_for_user",
 ]
 
 REGISTRY_VERSION = 1
@@ -111,7 +133,8 @@ def _registry_lock_file() -> Path:
 
 
 def _empty_registry() -> dict:
-    return {"version": REGISTRY_VERSION, "bindings": {}, "rooms": {}}
+    return {"version": REGISTRY_VERSION, "bindings": {}, "rooms": {},
+            "users": {}}
 
 
 def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
@@ -233,7 +256,8 @@ def _warn_registry_unreadable_once(path) -> None:
         path, exc_info=True)
 
 
-def _clean_section(raw: dict, path: Path, key: str, singular: str) -> bool:
+def _clean_section(raw: dict, path: Path, key: str, singular: str,
+                   plural: Optional[str] = None) -> bool:
     """Normalize a top-level ``key`` holding a channel->entry mapping
     (``bindings``/``rooms`` — one shared tolerance policy, not two copies):
 
@@ -257,9 +281,13 @@ def _clean_section(raw: dict, path: Path, key: str, singular: str) -> bool:
         return False
     skipped = [cid for cid, entry in section.items() if not isinstance(entry, dict)]
     if skipped:
+        # ``plural`` overrides the naive singular+"s" for irregular nouns
+        # (e.g. "user entry" -> "user entries", not "user entrys").
+        noun = plural if plural is not None and len(skipped) != 1 else (
+            singular + ("" if len(skipped) == 1 else "s"))
         logger.warning(
-            "concierge registry: skipping %d non-dict %s%s in %s: %s",
-            len(skipped), singular, "" if len(skipped) == 1 else "s", path,
+            "concierge registry: skipping %d non-dict %s in %s: %s",
+            len(skipped), noun, path,
             ", ".join(map(repr, skipped)))
         raw[key] = {cid: entry for cid, entry in section.items()
                     if isinstance(entry, dict)}
@@ -299,6 +327,8 @@ def load_registry() -> dict:
     if not _clean_section(raw, path, "bindings", "binding"):
         return _empty_registry()
     if not _clean_section(raw, path, "rooms", "room"):
+        return _empty_registry()
+    if not _clean_section(raw, path, "users", "user entry", "user entries"):
         return _empty_registry()
     raw.setdefault("version", REGISTRY_VERSION)
     return raw
@@ -574,3 +604,250 @@ def mark_connections_nudged(channel_id: str, kinds) -> list[str]:
         binding["nudged_connections"] = merged
         _save(reg)
         return list(merged)
+
+
+# ── Orchestrator redesign (T1): per-user orchestrator/worker records ──────
+
+# The scalar fields update_user may merge (closed set: a typo'd field must
+# surface, not silently drop the update the caller thought they made).
+_USER_MUTABLE_FIELDS = ("home_channel", "guild_id")
+
+
+def _require_profile_string(value, label: str) -> None:
+    """Write-path validation (the _require_member_string style): a profile or
+    key the WRITE path accepts must be a non-blank string, or the stored
+    entry would be invisible to every tolerant reader."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a non-blank string; got {value!r}")
+
+
+def _require_optional_channel(value, label: str) -> None:
+    """Same contract for optional channel/guild ids: a string or None."""
+    if value is not None:
+        _require_profile_string(value, label)
+
+
+def _user_entry(reg: dict, user_id: str) -> Optional[dict]:
+    """The stored (raw) user entry for ``user_id``, or None. Reads never
+    crash on hand-edited files: non-dict entries are dropped by
+    _clean_section at load time, so the only junk left is INSIDE a dict."""
+    entry = reg["users"].get(str(user_id))
+    return entry if isinstance(entry, dict) else None
+
+
+def _normalize_user_entry(entry: dict) -> dict:
+    """Tolerant read of a stored user entry (the nudged_connections policy):
+    missing or junk ``workers`` reads as ``{}``, missing or junk
+    ``home_channel``/``guild_id`` as None — a hand-edited file never crashes
+    a reader, and the next save self-heals the entry."""
+    normalized = dict(entry)
+    workers = normalized.get("workers")
+    normalized["workers"] = dict(workers) if isinstance(workers, dict) else {}
+    home_channel = normalized.get("home_channel")
+    normalized["home_channel"] = (home_channel
+                                  if isinstance(home_channel, str)
+                                  and home_channel.strip() else None)
+    guild_id = normalized.get("guild_id")
+    normalized["guild_id"] = (guild_id if isinstance(guild_id, str)
+                              and guild_id.strip() else None)
+    return normalized
+
+
+def set_user(user_id, *, orchestrator: str,
+             home_channel: Optional[str] = None,
+             guild_id: Optional[str] = None) -> dict:
+    """Record (or confirm) a user's orchestrator profile; returns the entry.
+
+    Idempotent create-or-return-existing, mirroring create_bot: when the
+    user already has an entry with the SAME orchestrator profile, the stored
+    entry is returned annotated ``already_provisioned: True`` — response
+    metadata only, never persisted, so a caller can tell "created just now"
+    from "was already there". On that idempotent path, differing
+    ``home_channel``/``guild_id`` args are intentionally ignored — the
+    stored entry wins (only a DIFFERENT orchestrator profile is a
+    reprovision; new scalar values never are). A DIFFERENT orchestrator
+    profile overwrites the whole entry (reprovision parity with
+    bind_channel's rebind-overwrite: the old orchestrator is being
+    replaced, not merged).
+    """
+    _require_profile_string(orchestrator, "orchestrator profile")
+    _require_optional_channel(home_channel, "home_channel")
+    _require_optional_channel(guild_id, "guild_id")
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        existing = _user_entry(reg, uid)
+        if existing is not None and existing.get("orchestrator") == orchestrator:
+            # A NORMALIZED copy (never the raw stored entry): a hand-edited
+            # junk ``workers`` value would otherwise reach the idempotent
+            # caller un-normalized — the same tolerance policy every other
+            # read applies.
+            normalized = _normalize_user_entry(existing)
+            normalized["already_provisioned"] = True
+            return normalized
+        entry = {"orchestrator": orchestrator,
+                 "home_channel": home_channel,
+                 "guild_id": guild_id,
+                 "created": _hermes_now().isoformat(),
+                 "workers": {}}
+        reg["users"][uid] = entry
+        _save(reg)
+        return dict(entry)
+
+
+def get_user(user_id) -> Optional[dict]:
+    """The user's stored entry (a tolerant, normalized copy) or None."""
+    entry = _user_entry(load_registry(), user_id)
+    return _normalize_user_entry(entry) if entry is not None else None
+
+
+def update_user(user_id, **fields) -> Optional[dict]:
+    """Merge-update the user's known scalar fields (``home_channel``,
+    ``guild_id``); returns the updated entry. A no-op returning None when
+    the user entry does not exist — an update never resurrects a removed
+    user (a retire can race the update). Unknown field names raise
+    ValueError: a typo'd field must surface, not silently vanish."""
+    unknown = [k for k in fields if k not in _USER_MUTABLE_FIELDS]
+    if unknown:
+        raise ValueError(
+            f"unknown user fields {unknown!r}; update_user accepts "
+            f"{list(_USER_MUTABLE_FIELDS)!r}")
+    for key, value in fields.items():
+        _require_optional_channel(value, f"user field {key!r}")
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        entry = _user_entry(reg, uid)
+        if entry is None:
+            return None
+        entry.update(fields)
+        _save(reg)
+        return _normalize_user_entry(entry)
+
+
+def orchestrator_for_user(user_id) -> Optional[str]:
+    """The orchestrator profile that speaks for this user, or None."""
+    entry = _user_entry(load_registry(), user_id)
+    if entry is None:
+        return None
+    orchestrator = entry.get("orchestrator")
+    return (orchestrator if isinstance(orchestrator, str)
+            and orchestrator.strip() else None)
+
+
+def home_channel_for_user(user_id) -> Optional[str]:
+    """The user's home channel id, or None (never bound / junk)."""
+    entry = _user_entry(load_registry(), user_id)
+    if entry is None:
+        return None
+    home_channel = entry.get("home_channel")
+    return (home_channel if isinstance(home_channel, str)
+            and home_channel.strip() else None)
+
+
+def worker_for_user(user_id, blueprint_key) -> Optional[str]:
+    """The user's worker profile for ``blueprint_key``, or None."""
+    entry = _user_entry(load_registry(), user_id)
+    if entry is None:
+        return None
+    workers = entry.get("workers")
+    if not isinstance(workers, dict):
+        return None
+    profile = workers.get(blueprint_key)
+    return profile if isinstance(profile, str) and profile.strip() else None
+
+
+def list_users() -> dict[str, dict]:
+    """All user entries (tolerant, normalized copies), keyed by user id."""
+    return {uid: _normalize_user_entry(entry)
+            for uid, entry in load_registry()["users"].items()}
+
+
+def set_user_worker(user_id, blueprint_key, profile) -> Optional[dict]:
+    """Record that ``blueprint_key``'s worker bot for this user runs as
+    ``profile``. Idempotent: the same profile for the same key is a no-op
+    returning the entry; a different profile overwrites. None when the user
+    entry does not exist — set_user is the only creation path, so a stray
+    worker write is a caller bug, never an implicit user."""
+    _require_profile_string(blueprint_key, "worker blueprint key")
+    _require_profile_string(profile, "worker profile")
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        entry = _user_entry(reg, uid)
+        if entry is None:
+            return None
+        workers = entry.get("workers")
+        if not isinstance(workers, dict):
+            workers = {}
+            entry["workers"] = workers
+        if workers.get(blueprint_key) == profile:
+            return _normalize_user_entry(entry)
+        workers[blueprint_key] = profile
+        _save(reg)
+        return _normalize_user_entry(entry)
+
+
+def clear_orchestrator(user_id) -> bool:
+    """Clear the user entry's ``orchestrator`` and ``home_channel`` fields —
+    and ONLY those: ``workers``/``guild_id``/``created`` survive. This is the
+    TARGETED clear the retire paths take when a user's orchestrator profile
+    goes away: the worker PROFILES stay alive (a retired or swapped
+    orchestrator is not a retired worker set), so wiping their records — as a
+    whole-entry remove_user would — is the exact double-build the user-keyed
+    idempotence exists to prevent. The home channel goes with the
+    orchestrator because it routed that orchestrator's ingress.
+
+    When the cleared entry would have neither an orchestrator nor workers,
+    it is removed entirely — no empty shells in the file. True when an entry
+    existed and was modified (the removed-empty-shell case counts); False
+    when there was nothing to clear (no entry, or a workers-only entry)."""
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        entry = _user_entry(reg, uid)
+        if entry is None:
+            return False
+        workers = entry.get("workers")
+        if not (isinstance(workers, dict) and workers):
+            # No orchestrator, no (tolerantly-read) workers: removing the
+            # entry entirely IS the clear.
+            del reg["users"][uid]
+            _save(reg)
+            return True
+        if "orchestrator" not in entry and "home_channel" not in entry:
+            return False  # workers-only entry: nothing orchestrator-shaped
+        entry.pop("orchestrator", None)
+        entry.pop("home_channel", None)
+        _save(reg)
+        return True
+
+
+def remove_user(user_id) -> bool:
+    """Remove the user's entry (and with it every worker record). True when
+    something was removed — the retire paths key off this contract."""
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        if uid not in reg["users"]:
+            return False
+        del reg["users"][uid]
+        _save(reg)
+        return True
+
+
+def remove_user_worker(user_id, blueprint_key) -> bool:
+    """Remove the user's worker record for ``blueprint_key``; the user entry
+    itself survives. True when something was removed."""
+    uid = str(user_id)
+    with _registry_lock():
+        reg = load_registry()
+        entry = _user_entry(reg, uid)
+        if entry is None:
+            return False
+        workers = entry.get("workers")
+        if not isinstance(workers, dict) or blueprint_key not in workers:
+            return False
+        del workers[blueprint_key]
+        _save(reg)
+        return True

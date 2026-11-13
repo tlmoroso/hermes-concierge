@@ -194,6 +194,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -207,6 +208,17 @@ logger = logging.getLogger(__name__)
 # wrap). Never serialized (SessionSource.to_dict reads declared fields
 # only).
 _ROOM_TARGETS_ATTR = "_concierge_room_targets"
+
+# Wire-invisible, process-local marker (orchestrator redesign, design §4):
+# the author's OWN orchestrator profile for a message in an UNBOUND channel —
+# stamped by the registry-verdict tail (the concierge_voice sibling, only
+# after NO binding/room verdict matched, so the stamp implies "unbound" by
+# construction) and consumed by the set_message_handler wrap, which re-homes
+# ``source.profile`` to it before delegation when the channel sits in a
+# managed category. Admission confirms via the users section (branch (c) of
+# ``_concierge_dynamic_runtime_profile``). Same discipline as
+# _ROOM_TARGETS_ATTR: never serialized.
+_CONCIERGE_ORCHESTRATOR_ATTR = "_concierge_orchestrator_profile"
 
 # Wire-invisible, process-local marker for the Task 8.2 connection nudge:
 # ``(registry_binding_key, missing_kind, ...)`` — the binding the nudge must
@@ -224,6 +236,40 @@ _CONCIERGE_CONNECT_NUDGE_ATTR = "_concierge_connect_nudge"
 # (concierge.voice_relay). Same discipline as _ROOM_TARGETS_ATTR:
 # wire-invisible, process-local, never serialized.
 _VOICE_RELAY_ATTR = "_concierge_voice_relay_member"
+
+# Wire-invisible, process-local marker (orchestrator redesign, PLAN decision
+# 2): stamped on the PHASE-B continuation event the dispatch driver clones,
+# consumed by the wrap's dispatch guard — a continuation turn NEVER
+# re-dispatches (depth 1), whatever the orchestrator answers with. Stamped
+# AFTER the dataclasses.replace clones (plain attrs do not survive a
+# replace). Same discipline as _ROOM_TARGETS_ATTR: never serialized.
+_CONCIERGE_DISPATCH_ATTR = "_concierge_dispatch_continuation"
+
+# The orchestrator's dispatch directive (PLAN decision 2): when work belongs
+# to a worker blueprint the ENTIRE response is exactly
+# ``@dispatch <blueprint-key> <task text>`` — the key is a CATALOG worker
+# blueprint (never ``orchestrator`` itself), and the task is everything after
+# it. Matched against the response STRIPPED (tolerating surrounding
+# whitespace); DOTALL lets the task run past the first line while the
+# response must still OPEN with the directive.
+_DISPATCH_DIRECTIVE_RE = re.compile(r"^@dispatch ([a-z_]+) (.+)$", re.DOTALL)
+
+# One history window line authored by the shared bot identity — the shape
+# ``_format_channel_history_line`` formats (``[Name [bot]] content``; foreign
+# bots are dropped by the formatter under the default DISCORD_ALLOW_BOTS, so
+# a ``[bot]``-suffixed line IS the shared identity's). The dispatch driver's
+# reply parser takes the NEWEST such line as the OPENING of the worker's
+# reply MESSAGE — everything after it up to the next author line below is
+# that same reply, so a multi-paragraph answer is captured WHOLE.
+_WORKER_REPLY_LINE_RE = re.compile(r"^\[.*\[bot\]\] (.+)$")
+
+# A history window line that OPENS a message — any of the formatter's author
+# shapes (``[name] ``, ``[name [bot]] ``, ``[unverified] [name] ``): the
+# dispatch reply parser's message boundary. A multi-line message's
+# continuation lines are emitted RAW by the formatter, so they do not match;
+# the accepted ambiguity is a reply paragraph that itself opens with
+# ``[x] `` (a line-based window cannot tell it from a new author).
+_WORKER_REPLY_AUTHOR_LINE_RE = re.compile(r"^\[.*\] ")
 
 # Circuit breaker on waiting for ONE member's turn: generous vs a normal
 # agent turn (minutes), bounded vs a wedged one (which would silently stop
@@ -282,6 +328,49 @@ def _concierge_enabled_from_config(runner) -> bool:
                           "gateway config; per-channel routing disabled",
                           exc_info=True)
         return False
+
+
+# The dispatch driver's fetch anchor (PLAN decision 2): the worker lane is
+# SYNTHETIC — no Discord message exists for it — but the reply fetch rides
+# ``_concierge_fetch_room_history``, which reads ``raw_message.channel`` and
+# anchors ``before=raw_message``. This duck-typed stand-in carries the WORKER
+# channel object plus a message id minted ahead in time, so the worker's
+# reply (posted by the normal delivery machinery, seconds ago) is INSIDE the
+# window instead of past its anchor. Plain class, not a discord.py type: the
+# base turn chain only ever duck-types the raw message (reply anchoring
+# reads the event's own ``message_id``), and the forum-seed precedent already
+# passes a channel object as a lane's raw message.
+_DISPATCH_FETCH_ANCHOR_AHEAD_SECONDS = 3600.0
+
+
+class _DispatchFetchAnchor:
+    """Duck-typed raw-message stand-in for a synthetic dispatch lane."""
+
+    __slots__ = ("channel", "id")
+
+    def __init__(self, channel, message_id: int) -> None:
+        self.channel = channel
+        self.id = message_id
+
+
+def _dispatch_fetch_anchor_id() -> int:
+    """A Discord snowflake minted ``_DISPATCH_FETCH_ANCHOR_AHEAD_SECONDS``
+    into the future — any message posted while this driver runs is strictly
+    OLDER than the anchor, so the fetch window sees the worker's reply."""
+    return int(((time.time() + _DISPATCH_FETCH_ANCHOR_AHEAD_SECONDS) * 1000.0
+                - 1420070400000.0) * (1 << 22))
+
+
+def _concierge_channel_slug(raw: str) -> str:
+    """Discord-safe slug of a display name/user id for channel names:
+    lowercase ascii alphanumerics with single hyphens. Never raises; never
+    empty (``user`` fallback). Shared by the orchestrator and worker channel
+    name helpers so the two cannot drift."""
+    slug = "".join(ch if ch.isascii() and ch.isalnum() else "-"
+                   for ch in raw.lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-") or "user"
 
 
 class ConciergeDiscordMixin:
@@ -506,7 +595,14 @@ class ConciergeDiscordMixin:
             runs the members) and RETURN — a room message is fully consumed
             by the fan-out, that is the designed semantics;
         (b) connect-nudge stamp → post the nudge FIRST, then delegate;
-        (c) otherwise delegate 1:1 to the stored runner handler.
+        (c) orchestrator stamp (design §4) → re-home ``source.profile`` to
+            the author's orchestrator before delegation (the channel is
+            unbound by construction of the stamp; admission confirms via
+            the users section), else — for a first contact with NO
+            orchestrator entry at all — spawn the background bootstrap (a
+            dead or uncheckable orchestrator skips it with one warning
+            per user), never blocking the message;
+        (d) otherwise delegate 1:1 to the stored runner handler.
         FAIL-CLOSED: any error in a concierge branch warns once and the
         message is delegated to the runner handler — intake never breaks.
         """
@@ -555,6 +651,43 @@ class ConciergeDiscordMixin:
                     "[%s] concierge: connection nudge failed for channel %s; "
                     "the turn proceeds normally: %s",
                     getattr(self, "name", "discord"), nudge[0], e)
+        # Orchestrator redesign (design §4), the unbound lanes. Order matters:
+        # room stamp → nudge → HERE → delegate, so neither branch disturbs
+        # the fan-out or nudge contracts. Both are fail-closed to today's hub
+        # behavior; neither ever blocks or breaks the delegation below.
+        orchestrator = None
+        try:
+            orchestrator = self._concierge_orchestrator_fallback_on(event)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("wrap-orchestrator",),
+                "[%s] concierge: the orchestrator fallback decision failed "
+                "(%s); the message is delegated to the normal lane instead",
+                getattr(self, "name", "discord"), e, exc_info=True)
+        if orchestrator is not None:
+            try:
+                event.source.profile = orchestrator
+                logger.debug(
+                    "[%s] concierge: unbound channel %s re-homed to the "
+                    "author's orchestrator %s",
+                    getattr(self, "name", "discord"),
+                    getattr(getattr(event, "source", None), "chat_id", "?"),
+                    orchestrator)
+            except Exception as e:
+                self._concierge_warn_once(
+                    ("wrap-orchestrator-rehome",
+                     str(getattr(getattr(event, "source", None), "chat_id", "?"))),
+                    "[%s] concierge: re-homing channel %s to the orchestrator "
+                    "failed (%s); the hub answers instead",
+                    getattr(self, "name", "discord"),
+                    getattr(getattr(event, "source", None), "chat_id", "?"), e)
+        else:
+            # Maybe spawn the bootstrap (never raises, never blocks — the
+            # task runs in the background and the message delegates
+            # normally, hub lane, exactly as before). First CONTACT only:
+            # a dead or uncheckable orchestrator entry skips it with one
+            # warning per user — never provision over the fault.
+            self._concierge_maybe_bootstrap_orchestrator(event)
         if runner_handler is None:
             # The base's no-handler contract, kept exact under the wrap: an
             # adapter that still polls and sends must not silently pretend.
@@ -566,7 +699,110 @@ class ConciergeDiscordMixin:
                     "connected and can send, but every inbound message is "
                     "discarded.", getattr(self, "name", "discord"))
             return None
-        return await runner_handler(event)
+        response = await runner_handler(event)
+        # Orchestrator dispatch (PLAN decision 2): a REGISTRY-CONFIRMED
+        # orchestrator turn that answered with the ``@dispatch`` directive
+        # hands the exchange to the background driver — the directive
+        # response itself is SUPPRESSED (None: the driver delivers
+        # everything). Every guard failure keeps the response UNCHANGED
+        # (fail-closed: the orchestrator answered alone).
+        dispatch = self._concierge_dispatch_directive_on(event, response)
+        if dispatch is None:
+            return response
+        blueprint_key, task = dispatch
+        channel_id = str(
+            getattr(getattr(event, "source", None), "chat_id", "") or "")
+        driver = None
+        try:
+            driver = asyncio.create_task(
+                self._concierge_orchestrator_dispatch(
+                    event, task, blueprint_key))
+            self._concierge_track_fanout_task(channel_id, driver)
+        except Exception as e:
+            # Never run the message twice: the half-spawned driver is
+            # cancelled before the fallback answer is returned (the room
+            # fan-out's spawn-failure contract).
+            if driver is not None:
+                driver.cancel()
+            self._concierge_warn_once(
+                ("dispatch-spawn", channel_id),
+                "[%s] concierge: spawning the orchestrator dispatch driver "
+                "failed for channel %s (%s); the orchestrator's answer is "
+                "delivered as-is instead",
+                getattr(self, "name", "discord"), channel_id, e,
+                exc_info=True)
+            return response
+        logger.info(
+            "[%s] concierge: orchestrator dispatch started for channel %s "
+            "(blueprint %s)",
+            getattr(self, "name", "discord"), channel_id, blueprint_key)
+        return None
+
+    # ── Orchestrator dispatch (PLAN decision 2): the wrap capability ──────
+
+    def _concierge_dispatch_directive_on(self, event, response):
+        """The dispatch verdict for *event*'s turn response:
+        ``(blueprint_key, task)`` when the response is the orchestrator's
+        ``@dispatch`` directive AND every guard holds, else ``None``.
+
+        Guards (ALL must hold, fail-closed to "no dispatch"):
+        - the event is human-authored (``source.is_bot`` False — a bot's
+          own directive-shaped answer never dispatches; anti-loop);
+        - the event does NOT carry the process-local dispatch-continuation
+          stamp (a phase-B turn never re-dispatches — depth 1);
+        - the response is a non-empty plain string whose (stripped) first
+          line is the directive, with a CATALOG worker blueprint key —
+          never ``orchestrator`` (no self-dispatch); every other response
+          shape (media objects, ephemeral wrappers, None) falls through;
+        - the turn ran AS the author's registry orchestrator
+          (``source.profile == orchestrator_for_user(user_id)``,
+          anti-spoof) — ONE registry read, paid ONLY on a
+          directive-shaped response (the wrap runs on every message; the
+          common case must stay read-free), tolerant → no dispatch.
+        """
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "is_bot", False):
+            return None
+        if getattr(event, _CONCIERGE_DISPATCH_ATTR, None):
+            return None
+        if not isinstance(response, str):
+            return None
+        match = _DISPATCH_DIRECTIVE_RE.match(response.strip())
+        if match is None:
+            return None
+        blueprint_key, task = match.group(1), match.group(2).strip()
+        if not task or blueprint_key == "orchestrator":
+            return None
+        try:
+            from concierge.blueprints import CATALOG
+
+            if blueprint_key not in CATALOG:
+                return None
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-catalog",),
+                "[%s] concierge: the blueprint catalog could not be read "
+                "for the dispatch decision (%s); the response is delivered "
+                "as-is instead",
+                getattr(self, "name", "discord"), e, exc_info=True)
+            return None
+        user_id = str(getattr(source, "user_id", "") or "")
+        if not user_id:
+            return None
+        try:
+            from concierge import registry
+
+            orchestrator = registry.orchestrator_for_user(user_id)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-registry", user_id),
+                "[%s] concierge: the orchestrator lookup for user %s failed "
+                "(%s); the response is delivered as-is instead",
+                getattr(self, "name", "discord"), user_id, e, exc_info=True)
+            return None
+        if not orchestrator or source.profile != orchestrator:
+            return None
+        return blueprint_key, task
 
     # ── Task 8.2: account-connection nudges (execution at the wrap) ────────
 
@@ -627,6 +863,754 @@ class ConciergeDiscordMixin:
                 "the turn proceeds normally: %s",
                 getattr(self, "name", "discord"), binding_key, e)
 
+    # ── Orchestrator redesign (design §4): unbound fallback + bootstrap ────
+    #
+    # Two unbound-channel lanes at the wrap, both fail-closed to today's hub
+    # behavior. The STAMP lives on the source (registry-verdict tail, the
+    # concierge_voice sibling — only set when NO binding/room verdict
+    # matched); the CATEGORY lives on the raw channel (the event), which is
+    # why the re-home happens HERE and not at the verdict tail.
+
+    def _concierge_event_category_id(self, event) -> str | None:
+        """The trigger channel's category id (normalized str) — duck-typed off
+        the RAW message's channel, exactly the way the event-surface helpers
+        read it (``category_id``, else ``category.id``). ``None`` when the
+        event carries no channel or no resolvable category, which every
+        consumer reads as a fail-closed "not managed".
+
+        Threads and forum posts: the category is resolved from the RAW
+        channel object only — this helper walks no parent chain of its
+        own. For a thread the only candidate view is discord.py's own
+        ``Thread.category_id`` property, which resolves the PARENT's
+        category when the parent is cached and RAISES ClientException
+        when it is not (the duck-typed read does not swallow that — the
+        consumers' fail-closed handlers do). The unbound fallback lanes
+        (re-home + bootstrap) are therefore NOT guaranteed inside
+        threads/forum posts — fail-closed, and asymmetric with the
+        binding/room path BY DESIGN (those inherit the parent channel's
+        registry key, because the registry owns that decision). Do not
+        "fix" this by walking the parent without revisiting the
+        bootstrap's assumptions (the personal channel is created in the
+        TRIGGER channel's category, which a thread does not have)."""
+        channel = getattr(getattr(event, "raw_message", None), "channel", None)
+        if channel is None:
+            return None
+        raw = getattr(channel, "category_id", None)
+        if raw is None:
+            raw = getattr(getattr(channel, "category", None), "id", None)
+        if raw is None:
+            return None
+        return str(raw)
+
+    def _concierge_event_in_managed_category(self, event) -> bool:
+        """True when the trigger channel sits in one of the configured managed
+        categories (the same list the auto-offer picker gates on). Anything
+        unresolvable — no category on the channel, unreadable settings —
+        resolves False: the unbound→orchestrator lanes must fail closed to
+        today's hub behavior, never re-home or bootstrap on a guess."""
+        settings = self._concierge_settings_obj()
+        if settings is None:
+            return False
+        category_id = self._concierge_event_category_id(event)
+        if category_id is None:
+            return False
+        managed = {str(c) for c in (settings.managed_category_ids or ())}
+        return category_id in managed
+
+    def _concierge_orchestrator_fallback_on(self, event) -> str | None:
+        """The unbound→orchestrator re-home verdict (design §4) for *event*:
+        the orchestrator profile to re-home to, or ``None`` (today's hub
+        behavior, unchanged). Requires ALL of a human-authored event
+        (anti-loop: a bot's own message never re-homes to the orchestrator),
+        the ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp the registry-verdict tail
+        left on the source (only ever set for an UNBOUND channel, by
+        construction), and a trigger channel inside a managed category —
+        the category check needs the RAW channel, which lives on the event,
+        not the source, and is why the re-home happens at the wrap instead
+        of in the verdict tail. The stamp is a plain str the tail validated
+        against the live registry (liveness included), moments ago on this
+        same dispatch; admission re-confirms via branch (c)."""
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "is_bot", False):
+            return None
+        stamp = getattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, None)
+        if not isinstance(stamp, str) or not stamp:
+            return None
+        if not self._concierge_event_in_managed_category(event):
+            return None
+        return stamp
+
+    def _concierge_source_unbound(self, source, reg) -> bool:
+        """True when the source's channel — or its parent, threads/forum
+        posts inherit (``_concierge_binding_key``'s resolution) — is NEITHER
+        a single-bot binding NOR a room: the fallback stamp's
+        by-construction precondition, re-checked here so a registry write
+        that raced the stamp still fails closed."""
+        bindings = reg.get("bindings")
+        if isinstance(bindings, dict):
+            if self._concierge_binding_key(source, bindings) is not None:
+                return False
+        rooms = reg.get("rooms")
+        if isinstance(rooms, dict):
+            for candidate in (getattr(source, "chat_id", None),
+                              getattr(source, "parent_chat_id", None)):
+                cid = str(candidate) if candidate is not None else ""
+                if cid and isinstance(rooms.get(cid), dict):
+                    return False
+        return True
+
+    def _concierge_user_orchestrator(self, users,
+                                     user_id: str) -> tuple[str | None, str]:
+        """The author's orchestrator POSTURE from the registry's users
+        section: ``(profile, posture)``, the postures the bootstrap lanes
+        distinguish explicitly (a dead or uncheckable orchestrator is NOT
+        first contact):
+
+        - ``"first_contact"`` — no users entry, or an entry with no
+          orchestrator field: the ONLY posture that bootstraps (design §4).
+        - ``"live"`` — an entry whose profile dir exists: route (the
+          orchestrator-stamp lane owns it), never bootstrap.
+        - ``"ghost"`` — an entry whose profile dir is MISSING: SKIP the
+          bootstrap — ``provision.create_bot`` is user-keyed idempotent and
+          returns the dead entry WITHOUT rebuilding the dir, so a bootstrap
+          here would create + bind a fresh home channel onto the dead
+          profile (a permanently wedged channel; the stamp tail already
+          warned, so there is no route either). The caller warns once per
+          user: re-provision or retire.
+        - ``"stat_error"`` — the liveness check itself failed (EACCES,
+          EIO, a stalled mount): SKIP, never provision over an
+          environmental fault. The caller warns once per user: investigate
+          the filesystem.
+
+        ``users`` is the users section of the ONE registry read the caller
+        already paid (None / non-dict → first contact) — this helper does
+        NO registry I/O of its own, keeping the hot path's one-read budget.
+        Never raises: an unclassifiable failure resolves to ``stat_error``
+        (fail-closed — never bootstrap over a fault we could not name).
+        """
+        try:
+            entry = users.get(str(user_id)) if isinstance(users, dict) else None
+            if not isinstance(entry, dict):
+                return None, "first_contact"
+            profile = entry.get("orchestrator")
+            if not isinstance(profile, str) or not profile.strip():
+                return None, "first_contact"
+            from plugins.platforms.discord.concierge_voice import _profile_exists
+
+            exists, stat_error = _profile_exists(profile)
+            if stat_error is not None:
+                return profile, "stat_error"
+            if not exists:
+                return profile, "ghost"
+            return profile, "live"
+        except Exception:
+            return None, "stat_error"
+
+    def _concierge_skip_bootstrap_warn(self, user_id: str, profile,
+                                       posture: str) -> None:
+        """The warn-once for a bootstrap skipped on a dead or uncheckable
+        orchestrator entry — SHARED by the decision and the in-task
+        re-check so the two call sites cannot drift, and keyed per USER so
+        a wedged entry warns once however many messages hit it (the fix —
+        re-provision, retire, or repair the filesystem — clears the noise
+        by construction). ``live`` is silent: routing, not an incident."""
+        if posture == "ghost":
+            self._concierge_warn_once(
+                ("bootstrap-ghost", user_id),
+                "[%s] concierge: user %s has a registry orchestrator (%r) "
+                "whose profile directory is missing (retired under us?); "
+                "skipping the first-contact bootstrap — re-provision the "
+                "orchestrator or retire the users entry",
+                getattr(self, "name", "discord"), user_id, profile)
+        elif posture == "stat_error":
+            self._concierge_warn_once(
+                ("bootstrap-stat", user_id),
+                "[%s] concierge: the orchestrator for user %s (profile %r) "
+                "could not be checked; skipping the first-contact "
+                "bootstrap — investigate the profile directory/filesystem "
+                "before re-provisioning",
+                getattr(self, "name", "discord"), user_id, profile)
+
+    def _concierge_maybe_bootstrap_orchestrator(self, event) -> None:
+        """First-contact bootstrap DECISION (design §4): a human-authored,
+        managed-category message in an UNBOUND channel from an author with
+        NO orchestrator AT ALL spawns ONE background bootstrap task
+        (``_concierge_orchestrator_bootstrap``), tracked like a fan-out
+        driver per channel id. Never raises and never blocks: the
+        triggering message delegates as the hub either way, and the NEXT
+        message routes to the orchestrator. Single-flight per USER via a
+        lazy in-flight set (check-then-add with no await between is atomic
+        on the event loop), so a burst of first messages spawns ONE
+        bootstrap; the task itself re-checks the users section and exits
+        unless the posture is still first contact (the second backstop).
+
+        The author's registry posture (``_concierge_user_orchestrator``)
+        decides — a dead or uncheckable orchestrator is NOT first contact:
+        ``first_contact`` bootstraps; ``live`` skips silently (the stamp
+        lane owns routing); ``ghost`` and ``stat_error`` skip with ONE
+        warning per user (a ghost must not bootstrap — the idempotent
+        provision would hand back the dead entry and the bootstrap would
+        bind a fresh home channel onto the dead profile; an uncheckable
+        orchestrator must never be provisioned over an environmental
+        fault).
+
+        HOT-PATH BUDGET: the registry read is for genuinely-unbound sources
+        ONLY. A room-targets stamp, or a binding/config verdict already on
+        the source — ``source.profile`` set to something OTHER than the
+        adapter's owner default, exactly build_source gate 3's distinction
+        between a REAL config route and the base's default stamp, and the
+        shape ``_concierge_apply_registry_verdict`` leaves on a bound
+        source — means the channel is not unbound: skip BEFORE any registry
+        work, so every BOUND-channel message in a managed category (the
+        normal concierge layout) and every member-lane room turn keeps the
+        ONE registry read for the whole routing decision. A message that
+        raced a concurrent bind/room write simply skips (fail-closed)."""
+        try:
+            source = getattr(event, "source", None)
+            if source is None or getattr(source, "is_bot", False):
+                return
+            if getattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, None):
+                return  # a stamp means an orchestrator exists: not first contact
+            if getattr(source, _ROOM_TARGETS_ATTR, None):
+                # A room message (or a member-lane clone carrying the
+                # stamp): the fan-out owns it — not a first contact, and no
+                # registry read to find that out.
+                return
+            stamped_profile = getattr(source, "profile", None)
+            if (stamped_profile is not None
+                    and stamped_profile != getattr(self, "_owner_profile", None)):
+                # A binding verdict re-homed the source (the
+                # registry-verdict tail stamps ``source.profile`` = the
+                # bound bot) or a real config route matched (build_source
+                # gate 3: only a stamp DIFFERING from the owner default is a
+                # decision) — the channel is not unbound, skip before any
+                # registry work.
+                return
+            if not self._concierge_event_in_managed_category(event):
+                return
+            user_id = str(getattr(source, "user_id", "") or "")
+            if not user_id:
+                return
+            from concierge import registry
+
+            # ONE registry read for the unbound check + the users-section
+            # posture (tolerate failure → skip: a bootstrap must never run
+            # on an unreadable registry); the posture reuses THIS read,
+            # never a separate users lookup.
+            reg = registry.load_registry()
+            if not self._concierge_source_unbound(source, reg):
+                return  # raced a concurrent bind/room write: fail closed
+            profile, posture = self._concierge_user_orchestrator(
+                reg.get("users"), user_id)
+            if posture != "first_contact":
+                # live: the stamp lane owns routing. ghost / stat_error:
+                # never bootstrap over a dead or uncheckable orchestrator.
+                self._concierge_skip_bootstrap_warn(user_id, profile, posture)
+                return
+            inflight = getattr(self, "_concierge_bootstrap_inflight", None)
+            if inflight is None:
+                inflight = self._concierge_bootstrap_inflight = set()
+            if user_id in inflight:
+                return
+            inflight.add(user_id)
+            try:
+                task = asyncio.create_task(
+                    self._concierge_orchestrator_bootstrap(event))
+            except Exception as e:
+                inflight.discard(user_id)
+                self._concierge_warn_once(
+                    ("bootstrap-spawn", user_id),
+                    "[%s] concierge: spawning the orchestrator bootstrap "
+                    "failed for user %s (%s); the next message retries",
+                    getattr(self, "name", "discord"), user_id, e,
+                    exc_info=True)
+                return
+            self._concierge_track_fanout_task(
+                str(getattr(source, "chat_id", "") or "?"), task)
+            logger.info(
+                "[%s] concierge: first contact from user %s in channel %s — "
+                "orchestrator bootstrap started",
+                getattr(self, "name", "discord"), user_id,
+                getattr(source, "chat_id", "?"))
+        except Exception as e:
+            self._concierge_warn_once(
+                ("bootstrap-decision",),
+                "[%s] concierge: the orchestrator bootstrap decision failed "
+                "(%s); the message is delegated to the normal lane instead",
+                getattr(self, "name", "discord"), e, exc_info=True)
+
+    async def _concierge_orchestrator_bootstrap(self, event) -> None:
+        """The first-contact bootstrap driver (design §4): provision the
+        author's orchestrator, create their personal channel in the trigger
+        channel's category, record the home + binding in the registry,
+        suppress the create event's auto-offer, and post the greeting + a
+        one-line pointer in the trigger channel.
+
+        FAIL-CLOSED: every step rides one try — any error warns ONCE (keyed
+        per user) and the bootstrap aborts; the triggering message is
+        UNAFFECTED (it already delegated to the hub — this task runs AFTER
+        delegation was initiated, never blocking it). A later message
+        retries only while the author still has NO orchestrator entry —
+        once the users entry lands, the re-check below exits, so the retry
+        window is exactly the window before a successful (or external)
+        provision. Provision/registry work is filesystem + flock work under
+        ``asyncio.to_thread`` (the M5c discipline of
+        ``_concierge_post_connect_nudge``). The in-flight set entry is
+        released in ``finally`` either way."""
+        user_id = str(getattr(getattr(event, "source", None), "user_id", "")
+                      or "")
+        try:
+            # Single-flight backstop: a bootstrap that lost a race re-checks
+            # the users section first and exits unless the posture is STILL
+            # first contact — the winning contact's bootstrap already
+            # happened (live), or the entry died or became uncheckable
+            # meanwhile (ghost / stat_error: never provision over those,
+            # the same three-posture rule the decision applies; the SHARED
+            # warn keys mean a state both seams saw warns once, not twice).
+            # An unreadable registry here also exits: the load raises into
+            # the fail-closed handler below — never provision over an
+            # environmental fault.
+            if not user_id:
+                return
+            from concierge import registry
+
+            reg = registry.load_registry()
+            profile, posture = self._concierge_user_orchestrator(
+                reg.get("users"), user_id)
+            if posture != "first_contact":
+                self._concierge_skip_bootstrap_warn(user_id, profile, posture)
+                return
+            source = getattr(event, "source", None)
+            guild_id = str(getattr(source, "guild_id", "") or "") or None
+            category_id = self._concierge_event_category_id(event)
+            from concierge import provision, registry
+
+            # 1) provision the author's orchestrator — user-keyed,
+            #    channel-less, idempotent (may return already_provisioned:
+            #    a race with another contact is fine, the entry is the truth).
+            record = await asyncio.to_thread(
+                provision.create_bot, "orchestrator",
+                user_id=user_id, guild_id=guild_id, channel_id=None)
+            profile = (record.get("orchestrator")
+                       if isinstance(record, dict) else None)
+            if not profile:
+                raise RuntimeError(
+                    "provisioning returned no orchestrator profile")
+            # 2) the personal channel, in the trigger channel's category.
+            home_channel = await self._concierge_create_channel(
+                guild_id=guild_id, category_id=category_id,
+                name=self._concierge_orchestrator_channel_name(source))
+            if not home_channel:
+                raise RuntimeError("the personal channel could not be created")
+            # 3) registry: the home channel + the binding (binding LAST among
+            #    the registry writes — until it lands, nothing routes there).
+            await asyncio.to_thread(
+                registry.update_user, user_id, home_channel=home_channel)
+            await asyncio.to_thread(
+                registry.bind_channel, home_channel, profile=profile,
+                blueprint="orchestrator", guild_id=guild_id)
+            # 4) the channel-create event's auto-offer picker must not fire
+            #    on the hub's own channel (``_concierge_create_channel``
+            #    already marked it; re-asserted here so the suppression
+            #    cannot depend on the create helper's internals).
+            self._concierge_remember_hub_created_channel(home_channel)
+            # 5) greet in the new home + point at it from the trigger channel.
+            title = self._concierge_member_title(profile)
+            await self._concierge_greet_created_channel(home_channel, title)
+            trigger = getattr(
+                getattr(event, "raw_message", None), "channel", None)
+            await self._concierge_post_to_channel(
+                str(getattr(source, "chat_id", "") or ""),
+                f"→ I set up a private channel for us: <#{home_channel}>",
+                channel=trigger)
+            # 6) the blueprint's routine, if it ships one (the orchestrator
+            #    ships routine=None today — guarded so a future routine lands
+            #    correctly with no further wiring). Mirrors provision.py's
+            #    routine step: the ORCHESTRATOR's own cron store, origin =
+            #    the new home channel.
+            await asyncio.to_thread(
+                self._concierge_attach_orchestrator_routine,
+                profile, home_channel)
+            logger.info(
+                "[%s] concierge: orchestrator bootstrap for user %s complete "
+                "(profile %s, home channel %s)",
+                getattr(self, "name", "discord"), user_id, profile,
+                home_channel)
+        except asyncio.CancelledError:
+            raise  # shutdown: cancel cleanly, no warn-once burn
+        except Exception as e:
+            self._concierge_warn_once(
+                ("bootstrap", user_id),
+                "[%s] concierge: the orchestrator bootstrap for user %s "
+                "failed (%s); the triggering message was unaffected — a "
+                "later message retries only while the author still has no "
+                "orchestrator entry (once the users entry lands, the "
+                "in-task re-check exits)",
+                getattr(self, "name", "discord"), user_id, e, exc_info=True)
+        finally:
+            inflight = getattr(self, "_concierge_bootstrap_inflight", None)
+            if inflight is not None:
+                inflight.discard(user_id)
+
+    @staticmethod
+    def _concierge_orchestrator_channel_name(source) -> str:
+        """Discord-safe name for the author's personal channel:
+        ``orchestrator-<slug of the display name>`` (falling back to the user
+        id), capped at Discord's 100-character limit. Never raises."""
+        try:
+            raw = str(getattr(source, "user_name", None)
+                      or getattr(source, "user_id", None) or "user")
+            return f"orchestrator-{_concierge_channel_slug(raw)}"[:100]
+        except Exception:
+            return "orchestrator-user"
+
+    @staticmethod
+    def _concierge_worker_channel_name(blueprint_key: str, source) -> str:
+        """Discord-safe name for the lazily created worker channel:
+        ``<blueprint key>-<slug of the display name>`` (the per-user suffix
+        keeps two users' workers of the same blueprint distinct), capped at
+        Discord's 100-character limit. Never raises."""
+        try:
+            raw = str(getattr(source, "user_name", None)
+                      or getattr(source, "user_id", None) or "user")
+            return f"{blueprint_key}-{_concierge_channel_slug(raw)}"[:100]
+        except Exception:
+            return f"{blueprint_key}-user"
+
+    def _concierge_attach_orchestrator_routine(self, profile: str,
+                                               home_channel: str) -> None:
+        """Attach the orchestrator blueprint's routine (provision.py's routine
+        step, mirrored) in the ORCHESTRATOR's OWN cron store
+        (``use_cron_store``), origin = the new home channel. Guarded on
+        ``bp.routine`` — the orchestrator ships routine=None today, so this
+        is inert until a future routine lands; errors propagate to the
+        bootstrap's fail-closed handler (profile, channel and binding are
+        already committed by then)."""
+        # DRIFT RISK: this INLINE call duplicates provision.py's
+        # routine-creation step (``create_bot``'s ``if bp.routine ...``
+        # block — the ``create_job`` call under ``use_cron_store(<profile
+        # dir>)``), deliberately NOT shared in this fix (scope). When a
+        # real orchestrator routine lands, keep the two ``create_job``
+        # calls field-for-field identical or refactor to one shared
+        # helper: a divergence means a channel-bound provision and a
+        # bootstrap provision ship different routines.
+        from concierge.blueprints import MODEL_PRESETS, get_blueprint
+        from concierge.provider_groups import (
+            apply_group_to_preset as _apply_group)
+        from cron.jobs import create_job, use_cron_store
+        from hermes_cli.profiles import get_profile_dir
+
+        bp = get_blueprint("orchestrator")
+        if not bp.routine:
+            return
+        preset = MODEL_PRESETS[bp.model_preset]
+        model = _apply_group(None, preset)
+        with use_cron_store(get_profile_dir(profile)):
+            create_job(
+                prompt=bp.routine.prompt,
+                schedule=bp.routine.schedule,
+                name=f"[bot:{profile}] {bp.routine.name}",
+                model=model.model,
+                provider=model.provider,
+                enabled_toolsets=list(bp.toolsets),
+                monitor_script=bp.routine.monitor,  # None = always run
+                deliver="origin",
+                origin={"platform": "discord", "chat_id": home_channel},
+            )
+
+    # ── Orchestrator dispatch (PLAN decision 2): the background driver ─────
+
+    def _concierge_dispatch_channel_object(self, channel_id):
+        """The worker channel OBJECT (duck-typed off the hub's own client)
+        for the reply fetch's anchor — ``None`` when unresolvable, which the
+        driver's failure ladder treats like any other missing reply."""
+        client = getattr(self, "_client", None)
+        if client is None or channel_id is None:
+            return None
+        try:
+            return client.get_channel(int(channel_id))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _concierge_worker_reply_from_window(window):
+        """The worker's answer: the NEWEST shared-identity MESSAGE of the
+        worker channel's history window — the newest ``[Name [bot]]`` author
+        line PLUS every line after it up to the next author line (or the
+        window's end), so a multi-paragraph reply is captured WHOLE (the
+        per-line read truncated it to its first paragraph and phase B
+        summarized from a cut-down answer — the quality-review fix).
+        ``None`` for an empty/unparseable window — the caller treats that as
+        the worker-turn failure it equals."""
+        if not isinstance(window, str):
+            return None
+        lines = window.splitlines()
+        start_match = None
+        start_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            match = _WORKER_REPLY_LINE_RE.match(lines[i].strip())
+            if match is not None:
+                start_match, start_idx = match, i
+                break
+        if start_match is None:
+            return None
+        reply_lines = [start_match.group(1)]
+        for line in lines[start_idx + 1:]:
+            if _WORKER_REPLY_AUTHOR_LINE_RE.match(line) is not None:
+                break  # the next history message opens: the reply is done
+            reply_lines.append(line)
+        return "\n".join(reply_lines).rstrip() or None
+
+    async def _concierge_orchestrator_dispatch(self, event, task: str,
+                                               blueprint_key: str) -> None:
+        """The Discord-mediated dispatch driver (PLAN decision 2): run the
+        worker's turn and the orchestrator's phase-B summary as REAL Discord
+        turns, visibly, through the room machinery — never in-process.
+
+        Serialized per home channel (``_concierge_room_lock_for``, the
+        fan-out's queue-behind contract) and tracked like a fan-out driver.
+        Fail-closed ladder, mirrored from the plan:
+
+        - PRE-HANDOFF prepare failures (registry entry, worker provision,
+          worker channel): warn ONCE and post ONE best-effort
+          "⚠ dispatch failed" notice into the home channel — the wrap already
+          suppressed the directive, so without the notice the user would see
+          nothing at all (the quality-review fix). The HANDOFF post failure
+          keeps the quiet abort: the handoff is the visible boundary, and a
+          channel that could not take the handoff could not take a notice
+          either.
+        - POST-HANDOFF: a worker-turn or reply-fetch failure posts the
+          "⚠ <worker> is unavailable" notice and phase B STILL runs (with the
+          failure noted in its context) so the user is never left with just
+          the handoff line; a phase-B failure posts the orchestrator's own
+          unavailable notice. Never a silent drop.
+        """
+        source = getattr(event, "source", None)
+        user_id = str(getattr(source, "user_id", "") or "")
+        home_channel = str(getattr(source, "chat_id", "") or "")
+        lock = self._concierge_room_lock_for(home_channel)
+        # Cancellation-safe cleanup (quality review): the wrap recorded THIS
+        # driver under the channel's fan-out key at SPAWN time
+        # (``_concierge_track_fanout_task``), so the entry must be removed
+        # even when the driver is CANCELLED while still QUEUED on the lock —
+        # the cleanup ``finally`` must wrap the lock ACQUISITION, not sit
+        # inside it (a queued driver never reaches an in-lock finally). The
+        # current-task ownership check is kept: a superseding driver's entry
+        # is never stolen.
+        try:
+            async with lock:
+                tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
+                if tasks.get(home_channel) is not asyncio.current_task():
+                    tasks[home_channel] = asyncio.current_task()
+                await self._concierge_dispatch_drive(
+                    event, task, blueprint_key, user_id, home_channel)
+        finally:
+            tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
+            if tasks.get(home_channel) is asyncio.current_task():
+                del tasks[home_channel]
+
+    async def _concierge_dispatch_drive(self, event, task: str,
+                                        blueprint_key: str, user_id: str,
+                                        home_channel: str) -> None:
+        """The driver body (one lock-held pass; see
+        ``_concierge_orchestrator_dispatch`` for the ladder)."""
+        import dataclasses
+
+        from concierge import provision, registry
+        from concierge.blueprints import CATALOG
+
+        source = event.source
+
+        # 1) the worker: registry-owned, lazily provisioned (channel-less,
+        #    per-user, idempotent) — and 2) its channel: bound channels
+        #    first, else lazily created in the HOME channel's category and
+        #    bound once. File/flock work off the loop (the M5c discipline).
+        try:
+            entry = registry.get_user(user_id) or {}
+            # belt-and-suspenders: ``source.profile`` IS the wrap's
+            # guard-confirmed orchestrator; this fallback guards direct-call
+            # misuse and fails open coherently (to that same profile) if the
+            # registry entry vanished mid-flight.
+            orchestrator = str(
+                entry.get("orchestrator")
+                or getattr(source, "profile", "") or "")
+            if not orchestrator:
+                # the wrap confirmed the orchestrator moments ago; a race
+                # (retire/remove) must fail closed BEFORE the handoff
+                raise RuntimeError("the orchestrator entry disappeared")
+            guild_id = (entry.get("guild_id")
+                        or getattr(source, "guild_id", None))
+            worker = registry.worker_for_user(user_id, blueprint_key)
+            if not worker:
+                record = await asyncio.to_thread(
+                    provision.create_bot, blueprint_key,
+                    user_id=user_id, channel_id=None)
+                worker = (record.get("profile")
+                          if isinstance(record, dict) else None)
+            if not worker:
+                raise RuntimeError(
+                    "worker provisioning returned no profile")
+            worker_channel = next(
+                iter(registry.channels_for_profile(worker)), None)
+            if not worker_channel:
+                worker_channel = await self._concierge_create_channel(
+                    guild_id=guild_id,
+                    category_id=self._concierge_event_category_id(event),
+                    name=self._concierge_worker_channel_name(
+                        blueprint_key, source))
+                if not worker_channel:
+                    raise RuntimeError("the worker channel failed to create")
+                await asyncio.to_thread(
+                    registry.bind_channel, worker_channel,
+                    profile=worker, blueprint=blueprint_key,
+                    guild_id=guild_id)
+                # the create event's auto-offer must not fire on the hub's
+                # own channel (the create helper already marked it; asserted
+                # here so the suppression cannot depend on its internals)
+                self._concierge_remember_hub_created_channel(worker_channel)
+            title = str(
+                getattr(CATALOG[blueprint_key], "title", "") or blueprint_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-prepare", user_id, blueprint_key),
+                "[%s] concierge: preparing the %s dispatch for user %s "
+                "failed (%s); nothing but the failure notice was posted",
+                getattr(self, "name", "discord"), blueprint_key, user_id, e,
+                exc_info=True)
+            # The wrap already SUPPRESSED the directive, so without a notice
+            # the user would see nothing at all (quality review): ONE
+            # best-effort "⚠ dispatch failed" post into the home channel.
+            # The HANDOFF subcase below keeps its quiet abort — the handoff
+            # post is the visible boundary, and a channel that could not
+            # take the handoff could not take a notice either. Best-effort: a
+            # notice failure must never raise out of the driver.
+            try:
+                channel = getattr(getattr(event, "raw_message", None),
+                                  "channel", None)
+                if channel is not None and hasattr(channel, "send"):
+                    await channel.send("⚠ dispatch failed")
+            except Exception as notice_error:
+                logger.warning(
+                    "[%s] concierge: the dispatch-failed notice for channel "
+                    "%s could not be posted: %s",
+                    getattr(self, "name", "discord"), home_channel,
+                    notice_error)
+            return
+
+        # 3) the visible handoff — the point of no return. The raw message's
+        #    channel is the home channel (the member-unavailable posture).
+        try:
+            channel = getattr(getattr(event, "raw_message", None),
+                              "channel", None)
+            if channel is None or not hasattr(channel, "send"):
+                raise RuntimeError("the event carried no postable channel")
+            await channel.send(f"→ asked **{title}**: {task}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-handoff", home_channel),
+                "[%s] concierge: posting the dispatch handoff into channel "
+                "%s failed (%s); the dispatch aborted with nothing else "
+                "posted",
+                getattr(self, "name", "discord"), home_channel, e,
+                exc_info=True)
+            return
+
+        # 4) the worker's turn — the member-turn clone pattern, on the WORKER
+        #    profile + channel with the TASK as the message text and the home
+        #    window as context. NO _VOICE_RELAY_ATTR stamp: the worker's raw
+        #    answer is never spoken (the phase-B summary is the single
+        #    playback; the auto-TTS gate also keys on the worker channel,
+        #    which no voice session joined).
+        worker_event = None
+        home_history = None
+        try:
+            home_history = await self._concierge_fetch_room_history(event)
+            worker_source = dataclasses.replace(
+                source, profile=worker, chat_id=str(worker_channel))
+            worker_event = dataclasses.replace(
+                event, source=worker_source, text=task,
+                raw_message=_DispatchFetchAnchor(
+                    self._concierge_dispatch_channel_object(worker_channel),
+                    _dispatch_fetch_anchor_id()))
+            if home_history is not None:
+                worker_event.channel_context = home_history
+            worker_event.media_urls = list(worker_event.media_urls or [])
+            worker_event.media_types = list(worker_event.media_types or [])
+            worker_event.media_text_inlined = list(
+                worker_event.media_text_inlined or [])
+            worker_event.metadata = dict(worker_event.metadata or {})
+            await super().handle_message(worker_event)
+            await self._concierge_wait_for_member_turn(worker_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                "[%s] concierge: the %s worker turn for user %s failed "
+                "(%s); the dispatch continues with the unavailable notice",
+                getattr(self, "name", "discord"), blueprint_key, user_id, e,
+                exc_info=True)
+            worker_event = None
+
+        # 5) the worker's reply: the newest shared-identity MESSAGE of the
+        #    worker channel's window (its author line through the next author
+        #    line — a multi-paragraph answer arrives WHOLE). A turn that ran
+        #    but answered nothing, or a window that cannot be
+        #    fetched/parsed, is the SAME failure the raised turn is —
+        #    notice + phase B with the failure noted.
+        #    The fetch anchor is re-minted HERE (fresh channel object, fresh
+        #    ahead-in-time id): at clone time the channel may not have been
+        #    cache-resolved yet, and the reply only exists since the turn.
+        worker_answer = None
+        if worker_event is not None:
+            worker_event.raw_message = _DispatchFetchAnchor(
+                self._concierge_dispatch_channel_object(worker_channel),
+                _dispatch_fetch_anchor_id())
+            worker_answer = self._concierge_worker_reply_from_window(
+                await self._concierge_fetch_room_history(worker_event))
+        if worker_answer is None:
+            await self._concierge_post_member_unavailable(event, worker)
+
+        # 6) phase B: the orchestrator summarizes. The clone keeps the
+        #    ORIGINAL user text and the home channel; the context appends
+        #    the worker's reply (or the failure note) as a labeled block so
+        #    the turn sees BOTH the request and the reply. The continuation
+        #    stamp goes on AFTER the replaces — its presence is what makes
+        #    this a depth-1 turn (the wrap never re-dispatches it). The
+        #    response is delivered into the home channel (and spoken, on a
+        #    voice event) by the normal machinery — exactly one playback.
+        try:
+            phase_b_source = dataclasses.replace(
+                source, profile=orchestrator, chat_id=home_channel)
+            phase_b_event = dataclasses.replace(event, source=phase_b_source)
+            reply_block = (
+                f"[{title} replied]\n{worker_answer}"
+                if worker_answer is not None else
+                f"[{title} is unavailable]\n"
+                f"(the dispatch could not reach {title})")
+            phase_b_event.channel_context = (
+                f"{home_history}\n\n{reply_block}"
+                if home_history else reply_block)
+            phase_b_event.media_urls = list(phase_b_event.media_urls or [])
+            phase_b_event.media_types = list(phase_b_event.media_types or [])
+            phase_b_event.media_text_inlined = list(
+                phase_b_event.media_text_inlined or [])
+            phase_b_event.metadata = dict(phase_b_event.metadata or {})
+            setattr(phase_b_event, _CONCIERGE_DISPATCH_ATTR, True)
+            await super().handle_message(phase_b_event)
+            await self._concierge_wait_for_member_turn(phase_b_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(
+                "[%s] concierge: the phase-B summary turn for user %s "
+                "failed (%s); posting the orchestrator unavailable notice",
+                getattr(self, "name", "discord"), user_id, e, exc_info=True)
+            await self._concierge_post_member_unavailable(event, orchestrator)
+
     def _concierge_track_fanout_task(self, channel_id: str, task) -> None:
         """Record the in-flight fan-out driver per channel (observability +
         tests) and register it with the adapter's background-task set so
@@ -671,11 +1655,16 @@ class ConciergeDiscordMixin:
         channel_id = str(
             getattr(getattr(event, "source", None), "chat_id", "") or "")
         lock = self._concierge_room_lock_for(channel_id)
-        async with lock:
-            tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
-            if tasks.get(channel_id) is not asyncio.current_task():
-                tasks[channel_id] = asyncio.current_task()
-            try:
+        # Cancellation-safe cleanup (quality review): the wrap recorded THIS
+        # driver under the channel's fan-out key at SPAWN time, so the entry
+        # must be removed even when the driver is CANCELLED while still
+        # QUEUED on the lock — the cleanup ``finally`` must wrap the lock
+        # ACQUISITION, not sit inside it (the dispatch driver's invariant).
+        try:
+            async with lock:
+                tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
+                if tasks.get(channel_id) is not asyncio.current_task():
+                    tasks[channel_id] = asyncio.current_task()
                 room_history = await self._concierge_fetch_room_history(event)
                 for member in targets:
                     try:
@@ -691,10 +1680,10 @@ class ConciergeDiscordMixin:
                             channel_id, e, exc_info=True)
                         await self._concierge_post_member_unavailable(
                             event, member)
-            finally:
-                tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
-                if tasks.get(channel_id) is asyncio.current_task():
-                    del tasks[channel_id]
+        finally:
+            tasks = getattr(self, "_concierge_room_fanout_tasks", None) or {}
+            if tasks.get(channel_id) is asyncio.current_task():
+                del tasks[channel_id]
 
     async def _concierge_run_member_turn(self, event, member: str,
                                          room_history: str | None = None) -> None:
@@ -1048,7 +2037,13 @@ class ConciergeDiscordMixin:
             the parent's binding (``_concierge_binding_key``'s key resolution)
             — is bound to exactly ``source.profile``, or
         (b) the channel (or parent) is a ROOM with ``source.profile`` among
-            its members.
+            its members, or
+        (c) the channel (or parent) is bound to nothing and rooms nowhere,
+            and the USERS section gives the author (``source.user_id``) an
+            orchestrator exactly equal to ``source.profile`` — the
+            unbound→orchestrator fallback's re-home (design §4; the wrap
+            re-homes the source to the author's orchestrator before
+            delegation, and this branch is what admits it).
 
         Anything else → None: admission keeps its owner fallback, so the
         fail-closed guard refuses (an unbound channel answers as the hub
@@ -1091,6 +2086,16 @@ class ConciergeDiscordMixin:
                     if isinstance(members, list) and stamp in members:
                         return stamp
                     return None  # the chat's room does not include the stamp
+            # (c): an unbound, non-room channel whose author's registry
+            # orchestrator IS the stamp. Reached only past the binding/room
+            # blocks above (both return early for claimed channels), so a
+            # users entry can never bypass a binding or a room membership.
+            users = reg.get("users")
+            if isinstance(users, dict):
+                entry = users.get(str(getattr(source, "user_id", "") or ""))
+                if (isinstance(entry, dict)
+                        and entry.get("orchestrator") == stamp):
+                    return stamp
         except Exception:
             logger.debug(
                 "[%s] concierge: dynamic runtime-profile resolution failed; "

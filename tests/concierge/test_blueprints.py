@@ -58,6 +58,84 @@ def test_get_blueprint_unknown_key_raises():
 
 
 def test_blueprint_choices_is_renderable():
+    """The picker payload is CATALOG minus the orchestrator (see
+    blueprint_choices: the orchestrator is auto-provisioned per user, the
+    picker offers workers only), order preserved."""
+    workers = [bp for key, bp in CATALOG.items() if key != "orchestrator"]
     choices = blueprint_choices()
     assert all({"value": bp.key, "label": bp.title, "description": bp.description}
-               == c for c, bp in zip(choices, CATALOG.values(), strict=True))
+               == c for c, bp in zip(choices, workers, strict=True))
+
+
+def test_orchestrator_blueprint_matches_locked_design():
+    """PLAN.md decision 7: key/title/description/model_preset/toolsets/skills/
+    memory_provider/connects/routine — plus the answers-alone constraint
+    (no terminal, no file: the orchestrator delegates hands-on work, it
+    never performs it)."""
+    bp = get_blueprint("orchestrator")
+    assert bp.title == "Orchestrator"
+    assert bp.description == (
+        "Your front door: triages requests, hands work to your helper bots, "
+        "and answers with the result."
+    )
+    assert bp.model_preset == "core"
+    assert bp.toolsets == ("web",)  # a real bundle (catalog-wide test enforces that)
+    assert "terminal" not in bp.toolsets
+    assert "file" not in bp.toolsets
+    assert bp.skills == ()
+    assert bp.memory_provider == "honcho"
+    assert bp.connects == ()
+    assert bp.routine is None  # deferred with provision (T3); avoids inventing behavior
+
+
+def test_orchestrator_soul_carries_dispatch_protocol_and_worker_catalog():
+    """The SOUL is the contract the inbound wrap (T5) parses: the directive
+    syntax must appear EXACTLY, the fail-closed triage rule and the
+    ENTIRE-reply constraint must appear verbatim (the future T5 dispatch
+    regex depends on both), and every non-orchestrator catalog key+title
+    must be listed as a dispatch target. The persona never names the
+    platform."""
+    soul = get_blueprint("orchestrator").soul
+    assert "@dispatch <blueprint-key> <task for the worker>" in soul
+    # Drift-critical sentences, asserted verbatim so deleting either one
+    # fails the suite. The fail-closed triage rule — the unsure case must
+    # answer the user directly, never guess a dispatch:
+    assert (
+        "When you are unsure whether to dispatch, answer the user directly."
+        in soul
+    )
+    # The no-prose constraint the T5 dispatch regex depends on — the reply
+    # is the directive line alone:
+    assert (
+        "your ENTIRE reply must be exactly one line, nothing before or after:"
+        in soul
+    )
+    # Triage tie-breaker: research-flavored requests always dispatch.
+    assert (
+        "Any request that needs search, sources, or citations goes to the "
+        "researcher." in soul
+    )
+    assert "Hermes" not in soul
+    for key, bp in CATALOG.items():
+        if key == "orchestrator":
+            continue
+        # The exact rendered "key — title" line, not a bare substring: a
+        # future key that is a substring of another ("email" vs
+        # "email_triage") must not pass spuriously.
+        assert f"  {key} — {bp.title}" in soul, (
+            f"worker catalog line {key!r} — {bp.title!r} missing or malformed"
+        )
+
+
+def test_orchestrator_is_last_in_catalog_and_absent_from_picker():
+    """The orchestrator is LAST IN CATALOG (CLI + programmatic dispatch use
+    it there) but ABSENT FROM the picker: the provisioning model
+    auto-provisions a per-user orchestrator on first contact — the
+    orchestrator owns the user, never a channel — so a picker-selected
+    orchestrator would be a channel-bound v1-style bot, contradicting that
+    model. The dedicated exclusion assertions below pin this ON PURPOSE:
+    absence must never happen by accident (a zip mismatch, a filter typo)."""
+    assert list(CATALOG)[-1] == "orchestrator"
+    values = [c["value"] for c in blueprint_choices()]
+    assert "orchestrator" not in values
+    assert values == [key for key in CATALOG if key != "orchestrator"]

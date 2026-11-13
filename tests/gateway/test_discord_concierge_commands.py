@@ -203,7 +203,13 @@ def test_disabled_registers_no_bot_group(rig):
     assert t.commands == []
 
 
-def test_enabled_registers_bot_group_with_four_subcommands(rig):
+def test_enabled_registers_bot_group_subcommands(rig):
+    """Pin the CURRENT registered surface of ``_concierge_register_slash``
+    (read from the live registration code, not from history): the tree gains
+    the /bot group, the /room group (Task 7.4), then top-level /connect
+    (Task 8.2). The /bot group's children are the five subcommands it
+    registers — new, list, memory (Task 9.2), retire, category (the
+    private-category admin command) — sorted below."""
     class _Tree:
         def __init__(self):
             self.commands = []
@@ -213,15 +219,12 @@ def test_enabled_registers_bot_group_with_four_subcommands(rig):
 
     t = _Tree()
     rig.adapter._concierge_register_slash(t)
-    # Task 7.4: the tree carries the /bot and /room groups; Task 8.2 adds the
-    # top-level /connect command after them; Task 9.2 adds /bot memory to
-    # the /bot group.
     assert [getattr(c, "name", None) for c in t.commands] == [
         "bot", "room", "connect"]
     group = t.commands[0]
     assert group.name == "bot"
     assert sorted(c.name for c in group._children.values()) == [
-        "list", "memory", "new", "retire"]
+        "category", "list", "memory", "new", "retire"]
     connect = t.commands[2]
     assert connect.name == "connect"
 
@@ -239,7 +242,7 @@ def test_bot_group_survives_a_tree_conflict(rig):
 # ── Task 5.4: /bot new → picker → provision ─────────────────────────────────
 
 
-def test_bot_new_posts_the_catalog_picker(rig, monkeypatch):
+def test_bot_new_posts_the_worker_picker(rig, monkeypatch):
     interaction = _FakeInteraction()
     monkeypatch.setattr(
         rig.adapter, "_concierge_gate_interaction", _allow)
@@ -249,12 +252,15 @@ def test_bot_new_posts_the_catalog_picker(rig, monkeypatch):
     assert len(interaction.response.sent) == 1
     _text, view, ephemeral = interaction.response.sent[0]
     assert ephemeral is True
-    # The view carries the whole catalog as select options.
+    # The view carries the WORKER blueprints as select options — the whole
+    # catalog minus the orchestrator (blueprint_choices excludes it: the
+    # orchestrator is auto-provisioned per user, never picked).
     select = view.children[0]
     values = [o.value for o in select.options]
     from concierge.blueprints import CATALOG
 
-    assert values == list(CATALOG)
+    assert values == [key for key in CATALOG if key != "orchestrator"]
+    assert "orchestrator" not in values
 
 
 def test_picker_selection_provisions_the_channel(rig, monkeypatch):
@@ -624,10 +630,13 @@ def test_auto_offer_posts_picker_into_managed_channel(rig):
     assert len(sends) == 1
     chan_id, _text, view = sends[0]
     assert chan_id == "700"
-    # Non-ephemeral (channel.send has no ephemeral at all) and the whole
-    # catalog is on the picker.
+    # Non-ephemeral (channel.send has no ephemeral at all); the picker
+    # carries the six WORKER blueprints in CATALOG order — the orchestrator
+    # is absent by design (blueprint_choices excludes it: auto-provisioned
+    # per user, never channel-bound via a pick).
     assert [o.value for o in view.children[0].options] == [
-        "reminders", "scheduler", "researcher", "email_triage", "notes"]
+        "reminders", "scheduler", "researcher", "email_triage", "notes",
+        "developer"]
 
 
 def test_auto_offer_selection_binds_the_posted_in_channel(rig, monkeypatch):

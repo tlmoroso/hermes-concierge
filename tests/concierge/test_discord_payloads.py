@@ -49,11 +49,15 @@ BINDINGS = {
 # ── /bot new picker payload (Task 5.4) ─────────────────────────────────────
 
 
-def test_new_bot_response_carries_the_whole_catalog_in_order():
+def test_new_bot_response_carries_the_worker_catalog_in_order():
+    """The picker payload is CATALOG minus the orchestrator, order preserved
+    (blueprint_choices excludes it: the orchestrator is auto-provisioned per
+    user on first contact — it owns the user, never a channel — so the
+    picker offers workers only)."""
     payload = build_new_bot_response()
     assert payload["choices"] == [
         {"value": bp.key, "label": bp.title, "description": bp.description}
-        for bp in CATALOG.values()
+        for key, bp in CATALOG.items() if key != "orchestrator"
     ]
     assert payload["content"]  # the greeting copy is never empty
 

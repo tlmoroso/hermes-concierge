@@ -172,6 +172,110 @@ class TestNew:
         assert "Already provisioned" not in fresh_out
 
 
+    def test_user_orchestrator_idempotent(self, concierge_home, capsys):
+        """``new orchestrator --user X`` twice: the second run prints
+        "Already provisioned" and builds NOTHING new (user-keyed
+        idempotence — the users entry is the commit pointer)."""
+        assert _run(["concierge", "new", "orchestrator", "--user", "77"]) == 0
+        capsys.readouterr()
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Already provisioned" in out
+        assert "Created Concierge bot" not in out
+        assert len(_visible_profiles(concierge_home)) == 1
+
+
+class TestNewUserFlag:
+    """T7: the ``--user`` provisioning mode (design §7) — a user-owned,
+    channel-less bot. NO binding is ever written for the user-only mode; the
+    users-section entry is the ownership record (T1/T3 contracts)."""
+
+    def test_user_orchestrator_provisions_channel_less(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        # the output names the user, not a channel (there is none)
+        assert "77" in out
+        assert "Channel:" not in out
+        # channel-less: NO binding; the users entry owns the bot
+        assert registry.list_bindings() == {}
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["orchestrator"].startswith("bot-orchestrator-")
+        assert (concierge_home / "profiles" / entry["orchestrator"]).is_dir()
+        # no home channel yet: the output says so instead of inventing one
+        assert "first Discord contact" in out
+
+    def test_user_worker_requires_orchestrator_entry(self, concierge_home, capsys):
+        """T3's ValueError (a channel-less worker for a user with NO user
+        entry) must surface as ``Error: ...`` + exit 1 — the CLI's catch
+        includes ValueError for exactly this operator-actionable refusal."""
+        rc = _run(["concierge", "new", "reminders", "--user", "77"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        # create_profile prints its own banner before the bookkeeping raises,
+        # so the Error line trails it — the contract is the line + exit 1.
+        assert "Error:" in out
+        assert "orchestrator first" in out
+        # fail closed: nothing half-built survived the refusal
+        assert registry.get_user("77") is None
+        assert registry.list_bindings() == {}
+        assert _visible_profiles(concierge_home) == []
+
+    def test_user_worker_after_orchestrator(self, concierge_home, capsys):
+        assert _run(["concierge", "new", "orchestrator", "--user", "77"]) == 0
+        capsys.readouterr()
+        rc = _run(["concierge", "new", "reminders", "--user", "77"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        worker = registry.worker_for_user("77", "reminders")
+        assert worker is not None and worker.startswith("bot-reminders-")
+        assert worker in out
+        assert "77" in out
+        # still channel-less: the worker has no binding either
+        assert registry.list_bindings() == {}
+        assert len(_visible_profiles(concierge_home)) == 2
+
+    def test_home_channel_printed_when_known(self, concierge_home, capsys):
+        """Once the bootstrap records a home channel, user provisions report
+        it (registry.home_channel_for_user) instead of the pending notice."""
+        assert _run(["concierge", "new", "orchestrator", "--user", "77"]) == 0
+        capsys.readouterr()
+        registry.update_user("77", home_channel="999")
+        assert _run(["concierge", "new", "reminders", "--user", "77"]) == 0
+        out = capsys.readouterr().out
+        assert "999" in out
+        assert "first Discord contact" not in out
+
+    def test_both_flags_bind_and_record(self, concierge_home, capsys):
+        """``--user`` + ``--channel``: user-owned AND channel-bound — the v1
+        binding exists and the users entry names the SAME profile."""
+        rc = _run(["concierge", "new", "orchestrator", "--channel", "123",
+                    "--user", "77"])
+        assert rc == 0
+        binding = registry.get_binding("123")
+        assert binding is not None
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["orchestrator"] == binding["profile"]
+        out = capsys.readouterr().out
+        assert "123" in out and "77" in out
+
+    def test_neither_flag_error_exit_1(self, concierge_home, capsys):
+        """Neither ``--channel`` nor ``--user``: an operator-actionable
+        refusal BEFORE provision (validation moved off the parser, T7) —
+        exit 1, both modes named, nothing built."""
+        rc = _run(["concierge", "new", "reminders"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "--channel" in out and "--user" in out
+        assert registry.list_bindings() == {}
+        assert registry.list_users() == {}
+        assert _visible_profiles(concierge_home) == []
+
+
 class TestList:
 
     def test_lists_provisioned_bot(self, concierge_home, capsys):
@@ -195,6 +299,56 @@ class TestList:
         rc = _run(["concierge"])
         assert rc == 0
         assert "No concierge bots" in capsys.readouterr().out
+
+
+class TestListUserGrouping:
+    """T7 (design §7): ``list`` gains a users section FIRST — per user the
+    orchestrator profile, home channel (or "(pending first contact)"), and
+    their workers (``blueprint → profile``) — then the existing per-profile
+    bindings output, byte-identical when the users section is empty."""
+
+    def _user_with_worker(self):
+        assert _run(["concierge", "new", "orchestrator", "--user", "77"]) == 0
+        assert _run(["concierge", "new", "reminders", "--user", "77"]) == 0
+
+    def test_lists_users_section_with_pending_home_channel(self, concierge_home, capsys):
+        self._user_with_worker()
+        rc = _run(["concierge", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "77" in out  # the user id
+        assert "pending first contact" in out  # home channel unknown yet
+        orchestrator = registry.orchestrator_for_user("77")
+        assert orchestrator in out
+        worker = registry.worker_for_user("77", "reminders")
+        assert worker in out
+        assert "reminders" in out  # the blueprint half of blueprint → profile
+
+    def test_lists_home_channel_when_known(self, concierge_home, capsys):
+        self._user_with_worker()
+        registry.update_user("77", home_channel="999")
+        rc = _run(["concierge", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "999" in out
+        assert "pending first contact" not in out
+
+    def test_users_section_empty_keeps_v1_output(self, concierge_home, capsys):
+        """Zero regression: a v1 channel bot with NO users section produces
+        the exact v1 list output (no users header, no pending line). The
+        leading blank line before the bot-count header is part of that v1
+        output (spec-review gap: it was dropped once already)."""
+        assert _run(["concierge", "new", "reminders", "--channel", "123"]) == 0
+        assert registry.list_users() == {}
+        capsys.readouterr()  # drain the `new` output: assert on LIST only
+        rc = _run(["concierge", "list"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "123" in out
+        assert "Reminder Bot" in out
+        assert "pending first contact" not in out
+        # v1 byte-parity: the bot-count header keeps its leading blank line.
+        assert out.startswith("\n  1 concierge bot(s):")
 
 
 class TestRetire:
@@ -408,9 +562,18 @@ class TestParserAndRegistration:
         # bare `hermes concierge` parses; the handler defaults it to list
         assert parser.parse_args(["concierge"]).concierge_action is None
 
-    def test_channel_required_for_new(self):
-        with pytest.raises(SystemExit):
-            self._build().parse_args(["concierge", "new", "reminders"])
+    def test_new_flags_parse(self):
+        """T7: ``--channel`` is no longer parser-required (validation moved
+        into the handler so the neither-flag refusal is operator-actionable),
+        and ``--user`` lands on dest ``user``."""
+        parser = self._build()
+        ns = parser.parse_args(["concierge", "new", "reminders"])
+        assert ns.channel is None and ns.user is None
+        ns = parser.parse_args(["concierge", "new", "orchestrator", "--user", "9"])
+        assert ns.user == "9" and ns.channel is None
+        ns = parser.parse_args(
+            ["concierge", "new", "orchestrator", "--channel", "123", "--user", "9"])
+        assert ns.channel == "123" and ns.user == "9"
 
     def test_registered_like_cron_and_webhook(self):
         # Module-level import (top of file): hermes_cli.main's first import runs
