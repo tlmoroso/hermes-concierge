@@ -118,12 +118,16 @@ def test_create_bot_makes_profile_with_pinned_model_and_soul(concierge_home):
     assert (
         "Reminder Bot" not in (profile_dir / "SOUL.md").read_text()
     )  # no Discord copy leaked
-    # model pin landed in the profile's own config.yaml
+    # model pin landed in the profile's own config.yaml — the blueprint's
+    # preset, resolved through MODEL_PRESETS (never a literal: presets are data)
+    from concierge.blueprints import MODEL_PRESETS, get_blueprint
+
+    preset = MODEL_PRESETS[get_blueprint("reminders").model_preset]
     cfg_text = (profile_dir / "config.yaml").read_text()
-    assert "glm-5.3-flash" in cfg_text
+    assert preset.model in cfg_text
     cfg = _yaml(profile_dir / "config.yaml")
-    assert cfg["model"]["default"] == "z-ai/glm-5.3-flash"
-    assert cfg["model"]["provider"] == "nous"
+    assert cfg["model"]["default"] == preset.model
+    assert cfg["model"]["provider"] == preset.provider
     # toolset allowlist is the blueprint's exact toolsets, nothing more
     # (todo + cronjob: todo_list holds the item, a one-shot cron job delivers it)
     assert cfg["toolsets"] == ["todo", "cronjob"]
@@ -1112,7 +1116,9 @@ def test_binding_without_provider_group_stays_none(concierge_home):
     persisted = registry.get_binding("123")
     assert persisted is not None and persisted["provider_group"] is None
     cfg = _yaml(concierge_home / "profiles" / binding["profile"] / "config.yaml")
-    assert cfg["model"]["default"] == "z-ai/glm-5.3-flash"
+    from concierge.blueprints import MODEL_PRESETS, get_blueprint
+
+    assert cfg["model"]["default"] == MODEL_PRESETS[get_blueprint("reminders").model_preset].model
 
 
 def test_resolve_provider_group_annotates_winner_with_name():

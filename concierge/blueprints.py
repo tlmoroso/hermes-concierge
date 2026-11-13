@@ -33,8 +33,9 @@ class ModelPreset:
 # (never swapped mid-conversation - prompt-caching invariant). Presets are data,
 # retunable here in one place.
 MODEL_PRESETS: dict[str, ModelPreset] = {
-    "nano": ModelPreset(provider="nous", model="z-ai/glm-5.3-flash"),
-    "core": ModelPreset(provider="nous", model="z-ai/glm-5.3"),
+    "nano": ModelPreset(provider="nous", model="tencent/hy4-preview"),
+    "core": ModelPreset(provider="nous", model="tencent/hy4-preview"),
+    "hy4": ModelPreset(provider="nous", model="tencent/hy4-preview"),
 }
 
 
