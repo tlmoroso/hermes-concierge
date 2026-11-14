@@ -32,7 +32,7 @@ def test_manifest_only_member_is_named_after_its_plugin_dir_and_stays_unique(tmp
         (plugin / "plugin.yaml").write_text("name: my-plugin\npip_dependencies: [left-pad-py]\n", encoding="utf-8")
         root = tmp_path / f"gen-{home}"
         root.mkdir()
-        members.append(_workspace_member(plugin, root, identity=plugin))
+        members.append(_workspace_member(plugin, root, identity=plugin, core_name="hermes-agent"))
     names = [tomllib.loads((m / "pyproject.toml").read_text(encoding="utf-8"))["project"]["name"] for m in members]
     assert all(name.startswith("hermes-plugin-my-plugin-") for name in names), names
     assert names[0] != names[1]
@@ -59,7 +59,7 @@ def test_pyproject_member_is_renamed_by_its_key_and_stays_unique(tmp_path):
         )
         root = tmp_path / f"gen-{home}"
         root.mkdir()
-        members.append(_workspace_member(plugin, root, identity=plugin))
+        members.append(_workspace_member(plugin, root, identity=plugin, core_name="hermes-agent"))
     names = [tomllib.loads((m / "pyproject.toml").read_text(encoding="utf-8"))["project"]["name"] for m in members]
     assert all(name.startswith("hermes-plugin-hindsight-") for name in names), names
     assert names[0] != names[1]
@@ -84,7 +84,7 @@ def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
     )
     root = tmp_path / "gen"
     root.mkdir()
-    member = _workspace_member(plugin, root, identity=plugin)
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
     assert (member / "pyproject.toml").read_text(encoding="utf-8") == (
         plugin / "pyproject.toml").read_text(encoding="utf-8")
 
@@ -103,7 +103,7 @@ def test_virtual_member_without_project_metadata_gets_a_version(tmp_path):
     (plugin / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n', encoding="utf-8")
     root = tmp_path / "gen"
     root.mkdir()
-    member = _workspace_member(plugin, root, identity=plugin)
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
     project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["version"] == "0.0.0"
 
@@ -125,7 +125,7 @@ def test_virtual_member_declaring_dynamic_version_is_left_alone(tmp_path):
     )
     root = tmp_path / "gen"
     root.mkdir()
-    member = _workspace_member(plugin, root, identity=plugin)
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
     project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert "version" not in project
     assert project["dynamic"] == ["version"]
@@ -146,6 +146,71 @@ def test_buildable_member_without_a_version_gets_one_and_keeps_its_name(tmp_path
     )
     root = tmp_path / "gen"
     root.mkdir()
-    member = _workspace_member(plugin, root, identity=plugin)
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
     project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project == {"name": "noversion-plugin", "version": "0.0.0"}
+
+
+def test_member_dev_groups_are_dropped_and_core_references_get_a_workspace_source(tmp_path):
+    """Regression: a plugin's dev/test groups reference pinned Hermes by name (the
+    documented way to run its own unit suite, e.g. ``hermes-agent @ git+…``). In the
+    generated workspace that name IS a member — the core root — so uv refused to
+    even parse the member manifest, and the group's pins conflicted with core's own
+    dev groups (honcho's pytest-asyncio vs core's); either way every ``uv lock``
+    (install, enable, update, the left-core migration) aborted. Groups can never be
+    installed from the workspace, so the copy drops them; a runtime dependency or
+    extra naming core still resolves, via a tool.uv.sources workspace entry uv
+    refuses to parse without."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "honcho"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-plugin-honcho"\nversion = "1.0.0"\n'
+        'dependencies = ["honcho-ai>=2.2.0,<3"]\n'
+        '[dependency-groups]\ntest = [\n'
+        '    "hermes-agent @ git+https://example.invalid/hermes-agent.git@1e4952ddba1bc585416ad43438d60183380035cd",\n'
+        '    "pytest==9.1.1",\n'
+        ']\n'
+        '[project.optional-dependencies]\ntype = ["hermes-agent[dev]>=0.21"]\n'
+        '[tool.uv]\npackage = false\n',
+        encoding="utf-8",
+    )
+    root = tmp_path / "gen"
+    root.mkdir()
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
+    document = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))
+    assert "dependency-groups" not in document and "dev-dependencies" not in document
+    assert document["project"]["dependencies"] == ["honcho-ai>=2.2.0,<3"]
+    assert document["project"]["optional-dependencies"] == {"type": ["hermes-agent[dev]>=0.21"]}
+    assert document["tool"]["uv"]["sources"] == {"hermes-agent": {"workspace": True}}
+
+
+def test_member_referencing_core_keeps_an_existing_source_entry(tmp_path):
+    """A member that already maps the core name (e.g. a vendored path source
+    rewritten elsewhere) is not clobbered with a workspace entry, and requirements
+    for other names gain nothing: an unused ``tool.uv.sources`` entry makes uv
+    reject the workspace too."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "vendored"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname = "vendored-plugin"\nversion = "1.0.0"\n'
+        'dependencies = ["hermes-agent", "left-pad-py>=1"]\n'
+        '[dependency-groups]\ntest = ["pytest"]\n'
+        '[tool.uv]\npackage = false\n'
+        '[tool.uv.sources]\nhermes-agent = { path = "vendor/hermes-agent" }\n',
+        encoding="utf-8",
+    )
+    root = tmp_path / "gen"
+    root.mkdir()
+    member = _workspace_member(plugin, root, identity=plugin, core_name="hermes-agent")
+    document = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))
+    # The vendored tree travels with the member copy, so the path stays relative and
+    # the workspace entry is NOT injected over it.
+    assert document["tool"]["uv"]["sources"] == {"hermes-agent": {"path": "vendor/hermes-agent"}}
+    assert "dependency-groups" not in document
+

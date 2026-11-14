@@ -28,6 +28,32 @@ def _member_ignored(directory, names):
     return [name for name in names if name in _MEMBER_EXCLUDE or name.endswith(".egg-info")]
 
 
+def _normalized_name(name: str) -> str:
+    """PEP 503 form, so requirement spellings compare equal to member names."""
+    import re
+
+    return re.sub(r"[-_.]+", "-", name.strip()).lower()
+
+
+def _requirement_name(entry: str) -> str:
+    """The package name a PEP 508 requirement entry is keyed by, or "" when unparseable."""
+    import re
+
+    match = re.match(r"\s*[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", entry)
+    return match.group(0).strip() if match else ""
+
+
+def _declared_requirements(document: dict) -> list[str]:
+    """Every requirement entry a manifest declares: project dependencies, optional
+    extras, dependency groups and the legacy dev-dependencies table."""
+    project = document.get("project") or {}
+    groups = [project.get("dependencies") or []]
+    groups += [extra for extra in (project.get("optional-dependencies") or {}).values()]
+    for table in ("dependency-groups", "dev-dependencies"):
+        groups += [group for group in (document.get(table) or {}).values()]
+    return [entry for group in groups for entry in group if isinstance(entry, str)]
+
+
 # The uv failure classifier lives beside the uv runner (stdlib-only imports): the bootstrap
 # runner streams uv output from a pre-3.11 system python where this module's tomllib import
 # cannot load. Workspace callers keep reaching it from here.
@@ -145,16 +171,23 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_pyproject = source / "pyproject.toml"
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
-    members = [_workspace_member(source, root, identity=identity).relative_to(root).as_posix()
-               for identity, source in member_sources(plugin_dirs).items()
-               if _is_member_candidate(source)]
-
-    if members:
+    core_document = None
+    members = []
+    candidates = {identity: candidate for identity, candidate in member_sources(plugin_dirs).items()
+                  if _is_member_candidate(candidate)}
+    if candidates:
         import tomllib
 
+        core_document = tomllib.loads(core_text)
+        core_name = str(core_document.get("project", {}).get("name") or "")
+        members = [_workspace_member(candidate, root, identity=identity, core_name=core_name)
+                   .relative_to(root).as_posix()
+                   for identity, candidate in candidates.items()]
+
+    if members:
         import tomli_w
 
-        document = tomllib.loads(core_text)
+        document = core_document
         uv_policy = document.setdefault("tool", {}).setdefault("uv", {})
         # Release age is checked when Hermes locks; users trust that lock (#135589).
         uv_policy.pop("exclude-newer", None)
@@ -292,7 +325,7 @@ def _member_key(identity: Path) -> str:
     return f"{name}-{digest}"
 
 
-def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
+def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path, core_name: str) -> Path:
     """Keep workspace members with their generation, not a temporary install clone."""
     import json
     import tomllib
@@ -316,6 +349,15 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
         changed = declaration.install_requirements != declaration.requirements
         if changed:
             document["project"]["dependencies"] = list(declaration.install_requirements)
+        # Member dev/test groups exist for the plugin's own checkout (`uv run
+        # --group test pytest` there); inside the generated workspace they can
+        # never be installed — sync takes the root's groups — and they abort
+        # `uv lock` twice over: an entry naming hermes-agent is unparseable next
+        # to the core root member, and pins in them conflict with core's own dev
+        # groups (honcho's test-suite pytest-asyncio vs core's). Build input: drop.
+        for table in ("dependency-groups", "dev-dependencies"):
+            if document.pop(table, None) is not None:
+                changed = True
         for sources in document.get("tool", {}).get("uv", {}).get("sources", {}).values():
             for spec in sources if isinstance(sources, list) else [sources]:
                 if not isinstance(spec, dict) or "path" not in spec:
@@ -327,6 +369,21 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
                 if resolved.is_relative_to(plugin_dir.resolve()):
                     continue  # The referenced tree was copied with this member.
                 spec["path"] = (identity / relative).resolve().as_posix()
+                changed = True
+        # A dependency naming the core project — a runtime requirement or an extra,
+        # since groups are gone — names a workspace member (the core root) here, and
+        # uv refuses to even parse the member manifest without a tool.uv.sources
+        # entry, aborting every `uv lock` with "… is included as a workspace member,
+        # but is missing an entry in tool.uv.sources". Point it at the workspace;
+        # uv resolves it to the core root.
+        if core_name:
+            core = _normalized_name(core_name)
+            sources = document.get("tool", {}).get("uv", {}).get("sources") or {}
+            spelling = next((_requirement_name(entry) for entry in _declared_requirements(document)
+                             if _normalized_name(_requirement_name(entry)) == core), "")
+            if spelling and core not in {_normalized_name(key) for key in sources}:
+                document.setdefault("tool", {}).setdefault("uv", {}).setdefault(
+                    "sources", {})[spelling] = {"workspace": True}
                 changed = True
         if virtual:
             document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
