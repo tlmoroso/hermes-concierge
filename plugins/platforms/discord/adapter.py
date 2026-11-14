@@ -1668,42 +1668,53 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
-                if member == adapter_self._client.user:
-                    return
-                joined = before.channel is None and after.channel is not None
-                left = before.channel is not None and after.channel is None
-                switched = (
-                    before.channel is not None
-                    and after.channel is not None
-                    and before.channel != after.channel
-                )
-                if joined or left or switched:
-                    logger.info(
-                        "Voice state: %s (%d) %s (guild %d)",
-                        member.display_name,
-                        member.id,
-                        "joined " + after.channel.name if joined
-                        else "left " + before.channel.name if left
-                        else f"moved {before.channel.name} -> {after.channel.name}",
-                        guild_id,
-                    )
-                    # Any membership change in the bot's channel bumps the
-                    # DAVE (E2EE) epoch — re-resolve the receiver's decryption
-                    # state so it never decodes against a stale session.
-                    vc = adapter_self._voice_clients.get(guild_id)
-                    receiver = adapter_self._voice_receivers.get(guild_id)
-                    if vc is not None and receiver is not None:
-                        bot_channel = getattr(vc, "channel", None)
-                        if bot_channel is not None and (
-                            before.channel == bot_channel
-                            or after.channel == bot_channel
-                        ):
-                            receiver.refresh_credentials("membership change")
+                if bot_guild_ids:
+                    guild_id = member.guild.id
+                    if (guild_id in bot_guild_ids
+                            and member != adapter_self._client.user):
+                        joined = before.channel is None and after.channel is not None
+                        left = before.channel is not None and after.channel is None
+                        switched = (
+                            before.channel is not None
+                            and after.channel is not None
+                            and before.channel != after.channel
+                        )
+                        if joined or left or switched:
+                            logger.info(
+                                "Voice state: %s (%d) %s (guild %d)",
+                                member.display_name,
+                                member.id,
+                                "joined " + after.channel.name if joined
+                                else "left " + before.channel.name if left
+                                else f"moved {before.channel.name} -> {after.channel.name}",
+                                guild_id,
+                            )
+                            # Any membership change in the bot's channel bumps the
+                            # DAVE (E2EE) epoch — re-resolve the receiver's decryption
+                            # state so it never decodes against a stale session.
+                            vc = adapter_self._voice_clients.get(guild_id)
+                            receiver = adapter_self._voice_receivers.get(guild_id)
+                            if vc is not None and receiver is not None:
+                                bot_channel = getattr(vc, "channel", None)
+                                if bot_channel is not None and (
+                                    before.channel == bot_channel
+                                    or after.channel == bot_channel
+                                ):
+                                    receiver.refresh_credentials("membership change")
+                # Concierge voice auto-join (concierge.voice_auto_join): the
+                # duck-typed TAIL hook (the _discord_free_response_channels
+                # pattern). Runs on EVERY voice-state event — including when
+                # the bot holds no voice client (the feature's main case) —
+                # and its failure must never break the bookkeeping above.
+                hook = getattr(adapter_self, "_concierge_maybe_auto_join_voice", None)
+                if callable(hook):
+                    try:
+                        await hook(member, before, after)
+                    except Exception:
+                        logger.debug(
+                            "[%s] concierge voice auto-join hook failed",
+                            getattr(adapter_self, "name", "discord"),
+                            exc_info=True)
 
             # Register slash commands
             if self._slash_commands:

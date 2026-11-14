@@ -169,7 +169,9 @@ and END THE TURN.
   git push personal "$SNAP":refs/heads/main && git update-ref refs/snapshots/<name> "$SNAP"
   ```
   Chain so far: 4e2143ce → d24b3cf9da8 → 09c3f4b7b9 → ba6b4dbbdab → 797c17bf561
-  → 3a43d0cfea0. **Push a fresh snapshot at the end of every work session** —
+  → 3a43d0cfea0 → 04161a5d38b (voice) → e7fa0152c3b (hy4-presets) → 8c3f92ee833
+  (orchestrator) → 96ed3d84575 (orchestrator-hotfix1) → 81029ebb073 (pm member
+  workspace fix: honcho catalog install). **Push a fresh snapshot at the end of every work session** —
   this is the only off-site copy of the feature.
 - Merges/recovery: resolve in a WORKTREE on a temp branch, test there, then
   fast-forward `main` atomically — conflict markers on the live checkout +
@@ -324,6 +326,21 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   tests/gateway/test_discord_concierge_orchestrator_{fallback,dispatch}.py,
   test_discord_concierge_voice_orchestrator.py; CLI rows in
   tests/hermes_cli/test_concierge_cli.py.
+- **Voice auto-join (`concierge.voice_auto_join`, 2026-11-14, ships OFF):** an
+  allowlisted user JOINING a Discord voice channel makes the bot auto-join
+  it via the programmatic `join_voice_channel` seam with the transcription
+  binding pointed at THE JOINER'S home channel — spoken input then routes to
+  their orchestrator through the EXISTING machinery (restamp → lane → relay),
+  zero new routing logic. Gate ladder in `_concierge_maybe_auto_join_voice`
+  (concierge_mixin.py): events-wanted + flag + join-event + human + allowed
+  (`_allowed_user_ids`, receiver parity) + no voice client in the guild (one
+  per guild, second joiner ignored, no moves) + LIVE orchestrator
+  (`_profile_exists` posture) + home channel. The join runs as a background
+  task, warns ONCE per (guild, user) on failure, never persists a voice mode
+  (default-state path), and is dispatched from `on_voice_state_update`'s
+  duck-typed TAIL (fail-safe, after the DAVE bookkeeping). Manual
+  `/voice join` unchanged. Suite:
+  tests/gateway/test_discord_concierge_voice_auto_join.py.
 
 Anchors: build plan at `~/.hermes/plans/2026-09-20_165455-discord-concierge.md`;
 design notes in `concierge/DISCORD_INTEGRATION.md`; deploy runbook

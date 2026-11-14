@@ -404,6 +404,11 @@ class ConciergeDiscordMixin:
 
     _concierge_warned: set[tuple[str, ...]] = set()
 
+    # Duck-typed adapter surface the voice auto-join drives (the MRO resolves
+    # them onto the Discord adapter at call time; declared ``Any`` so the
+    # mixin stays importable/standalone, the companion-mixin discipline).
+    join_voice_channel: Any
+
     def _concierge_warn_once(self, key: tuple[str, ...], message: str,
                              *args: Any, exc_info: bool = False) -> None:
         """Emit ``message % args`` as a WARNING the first time ``key`` is seen;
@@ -3699,6 +3704,142 @@ class ConciergeDiscordMixin:
         normalizer = getattr(self, "_on_platform_thread_create", None)
         if callable(normalizer):
             await normalizer(thread)
+
+    # ── Voice auto-join (concierge.voice_auto_join) ────────────────────────
+    #
+    # The orchestrator voice front door's phone-half: an allowlisted user
+    # JOINING a Discord voice channel makes the bot auto-join that channel
+    # with the transcription binding pointed at THE JOINER'S ORCHESTRATOR
+    # HOME CHANNEL — so their spoken input routes to their orchestrator
+    # through the EXISTING voice machinery (restamp → orchestrator lane →
+    # relay summary playback), zero new routing logic. Ships OFF.
+
+    async def _concierge_maybe_auto_join_voice(self, member, before, after) -> None:
+        """Gates + dispatch for the voice auto-join (never raises).
+
+        Called from the adapter's ``on_voice_state_update`` TAIL, duck-typed
+        (the ``_discord_free_response_channels`` pattern), so a failure here
+        never breaks the existing voice bookkeeping. Every gate is required
+        and any failure is a SILENT return — manual ``/voice join`` keeps
+        working exactly as today (the one-voice-client-per-guild posture of
+        the existing machinery is preserved: a second joiner elsewhere is
+        IGNORED, no moves).
+        """
+        try:
+            if not self._concierge_events_wanted():
+                return
+            settings = self._concierge_settings_obj()
+            if settings is None or not settings.voice_auto_join:
+                return
+            after_channel = getattr(after, "channel", None)
+            if after_channel is None or after_channel == getattr(
+                    before, "channel", None):
+                return  # a leave, or a mute/deafen state change: not a join
+            if getattr(member, "bot", False):
+                return  # anti-loop: another bot's voice state never joins
+            user_id = str(getattr(member, "id", "") or "")
+            allowed = getattr(self, "_allowed_user_ids", None) or set()
+            if allowed and user_id not in allowed:
+                return  # the hub .env allowlist still gates (receiver parity)
+            guild_id = getattr(getattr(member, "guild", None), "id", None)
+            if guild_id is None:
+                return
+            if getattr(self, "_voice_clients", {}).get(guild_id) is not None:
+                return  # one voice client per guild; no moves, no re-binding
+            from concierge import registry
+            from plugins.platforms.discord.concierge_voice import _profile_exists
+
+            orchestrator = registry.orchestrator_for_user(user_id)
+            if not orchestrator:
+                return  # no users entry: nothing to bind a join to
+            home_channel = registry.home_channel_for_user(user_id)
+            if not home_channel:
+                return  # no home channel: spoken input has nowhere to route
+            exists, stat_error = _profile_exists(orchestrator)
+            if stat_error is not None:
+                self._concierge_warn_once(
+                    ("voice-auto-join-stat", str(guild_id), user_id),
+                    "[%s] Concierge orchestrator for user %s (profile %r) "
+                    "could not be checked (%s); skipping the voice auto-join "
+                    "— investigate the profile directory/permissions before "
+                    "re-provisioning",
+                    getattr(self, "name", "discord"), user_id, orchestrator,
+                    stat_error)
+                return
+            if not exists:
+                self._concierge_warn_once(
+                    ("voice-auto-join-ghost", str(guild_id), user_id),
+                    "[%s] Concierge orchestrator for user %s points at "
+                    "profile %r which does not exist (bot retired?); "
+                    "skipping the voice auto-join — re-provision or repair "
+                    "the users entry",
+                    getattr(self, "name", "discord"), user_id, orchestrator)
+                return
+            # The join runs as a BACKGROUND task (the mixin's established
+            # event-handler pattern): ``channel.connect()`` is a network call
+            # and the voice-state event must not block on it.
+            task = asyncio.create_task(self._concierge_auto_join_voice_channel(
+                after_channel, int(home_channel), str(guild_id), user_id))
+            background = getattr(self, "_background_tasks", None)
+            if background is not None:
+                try:
+                    background.add(task)
+                    task.add_done_callback(background.discard)
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug(
+                "[%s] concierge: voice auto-join gate failed",
+                getattr(self, "name", "discord"), exc_info=True)
+
+    async def _concierge_auto_join_voice_channel(
+            self, channel, text_channel_id: int, guild_id: str, user_id: str) -> None:
+        """The join itself: the programmatic ``join_voice_channel`` seam with
+        the transcription binding set to the joiner's orchestrator HOME
+        CHANNEL. A failure warns ONCE per (guild, user) and never
+        propagates (the voice-state event that spawned this is long gone).
+
+        The seam writes ``_voice_text_channels`` (and starts the receiver)
+        exactly as a manual ``/voice join`` does; no voice MODE is persisted
+        (the default-state path — ``/voice on`` etc. stays operator-owned).
+        The spoken-input source takes the seam's programmatic branch
+        (``build_source`` + the restamp), so registry verdicts are re-read
+        live per utterance — no join-time snapshot to go stale."""
+        try:
+            success = await self.join_voice_channel(
+                channel, text_channel_id=text_channel_id)
+            if not success:
+                self._concierge_warn_once(
+                    ("voice-auto-join-failed", guild_id, user_id),
+                    "[%s] Concierge voice auto-join for user %s could not "
+                    "join the voice channel; manual /voice join still works",
+                    getattr(self, "name", "discord"), user_id)
+                return
+            # Mirror the manual join's runner wiring: the input callback that
+            # routes transcripts (idempotent — also bound at adapter publish;
+            # re-binding costs nothing and keeps the paths identical).
+            bind = getattr(getattr(self, "gateway_runner", None),
+                           "_bind_voice_input_callback", None)
+            if callable(bind):
+                try:
+                    bind(self)
+                except Exception:
+                    logger.debug(
+                        "[%s] concierge: voice input callback re-bind "
+                        "failed", getattr(self, "name", "discord"),
+                        exc_info=True)
+            logger.info(
+                "[%s] concierge: auto-joined voice channel %s for user %s "
+                "(transcription bound to their home channel %s)",
+                getattr(self, "name", "discord"),
+                getattr(getattr(channel, "guild", None), "id", "?"),
+                user_id, text_channel_id)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("voice-auto-join-failed", guild_id, user_id),
+                "[%s] Concierge voice auto-join for user %s failed (%s); "
+                "manual /voice join still works",
+                getattr(self, "name", "discord"), user_id, e, exc_info=True)
 
 
 def _concierge_payload(builder: str):

@@ -20,6 +20,24 @@ class ConciergeSettings:
     provider_groups: dict[str, dict] = field(default_factory=dict)
     location_channel_id: Optional[str] = None
     multi_user: bool = False
+    voice_auto_join: bool = False
+
+
+def _bool_or_default(value: object, default: bool) -> bool:
+    """Fail-closed boolean gate. Honors YAML bools and the scalar words the
+    ``hermes config set`` coercion recognizes (true/yes/on, false/no/off/null),
+    but junk (a random string, list, dict, int) resolves to ``default`` — a
+    garbage value must never turn a shipped-OFF feature ON.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in ("true", "yes", "on"):
+            return True
+        if word in ("false", "no", "off", "null", "none", "~", ""):
+            return False
+    return default
 
 
 def concierge_settings(cfg: Optional[dict] = None) -> ConciergeSettings:
@@ -40,4 +58,6 @@ def concierge_settings(cfg: Optional[dict] = None) -> ConciergeSettings:
         location_channel_id=(str(merged["location_channel_id"])
                              if merged.get("location_channel_id") else None),
         multi_user=bool(merged.get("multi_user", False)),
+        voice_auto_join=_bool_or_default(
+            merged.get("voice_auto_join"), False),
     )

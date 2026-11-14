@@ -1522,6 +1522,12 @@ DEFAULT_CONFIG = {
         # (the concierge-location webhook route; Task 10.1). None = route ignores events.
         "location_channel_id": None,
         "multi_user": False,
+        # Orchestrator voice auto-join: an allowlisted user joining a Discord
+        # voice channel makes the bot auto-join it with the transcription
+        # binding pointed at the joiner's orchestrator home channel. Ships
+        # OFF (zero behavior change). Reader: ConciergeSettings
+        # voice_auto_join in concierge/settings.py.
+        "voice_auto_join": False,
     },
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",
