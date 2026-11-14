@@ -2006,6 +2006,48 @@ class ConciergeDiscordMixin:
             logger.debug("concierge free-response lookup failed", exc_info=True)
             return ()
 
+    def _concierge_free_response_message(self, message) -> bool:
+        """True when *message*'s channel sits in a concierge MANAGED category.
+
+        The orchestrator front door's channels live in managed categories
+        and must answer plain typing (no @mention): the id-based hook above
+        covers only bound/room channels, so an UNBOUND managed-category
+        channel fell out of the union and ``require_mention`` (default on)
+        dropped the message at ingest — upstream of the concierge wrap, so
+        the T4 fallback/bootstrap never fired (the 2026-11-14 live E2E
+        bug). Bound/room channels are already covered by the id-based hook,
+        making this a clean superset rule: "a channel in a concierge
+        managed category is free-response".
+
+        Fail-closed, mirroring ``_concierge_event_in_managed_category``:
+        anything unresolvable resolves False — disabled concierge
+        (``_concierge_events_wanted``), unreadable/None settings, or no
+        category on the channel. THREADS don't resolve a category (the
+        parent channel's category is not reachable from the thread object),
+        so a thread message in a managed category is NOT free-response by
+        this hook — the same fail-closed limitation T4 documented. Runs on
+        the admission path, so it must be cheap and NEVER raise.
+        """
+        try:
+            if not self._concierge_events_wanted():
+                return False
+            settings = self._concierge_settings_obj()
+            if settings is None:
+                return False
+            channel = getattr(message, "channel", None)
+            category_id = getattr(channel, "category_id", None)
+            if category_id is None:
+                category_id = getattr(getattr(channel, "category", None),
+                                      "id", None)
+            if category_id is None:
+                return False
+            managed = {str(c) for c in (settings.managed_category_ids or ())}
+            return str(category_id) in managed
+        except Exception:
+            logger.debug("concierge free-response message lookup failed",
+                         exc_info=True)
+            return False
+
     def _concierge_events_wanted(self) -> bool:
         """Gate for the whole command/event surface: enabled AND multiplexed
         (the same two gates routing applies — commands that bind channels are

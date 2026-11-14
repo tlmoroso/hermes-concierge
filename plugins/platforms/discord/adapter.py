@@ -1860,7 +1860,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
                         parent_id = str(message.channel.parent_id)
                     free_channels = self._discord_free_response_channels()
                     channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    if ("*" not in free_channels
+                            and not (channel_keys & free_channels)
+                            and not self._discord_concierge_managed_channel(message)):
                         # Every other silent return in this function is at least guessable from
                         # the outside; this one is not, and an operator seeing no log line cannot
                         # tell it apart from the gateway never receiving the event.
@@ -2556,6 +2558,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
         raw = self._gate_env("DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS")
         if not raw.strip():
             allowed = self._get_allowed_channels()
+            # Id-enumerating union only: concierge's managed-category rule is
+            # message-shaped (needs a channel object), so it is enforced at the
+            # gate sites, never here.
             return allowed | self._discord_free_response_channels()
         return self._gate_csv_set(raw)
 
@@ -2690,6 +2695,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
                 self._discord_require_mention()
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
+                and not self._discord_concierge_managed_channel(message)
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -5257,6 +5263,25 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
                 logger.debug("concierge free-response hook failed", exc_info=True)
         return base
 
+    def _discord_concierge_managed_channel(self, message: Any) -> bool:
+        """True when concierge claims the message's channel via a MANAGED
+        category (the orchestrator front door's free-response rule).
+
+        Thin duck-typed indirection (the ``_concierge_free_response_channels``
+        pattern): byte-identical ``False`` when concierge is absent,
+        disabled, or its settings are unreadable — the base gates stay
+        exactly what they were. The hook consults the message's channel
+        category, so it can only run at the message-shaped gate sites, never
+        in the id-enumerating backfill union."""
+        hook = getattr(self, "_concierge_free_response_message", None)
+        if callable(hook):
+            try:
+                return bool(hook(message))
+            except Exception:
+                logger.debug("concierge managed-channel hook failed",
+                             exc_info=True)
+        return False
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract user-mention IDs (``<@ID>`` and legacy ``<@!ID>``) from raw content,
         since ``message.mentions`` isn't always populated (mobile/edited/relayed)."""
@@ -6284,6 +6309,10 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
                 or is_voice_linked_channel
+                # Concierge managed-category channels (the orchestrator front
+                # door) answer plain typing; the _has_mention_gap derivation
+                # below follows automatically from is_free_channel.
+                or self._discord_concierge_managed_channel(message)
             )
             in_bot_thread = self._in_bot_thread(message)
             if require_mention and not is_free_channel and not in_bot_thread:
