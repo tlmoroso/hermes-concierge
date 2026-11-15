@@ -184,6 +184,18 @@ class ConciergeAdminMixin:
                 ephemeral=True)
             return
 
+        # Answer BEFORE the slow provisioning tail. Discord's deferred interaction
+        # expires 15 minutes after the defer, and create_bot on a cold VM can approach
+        # that — which is exactly how the operator saw a 15-minute hang (2026-11-15):
+        # the work completed, but the reply reached an expired token. The completion
+        # line follows as a second followup below.
+        await self._concierge_respond(
+            interaction,
+            f"Created {visibility} category '{category_name}' (id {category_id}) "
+            f"with general channel (id {general_id}). Provisioning the "
+            f"orchestrator — this can take a few minutes.",
+            ephemeral=True)
+
         # ── 3–5) the NON-DISCORD tail is ONE shared pure helper ─────────────
         # Both lanes (this admin surface AND the offline CLI) call
         # ``concierge.home_space.provision_home_space``: ensure-orchestrator

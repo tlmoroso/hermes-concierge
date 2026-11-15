@@ -1637,6 +1637,15 @@ class ConciergeDiscordMixin:
             elif member is not None:
                 overwrites[member] = discord.PermissionOverwrite(
                     manage_channels=True)
+            # LAST, so no branch above can drop it: the bot must be able to see and
+            # post in the space IT creates. A private category denies @everyone and
+            # grants only the target member + guild administrators; the bot is neither,
+            # so without this overwrite it 403s on its own home channel
+            # ("Missing Access", observed live 2026-11-15).
+            bot_member = getattr(guild, "me", None)
+            if bot_member is not None:
+                overwrites[bot_member] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, manage_channels=True)
             category = await guild.create_category(
                 name=str(name), overwrites=overwrites)
             category_id = str(getattr(category, "id", "") or "") or None

@@ -109,6 +109,11 @@ class _FakeGuild:
         self.by_id = {m.id: m for m in self.members}
         self.created = []
         self.channels = {}
+        # The bot's own member. It must land in the category overwrites or the bot
+        # cannot see or post in the space it just created (403 Missing Access,
+        # observed live 2026-11-15). Deliberately NOT an administrator.
+        self.me = _Obj(id=7, name="Hermes-Concierge",
+                       guild_permissions=_Obj(administrator=False))
 
     def get_member(self, uid):
         return self.by_id.get(uid)
@@ -282,6 +287,11 @@ def test_category_private_full_flow(rig, monkeypatch):
     assert admin in overwrites
     assert overwrites[admin].kw == {"view_channel": True,
                                     "manage_channels": True}
+    # the bot itself: without this it 403s "Missing Access" on its own channel
+    assert guild.me in overwrites
+    assert overwrites[guild.me].kw == {"view_channel": True,
+                                       "send_messages": True,
+                                       "manage_channels": True}
 
     # Step order: the shared category helper records home_category
     # (best-effort) FIRST, then the general channel, provision, H's
@@ -307,12 +317,17 @@ def test_category_private_full_flow(rig, monkeypatch):
     # auto-offer suppressed on the created channel
     assert rig.adapter._concierge_channel_is_hub_created("9100")
 
-    # ephemeral reply carries BOTH ids
+    # The command answers TWICE: once as soon as the category + channel exist (so the
+    # operator is never left waiting out Discord's 15-minute deferred window while
+    # provisioning runs), then the completion line. BOTH carry the two ids.
     replies = inter.all_replies()
-    assert len(replies) == 1
-    text, ephemeral = replies[0]
-    assert ephemeral is True
-    assert "9001" in text and "9100" in text
+    assert len(replies) == 2
+    for text, ephemeral in replies:
+        assert ephemeral is True
+        assert "9001" in text and "9100" in text
+    # the first is the progress note, the last is the completion
+    assert "Provisioning" in replies[0][0]
+    assert "Provisioning" not in replies[-1][0]
 
 
 def test_category_reuses_existing_orchestrator(rig, monkeypatch):
@@ -355,6 +370,11 @@ def test_space_public_full_flow(rig, monkeypatch):
     # the caller keeps manage_channels
     assert caller in overwrites
     assert overwrites[caller].kw == {"manage_channels": True}
+    # public still grants the bot explicitly rather than relying on the default role
+    assert guild.me in overwrites
+    assert overwrites[guild.me].kw == {"view_channel": True,
+                                       "send_messages": True,
+                                       "manage_channels": True}
 
     assert _names(log) == [
         "update_user", "create_channel", "create_bot", "update_user",
