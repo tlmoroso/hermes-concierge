@@ -160,11 +160,17 @@ class _FakeInteraction:
         self.followup_log = []
         self.followup = _Followup(self.followup_log)
         self.guild = guild
+        # Completing the deferred response is what clears Discord's "thinking"
+        # indicator; a command that only ever followups keeps rendering as running.
+        self.original_edited = []
         self.user = _Obj(
             id=user_id, name="Admin", display_name="Admin")
 
+    async def edit_original_response(self, *, content=None, view=None, **_kw):
+        self.original_edited.append((content, True))
+
     def all_replies(self):
-        return self.response.sent + self.followup_log
+        return self.response.sent + self.original_edited + self.followup_log
 
 
 # ── service harness ────────────────────────────────────────────────────────
@@ -328,6 +334,12 @@ def test_category_private_full_flow(rig, monkeypatch):
     # the first is the progress note, the last is the completion
     assert "Provisioning" in replies[0][0]
     assert "Provisioning" not in replies[-1][0]
+    # The DEFERRED original response is completed, not just followed up: Discord keeps
+    # rendering "<bot> is thinking…" until edit_original_response lands, so a command
+    # that only ever followups looks hung to the operator even when it finished.
+    assert len(inter.original_edited) == 1
+    assert "9001" in inter.original_edited[0][0]
+    assert len(inter.followup_log) == 1          # the completion line follows up
 
 
 def test_category_reuses_existing_orchestrator(rig, monkeypatch):

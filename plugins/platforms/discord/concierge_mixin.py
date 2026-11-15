@@ -3399,17 +3399,40 @@ class ConciergeDiscordMixin:
 
     async def _concierge_respond(self, interaction, text: str, *,
                                  view=None, ephemeral: bool = True) -> None:
-        """Respond or follow up — whichever the interaction still allows
-        (picker selections arrive as component interactions that may already
-        be deferred). Never raises: command UX must not die on a stale token."""
+        """Answer the interaction, completing the DEFERRED response first.
+
+        A deferred interaction leaves Discord rendering "<bot> is thinking…" until the
+        ORIGINAL response is completed. Sending only followups leaves the client showing
+        the command as still running even though the messages arrived — which reads as a
+        hang to the operator (observed live 2026-11-15: the work finished, the registry
+        was correct, no error was logged, and the command still appeared stuck). So the
+        FIRST reply after a defer edits the original response; later replies follow up.
+
+        Failures are logged with a traceback, not debug: a silently swallowed send is how
+        a completed command looked like a 15-minute hang with no evidence.
+        """
+        answered = getattr(self, "_concierge_answered_original", None)
+        if answered is None:
+            answered = set()
+            self._concierge_answered_original = answered
+        key = getattr(interaction, "id", None) or id(interaction)
         try:
-            if interaction.response.is_done():
-                await interaction.followup.send(text, view=view, ephemeral=ephemeral)
-            else:
+            if not interaction.response.is_done():
                 await interaction.response.send_message(text, view=view, ephemeral=ephemeral)
+                return
+            if key not in answered:
+                try:
+                    await interaction.edit_original_response(content=text, view=view)
+                    answered.add(key)
+                    return
+                except Exception as e:  # health: allow BLE001 -- no original to edit (undeferred/picker edge); fall through to the followup below
+                    logger.debug("[%s] concierge: edit_original_response unavailable: %s",
+                                 getattr(self, "name", "discord"), e)
+            await interaction.followup.send(text, view=view, ephemeral=ephemeral)
         except Exception as e:
-            logger.debug("[%s] concierge: interaction response failed: %s",
-                         getattr(self, "name", "discord"), e)
+            logger.warning("[%s] concierge: interaction response FAILED (command work may "
+                           "still have completed): %s", getattr(self, "name", "discord"), e,
+                           exc_info=True)
 
     def _concierge_blueprint_title(self, blueprint_key: str) -> str:
         try:
