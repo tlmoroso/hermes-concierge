@@ -4,6 +4,8 @@
   ~12 GB from upstream — never happens here. Pushes go ONLY to `personal`
   (`git@github.com:tlmoroso/hermes-concierge.git`, key
   `~/.ssh/id_ed25519_gh_personal`, BatchMode) as **snapshot commits**:
+  **Do this with** `scripts/concierge/snapshot.sh "message"` — it performs exactly the
+  above and refuses anything but a clean `main`. Do not hand-roll it.
   ```
   SNAP=$(git commit-tree <tip>^{tree} -p <prev-snapshot> -m "Snapshot …")
   git push personal "$SNAP":refs/heads/main && git update-ref refs/snapshots/<name> "$SNAP"
@@ -19,7 +21,11 @@
   `main`. **Only `main` is ever deployed to the VM** — never a feature branch. The
   merge is resolved in a WORKTREE first (see below), tested there, and only then is
   `main` fast-forwarded, because conflict markers on the live checkout plus a
-  launchd crash-restart is an import-error crash loop.
+  launchd crash-restart is an import-error crash loop. Mechanics:
+  `scripts/concierge/deploy.sh` (refuses a non-`main` or dirty tree; **no override
+  flag**) and `scripts/concierge/snapshot.sh` (the off-site copy). Neither can be
+  run from inside the gateway process — Hermes' own guard blocks a restart that
+  would SIGTERM the session running it, so use a plain Terminal.
 - **Ratchet baseline:** the fork's own `main` only. `origin/main` is upstream
   NousResearch (no concierge code there — measuring against it counts long-merged
   fork work as "new"), and `personal/main` is this snapshot chain, not a history

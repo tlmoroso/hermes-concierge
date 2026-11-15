@@ -63,6 +63,7 @@ these before assuming any hook is live:
 |---|---|
 | `docs/seams.md` | the full ingress chain, admission, toolsets, home channel, cron delivery |
 | `docs/deployment-topology.md` | Mac/VM layout, services, deploy flow, backups |
+| `docs/repo-hygiene.md` | snapshot chain, branch + deploy policy, commit rules |
 | `docs/auth-model.md` | Nous Portal OAuth, token families, Honcho memory |
 | `docs/discord-surface-facts.md` | slash sync, forum flow, channel-delete teardown |
 | `docs/local-session-guard.md` | the terminal guard and its workarounds |
@@ -83,6 +84,10 @@ these before assuming any hook is live:
 - **Core must never import `concierge/`**, and plugin code must not either.
   Keep every new capability a thin, duck-typed hook.
 - **Never restart the gateway while the checkout is dirty.**
+- **Deploy only `main` — enforced, not advisory.** Feature branch → rebase onto
+  `main` → fast-forward merge → test → deploy. `scripts/concierge/deploy.sh`
+  refuses anything else (no override flag) and `scripts/concierge/snapshot.sh`
+  owns the off-site copy. Never run either from inside the gateway process.
 - **Hot path: ONE registry read per message.**
 - **Code-health ratchet — do not relax it.** The fork keeps `ENFORCEMENT = "blocking"`
   (`scripts/code_health/config.py`); never flip to `advisory`/`off` to make
