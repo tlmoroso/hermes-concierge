@@ -18,3 +18,15 @@ def _concierge_dispatch_reply_block(title, worker_answer):
     if worker_answer is not None:
         return f"[{title} replied]\n{worker_answer}"
     return f"[{title} is unavailable]\n(the dispatch could not reach {title})"
+
+
+def _concierge_channel_slug(raw: str) -> str:
+    """Discord-safe slug of a display name/user id for channel names:
+    lowercase ascii alphanumerics with single hyphens. Never raises; never
+    empty (``user`` fallback). Shared by the orchestrator and worker channel
+    name helpers so the two cannot drift."""
+    slug = "".join(ch if ch.isascii() and ch.isalnum() else "-"
+                   for ch in raw.lower())
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug.strip("-") or "user"
