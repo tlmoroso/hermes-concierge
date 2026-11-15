@@ -1304,9 +1304,13 @@ from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesM
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 from plugins.platforms.discord.concierge_mixin import ConciergeDiscordMixin
 from plugins.platforms.discord.concierge_voice import ConciergeVoiceMixin
+from plugins.platforms.discord.concierge_mixin_admin import ConciergeAdminMixin
+from plugins.platforms.discord.concierge_mixin_provisioning import ConciergeProvisioningMixin
+from plugins.platforms.discord.concierge_mixin_room_commands import ConciergeRoomCommandsMixin
 
 
 class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDiscordMixin, ConciergeVoiceMixin,
+                     ConciergeAdminMixin, ConciergeProvisioningMixin, ConciergeRoomCommandsMixin,
                      DiscordThreadTitlesMixin, DiscordVoiceInfoMixin, DiscordSlashAuthMixin, BasePlatformAdapter):
     """Discord bot adapter: guild/DM messages, threads, slash commands, button approvals, reactions."""
 
@@ -5073,6 +5077,34 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
             "free_response_auto_thread", "DISCORD_FREE_RESPONSE_AUTO_THREAD", "false", truthy=True,
         )
 
+    def _wants_auto_thread(self, message: Any, is_free_channel: bool) -> bool:
+        """Whether an inbound server message should be isolated into its own thread.
+
+        Concierge may *force* threading on its own surfaces through the optional
+        ``_concierge_wants_auto_thread`` hook. The hook is resolved by name at
+        call time: ``DiscordAdapter``'s own body precedes
+        ``ConciergeDiscordMixin`` in the MRO, so a plain mixin override cannot
+        win (the established seam convention here). The hook is strictly
+        optional -- an adapter with no concierge hook falls straight through to
+        the base rule with zero behavior change.
+
+        The base rule is byte-for-byte today's inline free-response term:
+        non-free channels thread; free channels only when the core
+        ``free_response_auto_thread`` opt-in is set. A hook that raises is
+        swallowed here (debug log only) so intake is never broken. Every hard
+        exclusion (DMs, ``no_thread_channels``, replies, voice-linked channels)
+        stays in the ``_handle_message`` gate, NOT here -- the hook can only
+        add threading, never widen past those exclusions.
+        """
+        hook = getattr(self, "_concierge_wants_auto_thread", None)
+        if callable(hook):
+            try:
+                if hook(message, is_free_channel):
+                    return True
+            except Exception:
+                logger.debug("concierge auto-thread hook failed", exc_info=True)
+        return (not is_free_channel) or self._discord_free_response_auto_thread()
+
     def _discord_max_attachment_bytes(self) -> int:
         """Per-attachment byte cap; 0 = unlimited (whole attachment is held in memory). Default 32 MiB."""
         configured = self.config.extra.get("max_attachment_bytes")
@@ -6337,13 +6369,21 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, ConciergeDisc
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
-            skip_thread = bool(channel_keys & no_thread_channels) or (
-                is_free_channel and not self._discord_free_response_auto_thread()
-            )
+            # Hard exclusions stay in the adapter and are never delegated to the
+            # concierge hook: no_thread_channels, voice-linked channels, quotes.
+            skip_thread = bool(channel_keys & no_thread_channels)
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # The free-response decision is delegated to _wants_auto_thread, which
+            # consults the optional concierge hook and otherwise reproduces the
+            # base rule exactly (no behavior change when concierge is off).
+            if (
+                auto_thread
+                and not skip_thread
+                and self._wants_auto_thread(message, is_free_channel)
+                and not is_voice_linked_channel
+                and not is_reply_message
+            ):
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)

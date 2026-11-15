@@ -34,10 +34,14 @@ import json
 import os
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from concierge import provision, registry
+from concierge.home_space import (
+    HomeSpaceError, home_general_channel_name, provision_home_space,
+)
 from hermes_cli.concierge import concierge_command
 from hermes_cli.main import _BUILTIN_SUBCOMMANDS, cmd_concierge
 from hermes_cli.subcommands.concierge import build_concierge_parser
@@ -587,3 +591,382 @@ class TestParserAndRegistration:
     def test_unknown_action_prints_usage_exit_1(self, capsys):
         assert concierge_command(Namespace(concierge_action="bogus")) == 1
         assert "Usage" in capsys.readouterr().out
+
+
+class TestNewHomeSpaceFlags:
+    """Card I — ``new orchestrator --user X`` gains ``--category <id>`` (bind
+    to an EXISTING category) and ``--public`` (create a shared public one).
+
+    Both flags are legal ONLY with --user. Per the operator decision
+    (2026-11-14) the CLI owns NO provisioning/registry logic: the new-home-
+    space path delegates the whole NON-DISCORD tail to the ONE shared pure
+    helper ``concierge.home_space.provision_home_space`` (ensure-orchestrator,
+    record home_category + home_channel + guild_id, bind_channel LAST) that
+    card H's ``/bot category`` / ``/bot space`` admin surface also calls, and
+    routes the general-channel name through the shared
+    ``home_general_channel_name``. The tests below exercise that delegation,
+    not CLI-local provisioning.
+    """
+
+    @staticmethod
+    def _parser():
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_concierge_parser(subparsers, cmd_concierge=concierge_command)
+        return parser
+
+    # ---- parser ----
+    def test_category_and_public_flags_parse(self):
+        parser = self._parser()
+        ns = parser.parse_args(
+            ["concierge", "new", "orchestrator", "--user", "77",
+             "--category", "555"])
+        assert ns.category == "555"
+        assert ns.public is False
+        ns = parser.parse_args(
+            ["concierge", "new", "orchestrator", "--user", "77",
+             "--public", "--name", "Research"])
+        assert ns.public is True
+        assert ns.name == "Research"
+        assert ns.category is None
+        # defaults unchanged for a plain channel-bound new
+        ns = parser.parse_args(
+            ["concierge", "new", "reminders", "--channel", "9"])
+        assert ns.category is None and ns.public is False
+
+    # ---- validation: invalid combos refused, exit 1, clear message, nothing built ----
+    def test_category_without_user_refused(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--category", "555"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "--category" in out and "--user" in out
+        assert registry.list_users() == {}
+        assert registry.list_bindings() == {}
+        assert _visible_profiles(concierge_home) == []
+
+    def test_category_with_channel_refused(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator",
+                   "--channel", "123", "--category", "555"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "--category" in out and "--channel" in out
+        assert registry.list_users() == {}
+        assert registry.list_bindings() == {}
+        assert _visible_profiles(concierge_home) == []
+
+    def test_category_with_channel_and_user_refused(self, concierge_home, capsys):
+        # --category + --channel is refused even when --user is also present.
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--channel", "123", "--category", "555"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:") and "--channel" in out
+        assert registry.list_users() == {}
+        assert _visible_profiles(concierge_home) == []
+
+    def test_public_without_user_refused(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--public",
+                   "--name", "Research"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:") and "--user" in out
+        assert registry.list_users() == {}
+        assert _visible_profiles(concierge_home) == []
+
+    def test_neither_target_still_refused(self, concierge_home, capsys):
+        # existing T7 contract preserved: no --channel / --user at all.
+        rc = _run(["concierge", "new", "orchestrator"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert out.startswith("Error:")
+        assert "--channel" in out and "--user" in out
+
+    def test_validation_before_provision(self, concierge_home, monkeypatch):
+        """A refused combo must not reach provision.create_bot at all."""
+        calls = []
+        orig = provision.create_bot
+
+        def spy(*a, **k):
+            calls.append((a, k))
+            return orig(*a, **k)
+
+        monkeypatch.setattr(provision, "create_bot", spy)
+        assert _run(["concierge", "new", "orchestrator", "--category", "555"]) == 1
+        assert _run(["concierge", "new", "orchestrator", "--channel", "1",
+                     "--category", "555"]) == 1
+        assert calls == []
+
+    # ---- happy path: --category binds an existing category ----
+    def test_user_with_category_records_both_ids(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--category", "555", "--guild", "42"])
+        assert rc == 0
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["orchestrator"].startswith("bot-orchestrator-")
+        # both ids + guild recorded in the registry
+        assert entry["home_category"] == "555"
+        general = entry["home_channel"]
+        assert general and isinstance(general, str)
+        assert general != "555"  # a general CHANNEL, not the category id
+        assert entry["guild_id"] == "42"
+        # general channel bound (bind LAST) and the profile really built
+        binding = registry.get_binding(general)
+        assert binding is not None and binding["profile"] == entry["orchestrator"]
+        assert (concierge_home / "profiles" / entry["orchestrator"]).is_dir()
+        out = capsys.readouterr().out
+        assert "555" in out and general in out and "42" in out
+
+    def test_user_with_category_reuses_create_bot(self, concierge_home, monkeypatch):
+        """The CLI reuses provision.create_bot — no re-implemented provisioning."""
+        calls = []
+        orig = provision.create_bot
+
+        def spy(*a, **k):
+            calls.append((a, k))
+            return orig(*a, **k)
+
+        monkeypatch.setattr(provision, "create_bot", spy)
+        assert _run(["concierge", "new", "orchestrator", "--user", "77",
+                     "--category", "555"]) == 0
+        assert len(calls) == 1
+        a, k = calls[0]
+        assert a[0] == "orchestrator"
+        assert k["user_id"] == "77" and k["channel_id"] is not None
+
+    def test_user_with_category_idempotent_adopts(self, concierge_home, capsys):
+        # deterministic seam -> re-running the same command adopts, no duplicate
+        assert _run(["concierge", "new", "orchestrator", "--user", "77",
+                     "--category", "555"]) == 0
+        capsys.readouterr()
+        assert _run(["concierge", "new", "orchestrator", "--user", "77",
+                     "--category", "555"]) == 0
+        assert "Already provisioned" in capsys.readouterr().out
+        assert len(_visible_profiles(concierge_home)) == 1
+
+    def test_seam_injects_real_ids_that_are_recorded(self, concierge_home,
+                                                     monkeypatch, capsys):
+        """Monkeypatch the single Discord seam to inject real ids; the CLI must
+        record exactly those ids and bind the general channel."""
+        import hermes_cli.concierge as cli
+
+        def fake(**k):
+            return {"category_id": "CAT-9", "channel_id": "GEN-9",
+                    "name": "Ops", "visibility": "public",
+                    "general_channel_name": "general"}
+
+        monkeypatch.setattr(cli, "_create_home_space_channel", fake)
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--public", "--name", "Ops"])
+        assert rc == 0
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["home_category"] == "CAT-9"
+        assert entry["home_channel"] == "GEN-9"
+        assert registry.get_binding("GEN-9") is not None
+        out = capsys.readouterr().out
+        assert "CAT-9" in out and "GEN-9" in out and "Ops" in out
+
+    # ---- happy path: --public creates a shared public category ----
+    def test_public_creates_named_shared_category(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--public", "--name", "Research"])
+        assert rc == 0
+        entry = registry.get_user("77")
+        assert entry is not None
+        # a NEW public category (not a passed-in id) + its general channel
+        assert entry["home_category"] and entry["home_channel"]
+        assert entry["home_category"] != entry["home_channel"]
+        assert registry.get_binding(entry["home_channel"]) is not None
+        out = capsys.readouterr().out
+        assert "Research" in out and "public" in out
+        assert entry["home_category"] in out and entry["home_channel"] in out
+
+    def test_public_default_name_without_flag(self, concierge_home, capsys):
+        # --public without --name still produces a named category
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--public"])
+        assert rc == 0
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["home_category"] and entry["home_channel"]
+        assert "77" in capsys.readouterr().out  # default name references the user
+
+    def test_public_and_category_binds_existing_public_category(self, concierge_home, capsys):
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--public", "--category", "555", "--name", "Ops"])
+        assert rc == 0
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["home_category"] == "555"  # adopts the existing id
+        assert "public" in capsys.readouterr().out
+
+    # ---- delegation: the CLI calls the ONE shared pure helper ---------------
+    def test_cli_delegates_to_shared_helper(self, concierge_home, monkeypatch):
+        """The new-home-space path owns NO provisioning/registry logic: it
+        calls ``concierge.home_space.provision_home_space`` (the same helper
+        card H's admin surface calls) with the resolved ids."""
+        from concierge import home_space
+
+        calls = []
+        orig = home_space.provision_home_space
+
+        def spy(**kwargs):
+            calls.append(kwargs)
+            return orig(**kwargs)
+
+        monkeypatch.setattr(home_space, "provision_home_space", spy)
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--category", "555", "--guild", "42"])
+        assert rc == 0
+        assert len(calls) == 1
+        kw = calls[0]
+        assert kw["user_id"] == "77"
+        assert kw["guild_id"] == "42"
+        assert kw["home_category"] == "555"
+        assert kw["home_channel"] and kw["home_channel"] != "555"
+        assert kw["blueprint"] == "orchestrator"
+        # the helper really did the work: the triple + binding landed
+        entry = registry.get_user("77")
+        assert entry is not None
+        assert entry["home_category"] == "555"
+        assert registry.get_binding(kw["home_channel"]) is not None
+
+    def test_cli_uses_shared_general_channel_name(self, concierge_home,
+                                                   monkeypatch, capsys):
+        """The general-channel name comes from the shared pure function
+        ``home_general_channel_name`` — exactly ONE function decides it for
+        both the CLI and card H's admin surface."""
+        from concierge import home_space
+        import hermes_cli.concierge as cli
+
+        seen = {}
+
+        def fake_name(settings=None):
+            return "LOBBY"
+
+        def fake_seam(**k):
+            seen.update(k)
+            return {"category_id": "CAT-1", "channel_id": "GEN-1",
+                    "name": "Ops", "visibility": "private",
+                    "general_channel_name": k["general_channel_name"]}
+
+        monkeypatch.setattr(home_space, "home_general_channel_name", fake_name)
+        monkeypatch.setattr(cli, "_create_home_space_channel", fake_seam)
+        rc = _run(["concierge", "new", "orchestrator", "--user", "77",
+                   "--category", "555"])
+        assert rc == 0
+        assert seen["general_channel_name"] == "LOBBY"
+        assert "LOBBY" in capsys.readouterr().out
+
+
+class TestSharedHomeSpaceHelper:
+    """The ONE shared, non-Discord home-space helper (operator decision
+    2026-11-14) tested DIRECTLY — the ordering/registry contract the CLI and
+    card H's admin surface BOTH rely on lives here, in exactly one place:
+    ensure-orchestrator -> record the FULL triple -> bind_channel LAST.
+    """
+
+    @staticmethod
+    def _install(monkeypatch, *, orchestrator=None):
+        log = []
+
+        def orchestrator_for_user(uid):
+            log.append(("orchestrator_for_user", uid))
+            return orchestrator
+
+        def create_bot(bk, **kw):
+            log.append(("create_bot", bk, dict(kw)))
+            return {"profile": "bot-orchestrator-new"}
+
+        def update_user(uid, **fields):
+            log.append(("update_user", uid, dict(fields)))
+            return dict(fields)
+
+        def bind_channel(cid, **kw):
+            log.append(("bind_channel", cid, dict(kw)))
+            return dict(kw)
+
+        monkeypatch.setattr(registry, "orchestrator_for_user",
+                            orchestrator_for_user)
+        monkeypatch.setattr(provision, "create_bot", create_bot)
+        monkeypatch.setattr(registry, "update_user", update_user)
+        monkeypatch.setattr(registry, "bind_channel", bind_channel)
+        return log
+
+    def test_ensure_record_bind_last_order(self, monkeypatch):
+        log = self._install(monkeypatch)
+        result = provision_home_space(
+            user_id="77", guild_id="42", home_channel="GEN",
+            home_category="CAT")
+        assert result["profile"] == "bot-orchestrator-new"
+        assert result["already_provisioned"] is False
+        names = [row[0] for row in log]
+        assert names == ["orchestrator_for_user", "create_bot",
+                         "update_user", "bind_channel"]
+        assert names[-1] == "bind_channel"  # nothing routes until it lands
+        # FULL home triple recorded with the resolved ids
+        assert log[2][2] == {"home_category": "CAT", "home_channel": "GEN",
+                             "guild_id": "42"}
+        # bind uses the general channel + the provisioned profile
+        assert log[3][1] == "GEN"
+        assert log[3][2]["profile"] == "bot-orchestrator-new"
+        assert log[3][2]["blueprint"] == "orchestrator"
+
+    def test_adopts_existing_orchestrator(self, monkeypatch):
+        log = self._install(monkeypatch, orchestrator="bot-orchestrator-old")
+        result = provision_home_space(
+            user_id="77", guild_id="42", home_channel="GEN",
+            home_category="CAT")
+        names = [row[0] for row in log]
+        assert "create_bot" not in names     # provision ONLY when user has none
+        assert names[-1] == "bind_channel"
+        assert log[-1][2]["profile"] == "bot-orchestrator-old"
+        assert result["already_provisioned"] is True
+
+    def test_provider_group_and_display_name_flow_through(self, monkeypatch):
+        log = self._install(monkeypatch)
+        provision_home_space(
+            user_id="77", guild_id="42", home_channel="GEN",
+            home_category="CAT", blueprint="orchestrator",
+            provider_group={"name": "fast"}, display_name="Ops")
+        cb = next(r for r in log if r[0] == "create_bot")
+        assert cb[2]["provider_group"] == {"name": "fast"}
+        assert cb[2]["display_name"] == "Ops"
+        bind = next(r for r in log if r[0] == "bind_channel")
+        assert bind[2]["provider_group"] == "fast"
+
+    def test_failure_is_step_tagged(self, monkeypatch):
+        self._install(monkeypatch)
+
+        def boom(*a, **k):
+            raise ValueError("registry is down")
+
+        monkeypatch.setattr(registry, "update_user", boom)
+        with pytest.raises(HomeSpaceError) as exc:
+            provision_home_space(
+                user_id="77", guild_id="42", home_channel="GEN",
+                home_category="CAT")
+        assert exc.value.step == "record"
+        assert "registry is down" in str(exc.value.cause)
+
+    def test_home_general_channel_name_is_one_pure_function(self, monkeypatch):
+        from concierge import settings
+
+        # default path (used by the mixin's single naming authority)
+        assert home_general_channel_name() == "general"
+        # honors the card-A config value, exactly as the mixin lane must
+        monkeypatch.setattr(
+            settings, "concierge_settings",
+            lambda: SimpleNamespace(
+                home_category=SimpleNamespace(general_channel="lobby")))
+        assert home_general_channel_name() == "lobby"
+        # the CLI passes its already-loaded typed settings object
+        assert home_general_channel_name(
+            SimpleNamespace(
+                home_category=SimpleNamespace(general_channel="atrium"))
+        ) == "atrium"
+        # junk settings fail closed to the cosmetic default
+        assert home_general_channel_name(object()) == "general"

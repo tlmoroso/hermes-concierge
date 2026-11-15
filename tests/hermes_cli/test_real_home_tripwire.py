@@ -216,6 +216,41 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_pm_install_metadata_probes_are_exempt_but_home_state_is_not():
+    """On a default install the checkout sits INSIDE the home, so its parent is the real
+    (guarded) home and PM's bootstrap / tool discovery probes its own install metadata and
+    tool store there before any imports: _payload_manifest reads <parent>/manifest.json,
+    owning_home_root stats <parent>/installs/<install_key>/facts.json, and installed_package
+    reads the <parent>/tools tool store. All are install metadata / the interpreter's own
+    installation, not Hermes state, so they are exempt — but ONLY those bounded paths. A
+    blanket home exemption would silently let config/profiles/state.db reads through."""
+    import hashlib
+
+    from tests.home_io_guard import HomeIOGuard
+
+    key = hashlib.sha256(str(PROJECT_ROOT).encode("utf-8")).hexdigest()[:16]
+    home = PROJECT_ROOT.parent
+    facts = home / "installs" / key / "facts.json"
+    guard = HomeIOGuard(lambda: [home])
+    # PM's own install metadata and tool store: exempt.
+    for path in (home / "manifest.json",
+                 facts,
+                 home / "tools" / "facts.json",
+                 home / "tools" / "lock.json",
+                 home / "tools" / "node-x" / "bin" / "node"):
+        guard.check(path)
+    # Every OTHER path under the guarded home remains real Hermes state. The exemptions
+    # must not widen into a blanket home exemption, nor cover other install keys.
+    for path in (home / "config.yaml",
+                 home / "state.db",
+                 home / "manifest.json.bak",
+                 home / "profiles",
+                 facts.parent / "other.json",
+                 home / "installs" / "deadbeefdeadbeef" / "facts.json"):
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            guard.check(path)
+
+
 @pytest.mark.parametrize("kind", ["environments", "test-environment"])
 def test_pm_generation_dir_around_the_running_venv_is_the_interpreter(tmp_path, kind):
     """scripts/run_tests.sh runs ``<home>/installs/<key>/<kind>/<gen>/venv`` with HOME pointed at the

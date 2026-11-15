@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- §8 home-category + threading typed defaults are 12 new DEFAULT_CONFIG keys (the feature ships OFF, read at import by concierge/settings.py); this pure-data leaf was already 3142 lines on fork main and the branch adds only those keys, no other structural growth
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -1528,6 +1529,18 @@ DEFAULT_CONFIG = {
         # OFF (zero behavior change). Reader: ConciergeSettings
         # voice_auto_join in concierge/settings.py.
         "voice_auto_join": False,
+        # §8 home-category feature (fork-level, ships OFF so unrelated Discord
+        # installs keep today's behavior byte-for-byte). Readers: ConciergeSettings
+        # home_category / threading in concierge/settings.py.
+        "home_category": {
+            "enabled": False,          # per-user home-category placement + scoping
+            "visibility": "private",   # /bot category default; user picks public/private
+            "general_channel": "general",
+            "unbound_scope": "managed",  # managed | guild
+        },
+        "threading": {
+            "mode": "mentions",        # off | mentions | always (surface-wide)
+        },
     },
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",

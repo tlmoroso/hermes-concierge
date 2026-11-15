@@ -35,8 +35,14 @@ def plane_env(tmp_path):
     with StubPlane() as plane:
         env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "TMPDIR", "LANG", "TZ",
                                                            "PYTHONHASHSEED", "HERMES_TEST_ISOLATION"}}
+        # Carry the suite's lazy-install kill-switch into these real child processes. Without it,
+        # importing tui_gateway.server triggers hermes_bootstrap's self-update relaunch into the
+        # bare managed interpreter (no site-packages, hence no `dotenv`); a `-c` child never
+        # re-imports the bootstrap to activate dependencies. Other subprocess tests pass this
+        # same var (tests/pm/test_source_update_launch.py). It is orthogonal to config selection:
+        # the three processes must still share one remote credential.
         env.update(remote_env(plane), HERMES_HOME=str(home), PYTHONPATH=str(REPO), HERMES_YOLO_MODE="",
-                   PYTHONDONTWRITEBYTECODE="1")
+                   PYTHONDONTWRITEBYTECODE="1", HERMES_DISABLE_LAZY_INSTALLS="1")
         plane.upper = {"display": {"personality": "concise"}}
         yield plane, env, home
 

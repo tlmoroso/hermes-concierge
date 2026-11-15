@@ -417,3 +417,129 @@ def test_clear_orchestrator_is_targeted(tmp_path, monkeypatch):
     assert registry.get_user("u-1") is None
     raw = json.loads((tmp_path / "concierge" / "registry.json").read_text())
     assert "u-1" not in raw["users"]
+
+
+# ---------------------------------------------------------------------------
+# Registry v3 — durable home_category pointer (HOME_CATEGORY_DESIGN.md §2)
+# ---------------------------------------------------------------------------
+
+def test_set_user_accepts_home_category_and_round_trips(tmp_path, monkeypatch):
+    """set_user persists home_category alongside the other scalar fields;
+    get_user and the raw file both read it back. Omitting it records None
+    (additive — the field is present but empty on a fresh entry)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    entry = registry.set_user("u-1", orchestrator="bot-orchestrator-a1b2",
+                              home_channel="ch-1", guild_id="42",
+                              home_category="cat-1")
+    assert entry["home_category"] == "cat-1"
+    assert registry.get_user("u-1")["home_category"] == "cat-1"
+    raw = json.loads((tmp_path / "concierge" / "registry.json").read_text())
+    assert raw["users"]["u-1"]["home_category"] == "cat-1"
+    # the field is additive but optional: a fresh entry without it stores None
+    registry.set_user("u-2", orchestrator="bot-orchestrator-c3d4")
+    assert registry.get_user("u-2")["home_category"] is None
+
+
+def test_home_category_for_user_reads_the_registry(tmp_path, monkeypatch):
+    """The accessor reads None before any user exists / for an absent key,
+    and returns the stored id once set (tolerant, single-registry-load)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert registry.home_category_for_user("u-1") is None
+    registry.set_user("u-1", orchestrator="bot-orchestrator-a1b2")
+    assert registry.home_category_for_user("u-1") is None  # key absent
+    registry.update_user("u-1", home_category="cat-9")
+    assert registry.home_category_for_user("u-1") == "cat-9"
+
+
+def test_home_category_absent_key_reads_as_none(tmp_path, monkeypatch):
+    """Back-compat: a v1/v2 entry with no home_category key reads as None
+    through every tolerant reader — never a KeyError on the hot path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cdir = tmp_path / "concierge"
+    cdir.mkdir()
+    (cdir / "registry.json").write_text(json.dumps({
+        "version": 1, "bindings": {},
+        "users": {"u-1": {"orchestrator": "bot-orchestrator-a1b2",
+                          "home_channel": "ch-1", "guild_id": "42",
+                          "workers": {}, "created": "2026-01-01T00:00:00"}}}))
+    assert registry.get_user("u-1")["home_category"] is None
+    assert registry.home_category_for_user("u-1") is None
+    assert registry.list_users()["u-1"]["home_category"] is None
+
+
+def test_junk_home_category_normalizes_to_none_and_self_heals(
+        tmp_path, monkeypatch):
+    """Tolerant read: int / blank / non-str home_category all read as None;
+    a subsequent save that writes a real value replaces the junk (the next
+    save self-heals). The write path itself refuses non-str values."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    cdir = tmp_path / "concierge"
+    cdir.mkdir()
+    (cdir / "registry.json").write_text(json.dumps({
+        "version": 1, "bindings": {},
+        "users": {
+            "u-int": {"orchestrator": "bot-orchestrator-a1b2",
+                      "home_category": 42},
+            "u-blank": {"orchestrator": "bot-orchestrator-c3d4",
+                        "home_category": "   "},
+            "u-list": {"orchestrator": "bot-orchestrator-f9e8",
+                       "home_category": []}}}))
+    for uid in ("u-int", "u-blank", "u-list"):
+        assert registry.get_user(uid)["home_category"] is None
+        assert registry.home_category_for_user(uid) is None
+    # write-path validation: a non-str value is refused, no junk written
+    with pytest.raises(ValueError, match="home_category"):
+        registry.set_user("u-new", orchestrator="bot-orchestrator-z0",
+                          home_category=42)
+    with pytest.raises(ValueError, match="home_category"):
+        registry.update_user("u-int", home_category=42)
+    # self-heal: a save with a real home_category replaces the hand-edit junk
+    registry.update_user("u-int", home_category="cat-real")
+    raw = json.loads((cdir / "registry.json").read_text())
+    assert raw["users"]["u-int"]["home_category"] == "cat-real"
+    assert registry.home_category_for_user("u-int") == "cat-real"
+
+
+def test_update_user_accepts_home_category_only_through_the_closed_set(
+        tmp_path, monkeypatch):
+    """home_category is a legal update_user field (closed set); a typo still
+    raises instead of silently vanishing."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    registry.set_user("u-1", orchestrator="bot-orchestrator-a1b2")
+    updated = registry.update_user("u-1", home_category="cat-9")
+    assert updated["home_category"] == "cat-9"
+    assert registry.get_user("u-1")["home_category"] == "cat-9"
+    with pytest.raises(ValueError, match="unknown user fields"):
+        registry.update_user("u-1", home_categry="cat-x")
+
+
+def test_clear_orchestrator_preserves_home_category(tmp_path, monkeypatch):
+    """clear_orchestrator clears ONLY orchestrator + home_channel. The durable
+    home_category, workers, guild_id and created all survive — an orchestrator
+    swap / Discord-side delete must not erase the placement anchor."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # (a) entry WITH workers
+    registry.set_user("u-1", orchestrator="bot-orchestrator-a1b2",
+                      home_channel="ch-1", guild_id="42",
+                      home_category="cat-1")
+    registry.set_user_worker("u-1", "researcher", "bot-researcher-x1")
+    assert registry.clear_orchestrator("u-1") is True
+    entry = registry.get_user("u-1")
+    assert entry.get("orchestrator") is None
+    assert entry["home_channel"] is None
+    assert entry["home_category"] == "cat-1"          # preserved
+    assert entry["guild_id"] == "42"
+    assert entry["created"]
+    assert entry["workers"] == {"researcher": "bot-researcher-x1"}
+    # (b) the durable anchor: an entry with home_category but NO workers must
+    # survive the clear (not be removed as an "empty shell")
+    registry.set_user("u-2", orchestrator="bot-orchestrator-c3d4",
+                      home_channel="ch-2", guild_id="42",
+                      home_category="cat-2")
+    assert registry.clear_orchestrator("u-2") is True
+    assert registry.get_user("u-2") is not None        # not erased
+    assert registry.home_category_for_user("u-2") == "cat-2"
+    assert registry.orchestrator_for_user("u-2") is None
+    assert registry.home_channel_for_user("u-2") is None
+    raw = json.loads((tmp_path / "concierge" / "registry.json").read_text())
+    assert raw["users"]["u-2"]["home_category"] == "cat-2"

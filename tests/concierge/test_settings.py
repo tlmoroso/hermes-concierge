@@ -127,3 +127,159 @@ def test_malformed_group_raises_helpful_keyerror():
     assert "'model'" in msg
     assert "concierge.provider_groups" in msg
     assert "groq" in msg  # the offending entry is identifiable in the message
+
+
+# ── §8 config surface: home_category + threading (card A) ──────────────────
+# Root invariant: every DEFAULT_CONFIG key has a runtime reader. The new nested
+# keys ship OFF (disabled placement, managed scope, mentions threading) so an
+# absent/disabled config is byte-for-byte today's behavior. Later cards read the
+# one typed surface: settings.home_category.* and settings.threading.mode.
+
+
+def test_default_config_has_home_category_and_threading_keys():
+    """The registered defaults exist and pin the conservative ship-OFF values."""
+    hc = DEFAULT_CONFIG["concierge"]["home_category"]
+    assert hc["enabled"] is False
+    assert hc["visibility"] == "private"
+    assert hc["general_channel"] == "general"
+    assert hc["unbound_scope"] == "managed"
+    threading = DEFAULT_CONFIG["concierge"]["threading"]
+    assert threading["mode"] == "mentions"
+
+
+def test_reader_returns_conservative_defaults_on_empty_config(tmp_path, monkeypatch):
+    """concierge_settings() with no config fills every new key from DEFAULT_CONFIG."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings()
+    assert settings.home_category.enabled is False
+    assert settings.home_category.visibility == "private"
+    assert settings.home_category.general_channel == "general"
+    assert settings.home_category.unbound_scope == "managed"
+    assert settings.threading.mode == "mentions"
+
+
+def test_reader_honors_explicit_home_category_and_threading_values(tmp_path, monkeypatch):
+    """An explicit value for each new key is honored (bool gate, non-blank strs)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {
+        "home_category": {
+            "enabled": True,
+            "visibility": "public",
+            "general_channel": "lobby",
+            "unbound_scope": "guild",
+        },
+        "threading": {"mode": "always"},
+    }})
+    assert settings.home_category.enabled is True
+    assert settings.home_category.visibility == "public"
+    assert settings.home_category.general_channel == "lobby"
+    assert settings.home_category.unbound_scope == "guild"
+    assert settings.threading.mode == "always"
+
+
+def test_reader_partial_subsection_fills_missing_keys_from_defaults(tmp_path, monkeypatch):
+    """A partial sub-section deep-merges over defaults: flipping only enabled
+    keeps the other conservative defaults (no shallow-replace of the sub-dict)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {
+        "home_category": {"enabled": True},
+        "threading": {},
+    }})
+    assert settings.home_category.enabled is True
+    assert settings.home_category.visibility == "private"     # default filled in
+    assert settings.home_category.general_channel == "general"
+    assert settings.home_category.unbound_scope == "managed"
+    assert settings.threading.mode == "mentions"
+
+
+@pytest.mark.parametrize("garbage", ["nope", [], {"a": 1}])
+def test_reader_ignores_non_dict_subsection(tmp_path, monkeypatch, garbage):
+    """A sub-section that isn't a mapping is junk: its defaults stay in force."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {"home_category": garbage}})
+    assert settings.home_category.enabled is False
+    assert settings.home_category.visibility == "private"
+    assert settings.home_category.unbound_scope == "managed"
+
+
+@pytest.mark.parametrize("field,garbage", [
+    ("visibility", ""),
+    ("visibility", "   "),
+    ("visibility", None),
+    ("visibility", 123),
+    ("visibility", ["public"]),
+    ("general_channel", None),
+    ("general_channel", 5),
+    ("unbound_scope", {}),
+    ("unbound_scope", "  "),
+])
+def test_reader_str_fields_fail_closed_to_default_on_garbage(field, garbage, tmp_path, monkeypatch):
+    """Blank / wrong-typed values resolve to the DEFAULT_CONFIG default,
+    fail-closed — mirroring _coerce_config_set_value's reject-junk disposition."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    defaults = DEFAULT_CONFIG["concierge"]["home_category"]
+    settings = concierge_settings({"concierge": {"home_category": {field: garbage}}})
+    assert getattr(settings.home_category, field) == defaults[field]
+
+
+@pytest.mark.parametrize("garbage", ["", "  ", None, 7, ["x"], {"a": 1}, False])
+def test_reader_threading_mode_fails_closed_to_default_on_garbage(garbage, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {"threading": {"mode": garbage}}})
+    assert settings.threading.mode == DEFAULT_CONFIG["concierge"]["threading"]["mode"]
+
+
+def test_reader_preserves_string_enum_off_not_bool(tmp_path, monkeypatch):
+    """Mirror _coerce_config_set_value: a string-typed enum member such as
+    threading.mode='off' stays the string 'off'. It must never be coerced to a
+    bool (which would silently flip the surface-wide threading policy)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {"threading": {"mode": "off"}}})
+    assert settings.threading.mode == "off"
+    assert isinstance(settings.threading.mode, str)
+
+
+@pytest.mark.parametrize("garbage", ["", None, [], "not-a-bool", 5, {"x": 1}])
+def test_reader_home_category_enabled_fails_closed_on_garbage(garbage, tmp_path, monkeypatch):
+    """The placement gate is fail-closed: junk never turns the feature ON."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {"home_category": {"enabled": garbage}}})
+    assert settings.home_category.enabled is False
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (True, True), (False, False), ("true", True), ("on", True), ("no", False), ("off", False),
+])
+def test_reader_home_category_enabled_honors_bool_and_scalar_words(raw, expected, tmp_path, monkeypatch):
+    """YAML bools and the scalar words `hermes config set` recognizes are honored."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    settings = concierge_settings({"concierge": {"home_category": {"enabled": raw}}})
+    assert settings.home_category.enabled is expected
+
+
+def test_new_keys_roundtrip_through_effective_loader(tmp_path, monkeypatch):
+    """Loader-backed invariant (hermes_cli/AGENTS.md): prove the real
+    config.yaml -> load_user_config_effective -> concierge_settings roundtrip.
+    The effective loader adds NO defaults, so an absent key is filled in by the
+    reader with its conservative DEFAULT_CONFIG value."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (home / "config.yaml").write_text(
+        "concierge:\n"
+        "  home_category:\n"
+        "    enabled: true\n"
+        "    visibility: public\n"
+        "  threading:\n"
+        "    mode: always\n",
+        encoding="utf-8",
+    )
+    from hermes_cli.config_effective import load_user_config_effective
+
+    effective = load_user_config_effective(home / "config.yaml")
+    settings = concierge_settings(effective)
+    assert settings.home_category.enabled is True
+    assert settings.home_category.visibility == "public"
+    assert settings.home_category.general_channel == "general"  # absent -> reader default
+    assert settings.home_category.unbound_scope == "managed"    # absent -> reader default
+    assert settings.threading.mode == "always"

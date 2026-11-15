@@ -16,6 +16,7 @@ logged, and the registry starts empty. Shape:
          "created_at": "..."}},
      "users": {"<discord_user_id>": {
          "orchestrator": "bot-orchestrator-a1b2",
+         "home_category": "<category_id or null>",
          "home_channel": "<channel_id or null>", "guild_id": "<guild or null>",
          "created": "...",
          "workers": {"<blueprint_key>": "bot-researcher-c3d4"}}}}
@@ -73,6 +74,7 @@ __all__ = [
     "create_room",
     "get_binding",
     "get_user",
+    "home_category_for_user",
     "home_channel_for_user",
     "list_bindings",
     "list_users",
@@ -610,7 +612,7 @@ def mark_connections_nudged(channel_id: str, kinds) -> list[str]:
 
 # The scalar fields update_user may merge (closed set: a typo'd field must
 # surface, not silently drop the update the caller thought they made).
-_USER_MUTABLE_FIELDS = ("home_channel", "guild_id")
+_USER_MUTABLE_FIELDS = ("home_channel", "guild_id", "home_category")
 
 
 def _require_profile_string(value, label: str) -> None:
@@ -643,6 +645,11 @@ def _normalize_user_entry(entry: dict) -> dict:
     normalized = dict(entry)
     workers = normalized.get("workers")
     normalized["workers"] = dict(workers) if isinstance(workers, dict) else {}
+    home_category = normalized.get("home_category")
+    if isinstance(home_category, str) and home_category.strip():
+        normalized["home_category"] = home_category
+    else:
+        normalized["home_category"] = None
     home_channel = normalized.get("home_channel")
     normalized["home_channel"] = (home_channel
                                   if isinstance(home_channel, str)
@@ -655,7 +662,8 @@ def _normalize_user_entry(entry: dict) -> dict:
 
 def set_user(user_id, *, orchestrator: str,
              home_channel: Optional[str] = None,
-             guild_id: Optional[str] = None) -> dict:
+             guild_id: Optional[str] = None,
+             home_category: Optional[str] = None) -> dict:
     """Record (or confirm) a user's orchestrator profile; returns the entry.
 
     Idempotent create-or-return-existing, mirroring create_bot: when the
@@ -663,8 +671,9 @@ def set_user(user_id, *, orchestrator: str,
     entry is returned annotated ``already_provisioned: True`` — response
     metadata only, never persisted, so a caller can tell "created just now"
     from "was already there". On that idempotent path, differing
-    ``home_channel``/``guild_id`` args are intentionally ignored — the
-    stored entry wins (only a DIFFERENT orchestrator profile is a
+    ``home_channel``/``guild_id``/``home_category`` args are
+    intentionally ignored — the stored entry wins (only a DIFFERENT
+    orchestrator profile is a
     reprovision; new scalar values never are). A DIFFERENT orchestrator
     profile overwrites the whole entry (reprovision parity with
     bind_channel's rebind-overwrite: the old orchestrator is being
@@ -673,6 +682,7 @@ def set_user(user_id, *, orchestrator: str,
     _require_profile_string(orchestrator, "orchestrator profile")
     _require_optional_channel(home_channel, "home_channel")
     _require_optional_channel(guild_id, "guild_id")
+    _require_optional_channel(home_category, "home_category")
     uid = str(user_id)
     with _registry_lock():
         reg = load_registry()
@@ -686,6 +696,7 @@ def set_user(user_id, *, orchestrator: str,
             normalized["already_provisioned"] = True
             return normalized
         entry = {"orchestrator": orchestrator,
+                 "home_category": home_category,
                  "home_channel": home_channel,
                  "guild_id": guild_id,
                  "created": _hermes_now().isoformat(),
@@ -703,8 +714,9 @@ def get_user(user_id) -> Optional[dict]:
 
 def update_user(user_id, **fields) -> Optional[dict]:
     """Merge-update the user's known scalar fields (``home_channel``,
-    ``guild_id``); returns the updated entry. A no-op returning None when
-    the user entry does not exist — an update never resurrects a removed
+    ``guild_id``, ``home_category``); returns the updated entry. A no-op
+    returning None when the user entry does not exist — an update never
+    resurrects a removed
     user (a retire can race the update). Unknown field names raise
     ValueError: a typo'd field must surface, not silently vanish."""
     unknown = [k for k in fields if k not in _USER_MUTABLE_FIELDS]
@@ -733,6 +745,16 @@ def orchestrator_for_user(user_id) -> Optional[str]:
     orchestrator = entry.get("orchestrator")
     return (orchestrator if isinstance(orchestrator, str)
             and orchestrator.strip() else None)
+
+
+def home_category_for_user(user_id) -> Optional[str]:
+    """The user's home category id, or None (never bound / junk)."""
+    entry = _user_entry(load_registry(), user_id)
+    if entry is None:
+        return None
+    home_category = entry.get("home_category")
+    return (home_category if isinstance(home_category, str)
+            and home_category.strip() else None)
 
 
 def home_channel_for_user(user_id) -> Optional[str]:
@@ -790,16 +812,18 @@ def set_user_worker(user_id, blueprint_key, profile) -> Optional[dict]:
 
 def clear_orchestrator(user_id) -> bool:
     """Clear the user entry's ``orchestrator`` and ``home_channel`` fields —
-    and ONLY those: ``workers``/``guild_id``/``created`` survive. This is the
-    TARGETED clear the retire paths take when a user's orchestrator profile
+    and ONLY those: ``workers``/``guild_id``/``created`` and the durable
+    ``home_category`` anchor survive. This is the TARGETED clear the retire
+    paths take when a user's orchestrator profile
     goes away: the worker PROFILES stay alive (a retired or swapped
     orchestrator is not a retired worker set), so wiping their records — as a
     whole-entry remove_user would — is the exact double-build the user-keyed
     idempotence exists to prevent. The home channel goes with the
     orchestrator because it routed that orchestrator's ingress.
 
-    When the cleared entry would have neither an orchestrator nor workers,
-    it is removed entirely — no empty shells in the file. True when an entry
+    When the cleared entry has neither an orchestrator, workers, nor a
+    home_category, it is removed entirely — no empty shells in the file.
+    True when an entry
     existed and was modified (the removed-empty-shell case counts); False
     when there was nothing to clear (no entry, or a workers-only entry)."""
     uid = str(user_id)
@@ -809,14 +833,19 @@ def clear_orchestrator(user_id) -> bool:
         if entry is None:
             return False
         workers = entry.get("workers")
-        if not (isinstance(workers, dict) and workers):
-            # No orchestrator, no (tolerantly-read) workers: removing the
-            # entry entirely IS the clear.
+        home_category = entry.get("home_category")
+        has_category = (isinstance(home_category, str)
+                        and bool(home_category.strip()))
+        if (not (isinstance(workers, dict) and workers)
+                and not has_category):
+            # No orchestrator, no (tolerantly-read) workers, and no durable
+            # home_category: removing the entry entirely IS the clear. A
+            # hand-edited junk home_category does not count as an anchor.
             del reg["users"][uid]
             _save(reg)
             return True
         if "orchestrator" not in entry and "home_channel" not in entry:
-            return False  # workers-only entry: nothing orchestrator-shaped
+            return False  # nothing orchestrator-shaped to clear
         entry.pop("orchestrator", None)
         entry.pop("home_channel", None)
         _save(reg)

@@ -63,7 +63,8 @@ def enforcement(repo: Path, rev: str) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="code_health", description=__doc__)
-    p.add_argument("--base", help="base revision (default: merge-base of HEAD with origin/main)")
+    p.add_argument("--base", help="base revision (default: newest common ancestor of HEAD with the"
+                   " fork's main refs; see scripts/code_health/gitio.py DEFAULT_BASE_REFS)")
     p.add_argument("--head", help="head commit or tree (default: the working tree, untracked included)")
     p.add_argument("--report", action="store_true", help="burn-down summary of the whole head tree")
     p.add_argument("--json", action="store_true", help="machine-readable findings")

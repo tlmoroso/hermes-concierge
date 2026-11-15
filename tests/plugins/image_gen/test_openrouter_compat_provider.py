@@ -785,11 +785,18 @@ class TestImageApiSurface:
         assert "_retryable" not in result
 
     def test_catalog_models_are_offered_only_by_openrouter(self):
+        """The curated Image API models are surfaced by the OpenRouter picker (which owns the
+        dedicated /images route) and never by the chat-only Nous picker. This is a capability
+        relationship between our two providers' static catalogs — NOT a snapshot of OpenRouter's
+        live /models listing, whose ids drift on every upstream refresh (tests/AGENTS.md bans
+        change-detector tests). A live probe would re-introduce that drift, so resolve both
+        pickers from their offline tables."""
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
         by_name = {p.name: p for p in _build_providers()}
-        openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
-        nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+        with patch("requests.get", side_effect=OSError("catalog unavailable")):
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
 

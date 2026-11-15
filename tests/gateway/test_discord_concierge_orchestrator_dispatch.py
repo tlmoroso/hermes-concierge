@@ -804,3 +804,178 @@ def test_cancelled_queued_driver_releases_its_task_dict_entry(rig):
         lock.release()
 
     _run(_scenario())
+
+
+# ── (6) Home-category placement of NEW worker channels (home-category G) ─────
+#
+# A recorded ``home_category`` is the durable, per-user placement authority:
+# a NEW worker channel is created THERE, not in whichever category the request
+# was typed in. Reuse of an existing bound channel still wins outright, and a
+# missing/None/unresolvable pointer falls through to today's trigger-category
+# rule. These tests drive the FULL dispatch exchange (same rig as §1) and spy
+# on the create helper's ``category_id`` decision while still running the REAL
+# helper, so the whole exchange completes unchanged.
+
+HOME_CATEGORY = 9000          # a per-user home category, distinct from CATEGORY
+
+
+def _place_home_category(rig, monkeypatch, *, value, seen=None):
+    """Record the user's home_category via the registry accessor the dispatch
+    reads (card B's addition, stubbed here so this suite stays green whether
+    or not that card has landed on the shared tree), and register a stand-in
+    category object so the REAL ``_concierge_create_channel`` resolves it into
+    the ``create_text_channel(category=...)`` kwarg."""
+    rig.channels[str(HOME_CATEGORY)] = _FakeChannel(HOME_CATEGORY)
+
+    def _read(uid):
+        if seen is not None:
+            seen.append(uid)
+        return value
+
+    monkeypatch.setattr(registry, "home_category_for_user", _read,
+                        raising=False)
+
+
+def _spy_create_channel(rig, monkeypatch):
+    """Record the placement decision while still running the REAL create
+    helper, so everything downstream (binding, handoff, worker turn, phase B)
+    behaves exactly as in production."""
+    calls = []
+    original = rig.adapter._concierge_create_channel
+
+    async def _spy(*, guild_id, category_id, name):
+        calls.append({"guild_id": guild_id, "category_id": category_id,
+                      "name": name})
+        return await original(guild_id=guild_id, category_id=category_id,
+                              name=name)
+
+    monkeypatch.setattr(rig.adapter, "_concierge_create_channel", _spy)
+    return calls
+
+
+def _dispatch_for_placement(rig, monkeypatch, *, home_category, seen=None):
+    """The §1 rig, plus a home_category pointer and a create-helper spy."""
+    _seed(rig)
+    _place_home_category(rig, monkeypatch, value=home_category, seen=seen)
+    provision_calls = []
+    _fake_provision(rig, monkeypatch, provision_calls)
+    _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(
+        rig, calls, {ORCH: DIRECTIVE, WORKER_PROFILE: WORKER_ANSWER})
+    create_calls = _spy_create_channel(rig, monkeypatch)
+    return SimpleNamespace(provision_calls=provision_calls, calls=calls,
+                           create_calls=create_calls)
+
+
+def test_new_worker_channel_placed_in_home_category(rig, monkeypatch):
+    """ACCEPT (public category): a dispatch typed in a public (non-home)
+    category, with a home_category recorded, creates the NEW worker channel
+    INSIDE the home category — not the trigger's category."""
+    s = _dispatch_for_placement(
+        rig, monkeypatch, home_category=str(HOME_CATEGORY))
+
+    _drive(rig, _trigger(rig))  # the trigger channel sits in CATEGORY (public)
+
+    assert len(s.create_calls) == 1
+    assert s.create_calls[0]["category_id"] == str(HOME_CATEGORY)
+    # ...and the REAL create helper handed that category to Discord.
+    category = rig.guild.create_text_channel.await_args.kwargs.get("category")
+    assert category is not None and category.id == HOME_CATEGORY
+    # the channel was created + bound, and the dispatch did not fail
+    assert registry.get_binding(str(WORKER_CHANNEL))["profile"] == WORKER_PROFILE
+    assert "⚠ dispatch failed" not in rig.channels[str(HOME)].sends
+
+
+def test_dispatch_from_thread_places_in_home_category(rig, monkeypatch):
+    """ACCEPT (thread / §5.3): a dispatch triggered from inside a THREAD still
+    lands in the home category. The thread's raw channel exposes NO resolvable
+    category, so with a home_category recorded the placement stops depending
+    on the trigger event at all — the routing fix's payoff."""
+    s = _dispatch_for_placement(
+        rig, monkeypatch, home_category=str(HOME_CATEGORY))
+
+    class _ThreadChannel(_FakeChannel):
+        # A thread carries its parent id; its raw channel has NO resolvable
+        # category (duck-typed ``category_id`` is None) — the §5.3 defect.
+        # Routing (card E) re-homes it to the author's orchestrator; here the
+        # trigger's chat_id is already bound, so only placement is at issue.
+        parent_id = HOME
+
+    rig.channels[str(HOME)] = _ThreadChannel(HOME)  # no category -> None
+    trigger = _trigger(rig)
+
+    _drive(rig, trigger)
+
+    assert len(s.create_calls) == 1
+    assert s.create_calls[0]["category_id"] == str(HOME_CATEGORY)
+    assert registry.get_binding(str(WORKER_CHANNEL))["profile"] == WORKER_PROFILE
+    assert "⚠ dispatch failed" not in rig.channels[str(HOME)].sends
+    # the whole exchange still completed from the thread trigger
+    assert any(getattr(c.source, "profile", None) == WORKER_PROFILE
+               for c in s.calls)
+
+
+def test_existing_worker_channel_is_reused_not_rehomed(rig, monkeypatch):
+    """ACCEPT (reuse wins): a worker channel provisioned BEFORE home
+    categories existed is reused unchanged, wherever it lives. A home_category
+    is recorded, but no NEW channel is created (so it is never placed there),
+    and the home_category accessor is not even consulted."""
+    seen = []
+    s = _dispatch_for_placement(
+        rig, monkeypatch, home_category=str(HOME_CATEGORY), seen=seen)
+
+    # pre-existing worker + bound channel (a pre-home-category provision)
+    registry.set_user_worker(USER, WORKER_KEY, WORKER_PROFILE)
+    registry.bind_channel(str(WORKER_CHANNEL), profile=WORKER_PROFILE,
+                          blueprint=WORKER_KEY, guild_id=str(GUILD))
+    rig.channels[str(WORKER_CHANNEL)] = _FakeChannel(WORKER_CHANNEL)
+
+    _drive(rig, _trigger(rig))
+
+    # reuse wins: NO new channel, NO provisioning, accessor never consulted
+    assert s.create_calls == []
+    assert rig.guild.create_text_channel.await_count == 0
+    assert s.provision_calls == []
+    assert seen == []
+    binding = registry.get_binding(str(WORKER_CHANNEL))
+    assert binding["profile"] == WORKER_PROFILE  # unchanged
+    # the exchange ran on the EXISTING channel
+    assert any(getattr(c.source, "profile", None) == WORKER_PROFILE
+               and c.source.chat_id == str(WORKER_CHANNEL)
+               for c in s.calls)
+
+
+def test_no_home_category_keeps_todays_placement(rig, monkeypatch):
+    """ACCEPT (fall-through): no recorded home_category -> byte-for-byte
+    today's placement (the trigger channel's category), with no raise."""
+    s = _dispatch_for_placement(rig, monkeypatch, home_category=None)
+
+    _drive(rig, _trigger(rig))  # trigger channel in CATEGORY (777)
+
+    assert len(s.create_calls) == 1
+    assert s.create_calls[0]["category_id"] == str(CATEGORY)
+    assert registry.get_binding(str(WORKER_CHANNEL))["profile"] == WORKER_PROFILE
+    assert "⚠ dispatch failed" not in rig.channels[str(HOME)].sends
+
+
+def test_missing_home_category_accessor_never_raises(rig, monkeypatch):
+    """ACCEPT (no raise, defensive): even when the registry has NO
+    home_category accessor at all (the pre-feature tree, before the sibling
+    registry card is integrated), dispatch degrades to today's placement and
+    does not raise."""
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(
+        rig, calls, {ORCH: DIRECTIVE, WORKER_PROFILE: WORKER_ANSWER})
+    create_calls = _spy_create_channel(rig, monkeypatch)
+    monkeypatch.delattr(registry, "home_category_for_user", raising=False)
+
+    _drive(rig, _trigger(rig))
+
+    assert len(create_calls) == 1
+    assert create_calls[0]["category_id"] == str(CATEGORY)
+    assert registry.get_binding(str(WORKER_CHANNEL))["profile"] == WORKER_PROFILE
+    assert "⚠ dispatch failed" not in rig.channels[str(HOME)].sends

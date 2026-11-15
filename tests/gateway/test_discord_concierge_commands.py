@@ -207,9 +207,9 @@ def test_enabled_registers_bot_group_subcommands(rig):
     """Pin the CURRENT registered surface of ``_concierge_register_slash``
     (read from the live registration code, not from history): the tree gains
     the /bot group, the /room group (Task 7.4), then top-level /connect
-    (Task 8.2). The /bot group's children are the five subcommands it
-    registers — new, list, memory (Task 9.2), retire, category (the
-    private-category admin command) — sorted below."""
+    (Task 8.2). The /bot group's children are the six subcommands it
+    registers — new, list, memory (Task 9.2), retire, category, space
+    (the two admin commands) — sorted below."""
     class _Tree:
         def __init__(self):
             self.commands = []
@@ -224,7 +224,7 @@ def test_enabled_registers_bot_group_subcommands(rig):
     group = t.commands[0]
     assert group.name == "bot"
     assert sorted(c.name for c in group._children.values()) == [
-        "category", "list", "memory", "new", "retire"]
+        "category", "list", "memory", "new", "retire", "space"]
     connect = t.commands[2]
     assert connect.name == "connect"
 

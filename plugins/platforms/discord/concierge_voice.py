@@ -276,6 +276,18 @@ class ConciergeVoiceMixin:
                 "instead — re-provision or repair the users entry",
                 getattr(self, "name", "discord"), user_id, orchestrator)
             return
+        # Card J (§6): a recorded home category Discord deleted (or that
+        # cannot be checked) degrades quietly, warn ONCE per user. Reuse THIS
+        # registry read (no second load); never create a category, never
+        # bootstrap a second orchestrator. Fail-closed: a reconciliation
+        # error must never break the orchestrator stamp / routing.
+        try:
+            self._concierge_resolve_home_category(user_id, reg=reg)
+        except Exception:
+            logger.debug(
+                "[%s] Concierge: home-category reconciliation failed; "
+                "routing proceeds unchanged",
+                getattr(self, "name", "discord"), exc_info=True)
         setattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, orchestrator)
         logger.debug(
             "[%s] Concierge: unbound channel %s stamped for the author's "

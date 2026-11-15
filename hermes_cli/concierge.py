@@ -48,6 +48,24 @@ T7 (orchestrator redesign) encoded here:
   profile``) — a channel-less bot has no binding, so the per-profile
   bindings section (unchanged) can never list it. ``bindings`` stays the
   flat channel table (design §7 says so explicitly).
+
+Card I (home-category CLI, HOME_CATEGORY_DESIGN §3.2) encoded here:
+- ``new orchestrator --user X`` gains ``--category <id>`` (bind to an
+  EXISTING category) and ``--public`` (create a shared public one named
+  by ``--name``). Both are legal ONLY with ``--user`` — ``--category`` +
+  ``--channel`` and ``--category`` without ``--user`` are refused with a
+  short operator message + exit 1; the ``--channel``/``--user`` target rule
+  is unchanged.
+- Home-space mode delegates the NON-DISCORD tail to ONE shared pure helper,
+  ``concierge.home_space.provision_home_space`` (the SAME helper card H's
+  ``/bot category`` / ``/bot space`` admin surface calls): ensure the
+  orchestrator (provision only when the user has none), record
+  ``home_category`` + ``home_channel`` + ``guild_id``, then ``bind_channel``
+  LAST. The CLI owns NO provisioning/registry logic of its own. The
+  general-channel name comes from the shared ``home_general_channel_name``
+  (card-A config-driven, default ``general``). Discord object ids come from
+  ``_create_home_space_channel`` (the CLI's single Discord seam; offline it
+  records deterministic ids the runtime reconciles, design §6).
 """
 
 from __future__ import annotations
@@ -82,6 +100,28 @@ def _cmd_new(args) -> int:
     # message instead of argparse's bare usage error.
     channel_id = str(args.channel) if args.channel is not None else None
     user_id = str(args.user) if args.user is not None else None
+    category_id = (str(args.category)
+                   if getattr(args, "category", None) is not None else None)
+    public = bool(getattr(args, "public", False))
+    # Home-space flags (--category / --public) are legal ONLY with --user:
+    # --category binds an EXISTING category for that user, --public creates a
+    # shared one. These are operator-actionable refusals BEFORE any provision.
+    # --channel + --user together remains legal, as before. --category + --channel
+    # is explicitly refused (checked first: it also lacks --user).
+    if category_id is not None and channel_id is not None:
+        print("Error: --category cannot be used with --channel — it belongs "
+              "with --user <discord-user-id> to place the orchestrator's home "
+              "space. Use --channel alone for a channel-bound bot.")
+        return 1
+    if category_id is not None and user_id is None:
+        print("Error: --category needs a --user <discord-user-id> — it binds "
+              "an existing home category for that user and cannot stand alone.")
+        return 1
+    if public and user_id is None:
+        print("Error: --public needs a --user <discord-user-id> — it creates "
+              "a shared public home category for that user.")
+        return 1
+    # The neither-flag refusal stays the operator-actionable fallback (T7).
     if channel_id is None and user_id is None:
         print("Error: a target is required: pass --channel <channel-id> "
               "(channel-bound bot) or --user <discord-user-id> "
@@ -95,6 +135,16 @@ def _cmd_new(args) -> int:
         category_id=None,
         default_group=settings.default_provider_group,
     )
+
+    # Home-space mode: delegate to the SAME provisioning + registry helpers
+    # the /bot category + /bot space admin surface (card H) uses. The CLI owns
+    # NO provisioning logic of its own — it calls provision.create_bot and the
+    # registry writers below, it never re-implements them.
+    if category_id is not None or public:
+        return _cmd_new_home_space(
+            args, user_id=user_id, guild_id=args.guild, group=group,
+            category_id=category_id, public=public, settings=settings)
+
     try:
         result = provision.create_bot(
             args.blueprint,
@@ -149,6 +199,108 @@ def _cmd_new(args) -> int:
         else:
             print("  Home channel: personal channel is created on first "
                   "Discord contact")
+    print()
+    return 0
+
+
+def _create_home_space_channel(*, user_id, guild_id, category_id, name,
+                               public, general_channel_name):
+    """The CLI's single Discord-facing seam for a home space.
+
+    A home space is a Discord CATEGORY plus its GENERAL channel. In a live
+    deployment (hub gateway present) this delegates to the very same channel /
+    category creation path the ``/bot category`` and ``/bot space`` admin
+    commands use (card H) and returns the REAL Discord ids. The operator CLI
+    runs offline (no gateway), so by default it records stable, deterministic
+    ids that the runtime reconciles against Discord (design §6); a test or an
+    embedding deployment can monkeypatch this function to inject real ids. The
+    CLI itself never issues Discord API calls — it only ever works with id
+    strings, exactly as ``provision.create_bot`` does.
+    """
+    import hashlib
+
+    def _offline_id(kind, *parts):
+        seed = ":".join(str(p) for p in (kind, user_id, guild_id, *parts))
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+        return str(int(digest[:16], 16))
+
+    visibility = "public" if public else "private"
+    if public:
+        # A shared space is named by the operator-supplied topic, never by a
+        # user's display name (§12.5). --category, when also supplied, names an
+        # EXISTING public category; otherwise a new one is created.
+        space_name = (str(name).strip() if name else "") or f"shared-{user_id}"
+        cat_id = (str(category_id) if category_id is not None
+                  else _offline_id("category", space_name))
+    else:
+        # A single-user category is private by implication; --category is the
+        # id of the EXISTING category to place the general channel inside.
+        cat_id = str(category_id)
+        space_name = (str(name).strip() if name else "") or cat_id
+    general_id = _offline_id("channel", cat_id, general_channel_name)
+    return {"category_id": cat_id, "channel_id": general_id,
+            "name": space_name, "visibility": visibility,
+            "general_channel_name": general_channel_name}
+
+
+def _cmd_new_home_space(args, *, user_id, guild_id, group, category_id,
+                        public, settings) -> int:
+    """``new orchestrator --user X`` with ``--category <id>`` / ``--public``.
+
+    Establishes the user's home space. The Discord-facing part (resolving /
+    creating the category + its general channel) is the CLI's single seam
+    ``_create_home_space_channel``; everything NON-DISCORD — ensure the
+    orchestrator, record ``home_category`` + ``home_channel`` + ``guild_id``,
+    ``bind_channel`` LAST — is delegated to the ONE shared pure helper
+    ``concierge.home_space.provision_home_space`` that the ``/bot category`` /
+    ``/bot space`` admin surface (card H) also calls. The CLI owns NO
+    provisioning or registry logic of its own (operator decision 2026-11-14).
+    """
+    from concierge.blueprints import get_blueprint
+    from concierge.home_space import (
+        HomeSpaceError, home_general_channel_name, provision_home_space,
+    )
+
+    # ONE pure function decides the HOME-space general-channel name (card-A
+    # config-driven, default ``general``) — the same function the mixin's
+    # single naming authority calls.
+    general_channel_name = home_general_channel_name(settings)
+
+    # 1) resolve/create the category + its general channel (single seam).
+    space = _create_home_space_channel(
+        user_id=user_id, guild_id=guild_id, category_id=category_id,
+        name=args.name, public=public,
+        general_channel_name=general_channel_name)
+    cat_id = space["category_id"]
+    general_id = space["channel_id"]
+
+    # 2) the shared, non-Discord tail: ensure-orchestrator -> record the FULL
+    #    triple -> bind_channel LAST. Both lanes call this ONE helper.
+    try:
+        result = provision_home_space(
+            user_id=user_id, guild_id=guild_id,
+            home_channel=general_id, home_category=cat_id,
+            blueprint=args.blueprint,
+            provider_group=group, display_name=args.name)
+    except HomeSpaceError as exc:
+        print(f"Error: {exc}")
+        return 1
+    profile = result["profile"]
+    already = bool(result["already_provisioned"])
+
+    # Report — always carries BOTH ids, the visibility, and the space name.
+    bp = get_blueprint(args.blueprint)
+    header = "Already provisioned" if already else "Created Concierge bot"
+    print(f"\n  {header}: {bp.title}")
+    print(f"  Profile: {profile}")
+    print(f"  User: {user_id}")
+    print(f"  Blueprint: {bp.key}")
+    print(f"  Home category: {cat_id} ({space['visibility']}, "
+          f"name '{space['name']}')")
+    print(f"  General channel: {general_id} "
+          f"(name '{general_channel_name}')")
+    if guild_id is not None:
+        print(f"  Guild: {guild_id}")
     print()
     return 0
 

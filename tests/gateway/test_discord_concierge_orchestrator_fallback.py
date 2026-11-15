@@ -863,3 +863,720 @@ def test_room_channel_is_never_admitted_via_the_users_branch(concierge_rig):
     source.profile = ORCH  # the author's orchestrator, NOT a room member
 
     assert rig.adapter._concierge_dynamic_runtime_profile(source, {}) is None
+
+
+# ── Card F: general channel in the user's home category + record it ──────────
+
+HOME_CATEGORY = "4242"   # a recorded home category, distinct from the trigger's
+
+
+def _enable_home_category_field(monkeypatch):
+    """Card B adds ``home_category`` to the registry's writable fields.
+    Emulate JUST that write-side contract so card F's bootstrap can be tested
+    against the registry BEFORE B lands — and pass unchanged AFTER it does:
+    when B is present the field is already in the tuple, so this is a no-op.
+    Reads are tolerant of the raw key with or without B's normalization."""
+    fields = registry._USER_MUTABLE_FIELDS
+    if "home_category" not in fields:
+        monkeypatch.setattr(registry, "_USER_MUTABLE_FIELDS",
+                            tuple(fields) + ("home_category",))
+
+
+def _seed_home_category(user_id, category_id):
+    """The post-``clear_orchestrator`` first-contact state: a users entry
+    carrying a durable ``home_category`` but NO orchestrator (card B keeps
+    the category when an orchestrator is cleared). Written raw so the setup
+    does not depend on card B's ``set_user`` signature."""
+    reg = registry.load_registry()
+    reg.setdefault("users", {})[str(user_id)] = {
+        "home_category": str(category_id),
+        "created": "2026-01-01T00:00:00",
+    }
+    registry._save(reg)
+
+
+def test_bootstrap_places_general_channel_in_recorded_home_category(
+        concierge_rig, monkeypatch):
+    """THE card-F contract: with a recorded home_category, the general channel
+    is created THERE, not in the trigger channel's category — and BOTH ids are
+    recorded, the binding written last. The trigger channel stays the hub's."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _seed_home_category("u1", HOME_CATEGORY)  # first contact: no orchestrator
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    provision_calls = _recording_provision(monkeypatch, rig)
+    fakes = _fake_discord_client(rig)
+    channel = _RecordingChannel(category_id=MANAGED_CATEGORY)  # trigger
+
+    _run_dispatch(rig.adapter, _orch_event(
+        rig.adapter, channel=channel, user_name="Alice"))
+
+    # triggering message answered as the HUB (bootstrap is a background task)
+    dispatched = [e for e in order if e[0] == "dispatch"]
+    assert [e[2] for e in dispatched] == [None]
+    assert len(provision_calls) == 1  # provisioned once, user-keyed
+    # the general channel: orchestrator-slug name, in the HOME category (NOT
+    # the trigger channel's managed category)
+    assert len(fakes.created) == 1
+    assert fakes.created[0]["name"] == "orchestrator-alice"
+    created_category = fakes.created[0].get("category")
+    assert str(getattr(created_category, "id", "")) == HOME_CATEGORY
+    # BOTH ids recorded in the registry
+    entry = registry.get_user("u1")
+    assert entry["home_channel"] == HOME_CHANNEL
+    assert entry["home_category"] == HOME_CATEGORY
+    binding = registry.get_binding(HOME_CHANNEL)
+    assert binding["profile"] == ORCH
+    assert binding["blueprint"] == "orchestrator"
+    # greeting in the home + one-line pointer in the trigger channel
+    assert len(fakes.home.sent) == 1 and fakes.home.sent[0]
+    assert len(channel.sent) == 1 and f"<#{HOME_CHANNEL}>" in channel.sent[0]
+    assert not getattr(rig.adapter, "_concierge_bootstrap_inflight", set())
+
+
+def test_bootstrap_without_home_category_keeps_trigger_category_and_no_warning(
+        concierge_rig, monkeypatch, caplog):
+    """No recorded home_category → today's behavior: the general channel is
+    created in the trigger channel's category, home_channel is recorded, NO
+    home_category is invented and NO warning is emitted."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, [])
+    _recording_provision(monkeypatch, rig)
+    fakes = _fake_discord_client(rig)
+    channel = _RecordingChannel(category_id=MANAGED_CATEGORY)
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel, user_name="Alice"))
+        assert len(fakes.created) == 1
+        created_category = fakes.created[0].get("category")
+        assert str(getattr(created_category, "id", "")) == MANAGED_CATEGORY
+        entry = registry.get_user("u1")
+        assert entry["home_channel"] == HOME_CHANNEL
+        assert entry.get("home_category") in (None, "")  # today's behavior
+        assert registry.get_binding(HOME_CHANNEL)["profile"] == ORCH
+        # no reconciliation-style home-category warning on the fallback path
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno >= logging.WARNING]
+        assert not any("home category" in w.lower() for w in warnings)
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_bootstrap_registry_write_order_binding_is_last(
+        concierge_rig, monkeypatch):
+    """documented order (design §3.1 step 4): home_category + home_channel
+    are recorded in ONE update FIRST, bind_channel is written LAST — nothing
+    routes to the new channel until the binding lands."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _seed_home_category("u1", HOME_CATEGORY)
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, [])
+    _recording_provision(monkeypatch, rig)
+    _fake_discord_client(rig)
+    channel = _RecordingChannel(category_id=MANAGED_CATEGORY)
+
+    writes = []
+    real_update = registry.update_user
+    real_bind = registry.bind_channel
+
+    def _rec_update(*args, **kwargs):
+        writes.append(("update_user", dict(kwargs)))
+        return real_update(*args, **kwargs)
+
+    def _rec_bind(*args, **kwargs):
+        writes.append(("bind_channel", dict(kwargs)))
+        return real_bind(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "update_user", _rec_update)
+    monkeypatch.setattr(registry, "bind_channel", _rec_bind)
+
+    _run_dispatch(rig.adapter, _orch_event(
+        rig.adapter, channel=channel, user_name="Alice"))
+
+    assert [w[0] for w in writes] == ["update_user", "bind_channel"]
+    assert writes[0][1]["home_category"] == HOME_CATEGORY
+    assert writes[0][1]["home_channel"] == HOME_CHANNEL
+    assert writes[1][1]["profile"] == ORCH
+    assert writes[1][1]["blueprint"] == "orchestrator"
+
+
+# ── Card J: reconciliation of a deleted / unresolvable home category (§6) ──
+#
+# A recorded ``home_category`` is a durable pointer Discord can invalidate out
+# from under us (manual delete) or that a liveness lookup can fail to check
+# (EACCES / EIO / a stalled mount). These tests pin the §6 contract through
+# the REAL rig: the pure classifier, the SHARED mixin reader/helper, and full
+# runner-seam dispatches that must degrade quietly — hub fallback, ONE warning
+# per user, no auto-recreated category, no second orchestrator, no provision
+# over the fault, and byte-for-byte today's behavior when no pointer exists.
+
+JHOME_CATEGORY = "4242"   # a recorded home category (also used by card F)
+
+
+def _j_live_object():
+    return SimpleNamespace(id=JHOME_CATEGORY)
+
+
+def _j_client(rig, home_category, resolution, created=None):
+    """Duck-typed hub client whose ``get_channel`` resolves the recorded
+    home-category id to ``resolution``:
+
+      * a real object                -> ``live``
+      * ``None``                     -> ``ghost`` (Discord deleted it)
+      * an exception instance        -> ``stat_error`` (EACCES / EIO / ...)
+
+    Every OTHER id resolves to a plain category object, and ANY Discord
+    category / text-channel CREATION is recorded so a test can assert that a
+    routing decision never silently rebuilds an admin-created space.
+    """
+    if created is None:
+        created = {"categories": [], "text": []}
+    hc = str(home_category)
+
+    def _get_channel(cid):
+        if str(cid) == hc:
+            if isinstance(resolution, BaseException):
+                raise resolution
+            return resolution          # object or None
+        return SimpleNamespace(id=str(cid))
+
+    class _Guild:
+        async def create_category(self, *a, **kw):
+            created["categories"].append(kw)
+            return SimpleNamespace(id="77777")
+
+        async def create_text_channel(self, *a, **kw):
+            created["text"].append(kw)
+            return SimpleNamespace(id=HOME_CHANNEL)
+
+    guild = _Guild()
+    rig.adapter._client = SimpleNamespace(
+        get_channel=_get_channel, get_guild=lambda _i: guild,
+        guilds=[guild])
+    return created
+
+
+def _give_user_live_home_category(root, user_id, category_id, profile=ORCH):
+    """A user with a LIVE orchestrator AND a recorded home_category — the
+    steady state §6 reconciles. Written raw so the setup is independent of
+    card B's ``set_user`` signature (which has landed on the shared tree)."""
+    _give_user_orchestrator(root, user_id, profile)
+    reg = registry.load_registry()
+    reg["users"][str(user_id)]["home_category"] = str(category_id)
+    registry._save(reg)
+
+
+def _j_home_warnings(caplog):
+    """The warn-once, per-user home-category reconciliation WARNING lines."""
+    return [r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "home category" in r.getMessage().lower()]
+
+
+def _j_recorded_pointer(user_id="u1"):
+    reg = registry.load_registry()
+    entry = reg.get("users", {}).get(str(user_id), {})
+    return entry.get("home_category") if isinstance(entry, dict) else None
+
+
+# ── The pure classifier (single source of truth for the four postures) ─────
+
+
+def test_home_category_pure_posture_matrix():
+    """The bootstrap's EXACT vocabulary — live / ghost / stat_error /
+    first_contact — and nothing else. Never raises, never creates, and a
+    ``first_contact`` (no pointer) must NOT even call the resolver."""
+    from concierge import home_category as hc
+
+    assert hc.POSTURES == ("live", "ghost", "stat_error", "first_contact")
+
+    # tolerant read of a hand-edited pointer
+    assert hc.read_home_category(None) is None
+    assert hc.read_home_category(123) is None
+    assert hc.read_home_category("   ") is None
+    assert hc.read_home_category(" 4242 ") == "4242"
+
+    called = []
+
+    def _resolver(cid):
+        called.append(cid)
+        return object()
+
+    assert hc.classify_home_category(None, _resolver) == (None, "first_contact")
+    assert hc.classify_home_category(5, _resolver) == (None, "first_contact")
+    assert called == []                      # no lookup, no I/O on first contact
+
+    assert hc.classify_home_category(
+        "4242", lambda c: object()) == ("4242", "live")
+    assert hc.classify_home_category(
+        "4242", lambda c: None) == ("4242", "ghost")
+
+    def _stat(cid):
+        raise OSError(13, "EACCES")
+
+    assert hc.classify_home_category(
+        "4242", _stat) == ("4242", "stat_error")
+
+    # an unavailable liveness oracle is NOT an incident: adopt, never degrade
+    assert hc.classify_home_category(
+        "4242", lambda c: hc.UNCHECKABLE) == ("4242", "live")
+    assert hc.classify_home_category("4242", None) == ("4242", "live")
+
+    assert hc.is_degraded("ghost") and hc.is_degraded("stat_error")
+    assert not hc.is_degraded("live") and not hc.is_degraded("first_contact")
+    assert hc.resolve_to_id("4242", "live") == "4242"
+    assert hc.resolve_to_id("4242", "ghost") is None
+    assert hc.resolve_to_id(None, "first_contact") is None
+
+
+def test_shared_helper_never_creates_and_reuses_one_registry_read(
+        concierge_rig, monkeypatch, caplog):
+    """The SHARED reader/helper answers "does this user's home category still
+    resolve?" reusing the caller's ONE registry read (no second load), and a
+    ``first_contact`` state (the common, pre-feature case) is byte-for-byte
+    quiet: no lookup, no warning, no category creation, no provisioning.
+    Setup is done BEFORE the counter is installed so only the helper's own
+    I/O is measured."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _j_client(rig, JHOME_CATEGORY, _j_live_object())
+    _give_user_live_home_category(rig.root, "u1", JHOME_CATEGORY)  # setup
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        loads = _counting_registry(monkeypatch)  # count AFTER setup
+        reg = registry.load_registry()            # the caller's ONE read
+        assert len(loads) == 1
+        with caplog.at_level(logging.WARNING):
+            assert rig.adapter._concierge_resolve_home_category(
+                "u1", reg=reg) == JHOME_CATEGORY
+        assert len(loads) == 1                   # helper added ZERO reads
+        assert _j_home_warnings(caplog) == []    # live: no incident
+
+        # first_contact (no pointer): still ZERO extra reads, still silent
+        reg = registry.load_registry()
+        reg["users"]["u1"].pop("home_category", None)
+        registry._save(reg)
+        loads.clear()
+        reg = registry.load_registry()            # the caller's ONE read
+        with caplog.at_level(logging.WARNING):
+            assert rig.adapter._concierge_resolve_home_category(
+                "u1", reg=reg) is None
+        assert len(loads) == 1                   # helper added ZERO reads
+        assert _j_home_warnings(caplog) == []    # first contact: no incident
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_shared_helper_degrades_ghost_and_stat_error_warn_once(
+        concierge_rig, caplog):
+    """A deleted pointer (ghost) and an uncheckable one (stat_error) both
+    resolve to ``None`` (degrade) and warn ONCE per user — repeat lookups do
+    not re-warn. The stat_error diagnosis points at the filesystem, never at
+    "re-provision over the fault"."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _give_user_live_home_category(rig.root, "u1", JHOME_CATEGORY)
+
+    # ghost: get_channel -> None
+    _j_client(rig, JHOME_CATEGORY, None)
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert rig.adapter._concierge_resolve_home_category("u1") is None
+            assert rig.adapter._concierge_resolve_home_category("u1") is None
+            assert rig.adapter._concierge_resolve_home_category("u1") is None
+        ghost = _j_home_warnings(caplog)
+        assert len(ghost) == 1                 # ONE warning per user
+        assert "no longer resolves" in ghost[0].lower()
+        assert "admin" in ghost[0].lower()     # creating is an ADMIN action
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+    # stat_error: the lookup itself failed (EACCES / EIO / stalled mount)
+    _j_client(rig, JHOME_CATEGORY, OSError(5, "EIO"))
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert rig.adapter._concierge_resolve_home_category("u1") is None
+            assert rig.adapter._concierge_resolve_home_category("u1") is None
+        stat = _j_home_warnings(caplog)
+        assert len(stat) == 1
+        assert "could not be checked" in stat[0].lower()
+        assert "nothing" in stat[0].lower()   # NOTHING is provisioned
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_resolve_home_category_id_validates_an_already_read_pointer(
+        concierge_rig):
+    """The seam helper cards G/D use: validate an ALREADY-READ value with NO
+    registry read. Live -> id; ghost / stat_error -> None; first_contact ->
+    None. This is what makes dispatch placement and in-scope widening degrade
+    to today's trigger-category / hub behavior."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _j_client(rig, JHOME_CATEGORY, _j_live_object())
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        assert rig.adapter._concierge_resolve_home_category_id(
+            JHOME_CATEGORY, "u1") == JHOME_CATEGORY
+        assert rig.adapter._concierge_resolve_home_category_id(
+            None, "u1") is None
+        _j_client(rig, JHOME_CATEGORY, None)
+        assert rig.adapter._concierge_resolve_home_category_id(
+            JHOME_CATEGORY, "u1") is None
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+# ── Full runner-seam dispatches: the §6 acceptance criteria ───────────────
+
+
+def test_deleted_home_category_routing_falls_back_and_warns_once(
+        concierge_rig, monkeypatch, caplog):
+    """ACCEPT: category id recorded but the category is GONE -> routing falls
+    back to the HUB (card D's in-scope widening must not use the dead pointer),
+    ONE warning per user (repeat messages do not re-warn), NO category created
+    as a side effect of a routing decision, the durable pointer NOT silently
+    rebuilt, and NO duplicate orchestrator (nothing provisioned)."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _give_user_live_home_category(rig.root, "u1", JHOME_CATEGORY)
+    created = _j_client(rig, JHOME_CATEGORY, None)   # ghost / deleted
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    provision_calls = _recording_provision(monkeypatch, rig)
+    # A channel that still reports the (dead) home category: WITHOUT
+    # reconciliation the owns-conversation widening would re-home to ORCH.
+    channel = _RecordingChannel(category_id=JHOME_CATEGORY)
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+        dispatched = [e for e in order if e[0] == "dispatch"]
+        assert len(dispatched) == 2
+        assert [e[2] for e in dispatched] == [None, None]  # hub, never ORCH
+        assert len(_j_home_warnings(caplog)) == 1           # warn ONCE
+        assert created["categories"] == []                  # no re-create
+        assert created["text"] == []
+        assert provision_calls == []                        # no 2nd orchestrator
+        assert _j_recorded_pointer() == JHOME_CATEGORY      # not rebuilt
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_stat_error_home_category_degrades_without_provisioning(
+        concierge_rig, monkeypatch, caplog):
+    """ACCEPT: a stat error (EACCES / EIO / a stalled mount) degrades
+    IDENTICALLY to a deleted category — hub fallback, ONE warning, and NEVER
+    provisions over the environmental fault, never creates a category."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _give_user_live_home_category(rig.root, "u1", JHOME_CATEGORY)
+    created = _j_client(rig, JHOME_CATEGORY, OSError(13, "EACCES"))
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    provision_calls = _recording_provision(monkeypatch, rig)
+    channel = _RecordingChannel(category_id=JHOME_CATEGORY)
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+        dispatched = [e for e in order if e[0] == "dispatch"]
+        assert [e[2] for e in dispatched] == [None]         # hub
+        warnings = _j_home_warnings(caplog)
+        assert len(warnings) == 1
+        assert "could not be checked" in warnings[0].lower()
+        assert created["categories"] == [] and created["text"] == []
+        assert provision_calls == []                         # no provision over fault
+        assert _j_recorded_pointer() == JHOME_CATEGORY
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_degraded_pointer_never_bootstraps_second_orchestrator(
+        concierge_rig, monkeypatch, caplog):
+    """ACCEPT: the post-``clear_orchestrator`` state — a durable home_category
+    but NO orchestrator — with the category since deleted. The bootstrap
+    decision must NOT spawn a second orchestrator nor silently rebuild the
+    admin-created space: no provision, no channel, one warning, hub answers."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _seed_home_category("u1", JHOME_CATEGORY)  # home_category, no orchestrator
+    created = _j_client(rig, JHOME_CATEGORY, None)         # ghost
+    provision_calls = _recording_provision(monkeypatch, rig)
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    channel = _RecordingChannel(category_id=MANAGED_CATEGORY)
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+        assert provision_calls == []                        # NO bootstrap
+        assert created["categories"] == [] and created["text"] == []
+        assert len(_j_home_warnings(caplog)) == 1           # warn once
+        dispatched = [e for e in order if e[0] == "dispatch"]
+        assert [e[2] for e in dispatched] == [None]         # hub
+        assert _j_recorded_pointer() == JHOME_CATEGORY      # durable, untouched
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_no_home_category_is_silent_and_keeps_todays_behavior(
+        concierge_rig, monkeypatch, caplog):
+    """Zero-behavior-change invariant: with NO recorded pointer, a managed-
+    category message still re-homes to the live orchestrator and emits NO
+    reconciliation warning. card J is inert for every pre-feature user."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _give_user_orchestrator(rig.root)          # live orchestrator, NO home_category
+    _j_client(rig, JHOME_CATEGORY, _j_live_object())
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    provision_calls = _recording_provision(monkeypatch, rig)
+    channel = _RecordingChannel(category_id=MANAGED_CATEGORY)
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+        dispatched = [e for e in order if e[0] == "dispatch"]
+        assert [e[2] for e in dispatched] == [ORCH]        # today's re-home
+        assert provision_calls == []
+        assert _j_home_warnings(caplog) == []               # no incident
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_live_home_category_still_widens_the_lane(
+        concierge_rig, monkeypatch, caplog):
+    """J must not over-degrade: a LIVE home category still widens the in-scope
+    surface (a non-managed home-category channel re-homes to the orchestrator),
+    with NO warning — the pointer resolves, so there is no incident."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _give_user_live_home_category(rig.root, "u1", JHOME_CATEGORY)
+    _j_client(rig, JHOME_CATEGORY, _j_live_object())       # live
+    order = []
+    _install_fake_turn_spawner(monkeypatch, rig.adapter, order)
+    channel = _RecordingChannel(category_id=JHOME_CATEGORY)  # NOT managed
+
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            _run_dispatch(rig.adapter, _orch_event(
+                rig.adapter, channel=channel))
+        dispatched = [e for e in order if e[0] == "dispatch"]
+        assert [e[2] for e in dispatched] == [ORCH]         # live widening
+        assert _j_home_warnings(caplog) == []
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+# ── Card F: the two shared helpers (design §3.1, §6) ───────────────────────
+#
+# The bootstrap AND the admin slash commands funnel "where do this user's
+# spaces live" through ONE pair of helpers. These rows pin the helpers'
+# contracts directly (the end-to-end bootstrap rows above prove the bootstrap
+# DELEGATES to them): adopt a live pointer, resolve-only fallback for a
+# first-contact bootstrap, admin create with private overwrites, fail-closed
+# on any fault, and create+greet the general channel.
+
+
+class _CardFObj:
+    """Hashable stand-in for a discord Member/Role (PermissionOverwrite key)."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _CardFPO:
+    """Capturable stand-in for discord.PermissionOverwrite."""
+
+    def __init__(self, **kw):
+        self.kw = kw
+
+
+def _card_f_client(rig, *, home_resolves=True, create_raises=False):
+    """Duck-typed hub client whose guild can create categories (overwrites
+    captured) and text channels, plus a recording home channel for the
+    greeting. ``home_resolves`` drives the §6 liveness oracle."""
+    created = {"categories": [], "channels": []}
+    home = _RecordingChannel(category_id=MANAGED_CATEGORY,
+                             channel_id=int(HOME_CHANNEL))
+    member = _CardFObj(id=1, display_name="Alice",
+                       guild_permissions=_CardFObj(administrator=False))
+    admin = _CardFObj(id=2, guild_permissions=_CardFObj(administrator=True))
+
+    class _Guild:
+        id = 42
+        default_role = "@everyone"
+        members = [member, admin]
+
+        def get_member(self, uid):
+            return member if int(uid) == 1 else None
+
+        async def create_category(self, *, name, overwrites=None):
+            if create_raises:
+                raise RuntimeError("simulated category create failure")
+            created["categories"].append((name, overwrites))
+            return SimpleNamespace(id=9001, name=name)
+
+        async def create_text_channel(self, **kw):
+            created["channels"].append(kw)
+            return SimpleNamespace(id=int(HOME_CHANNEL))
+
+    guild = _Guild()
+
+    def _get_channel(cid):
+        if str(cid) == HOME_CHANNEL:
+            return home
+        if str(cid) == HOME_CATEGORY and not home_resolves:
+            return None
+        return SimpleNamespace(id=str(cid))
+
+    rig.adapter._client = SimpleNamespace(
+        get_channel=_get_channel, get_guild=lambda _i: guild,
+        guilds=[guild])
+    return SimpleNamespace(created=created, home=home, guild=guild,
+                           member=member, admin=admin)
+
+
+def _card_f_call(coro):
+    """Run one async helper to completion on a fresh loop."""
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_ensure_home_category_adopts_a_live_recorded_pointer(
+        concierge_rig, monkeypatch):
+    """ADOPT: a resolving recorded home_category is returned unchanged —
+    NO category creation, NO registry write (idempotent shared resolver)."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _seed_home_category("u1", HOME_CATEGORY)
+    fakes = _card_f_client(rig)
+    writes = []
+    monkeypatch.setattr(registry, "update_user",
+                        lambda *a, **k: writes.append(k))
+
+    cid = _card_f_call(rig.adapter._concierge_ensure_home_category(
+        user_id="u1", guild_id="42", visibility="private"))
+
+    assert cid == HOME_CATEGORY
+    assert fakes.created["categories"] == []      # nothing created
+    assert writes == []                           # nothing written
+
+
+def test_ensure_home_category_resolve_only_never_creates(
+        concierge_rig, monkeypatch, caplog):
+    """RESOLVE-ONLY (name=None, the bootstrap's call): with NO recorded
+    pointer the helper returns None, creates NOTHING, writes NOTHING, and
+    emits NO warning — the caller falls back to the trigger channel's
+    category (today's behavior, design §6)."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    fakes = _card_f_client(rig)
+    writes = []
+    monkeypatch.setattr(registry, "update_user",
+                        lambda *a, **k: writes.append(k))
+    ConciergeDiscordMixin._concierge_warned.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            cid = _card_f_call(rig.adapter._concierge_ensure_home_category(
+                user_id="u1", guild_id="42", visibility="private"))
+        assert cid is None
+        assert fakes.created["categories"] == []
+        assert writes == []
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING
+                    and "home category" in r.getMessage().lower()]
+    finally:
+        ConciergeDiscordMixin._concierge_warned.clear()
+
+
+def test_ensure_home_category_creates_private_with_overwrites(
+        concierge_rig, monkeypatch):
+    """ADMIN CREATE (name given): a private home category is built with
+    @everyone denied, the target member + every guild administrator granted
+    view+manage, and the new id is recorded via update_user(home_category)."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    registry.set_user("1", orchestrator="seed-orch", guild_id="42")
+    fakes = _card_f_client(rig)
+    monkeypatch.setattr(sys.modules["discord"], "PermissionOverwrite",
+                        _CardFPO, raising=False)
+
+    cid = _card_f_call(rig.adapter._concierge_ensure_home_category(
+        user_id="1", guild_id="42", visibility="private", name="Alice"))
+
+    assert cid == "9001"
+    assert len(fakes.created["categories"]) == 1
+    cname, overwrites = fakes.created["categories"][0]
+    assert cname == "Alice"
+    assert overwrites[fakes.guild.default_role].kw == {"view_channel": False}
+    assert overwrites[fakes.member].kw == {"view_channel": True,
+                                           "manage_channels": True}
+    assert overwrites[fakes.admin].kw == {"view_channel": True,
+                                          "manage_channels": True}
+    entry = registry.get_user("1")
+    assert entry is not None and entry["home_category"] == "9001"
+
+
+def test_ensure_home_category_is_fail_closed_on_create_failure(
+        concierge_rig, monkeypatch):
+    """FAIL-CLOSED: a Discord create error returns None (the caller falls
+    back to the trigger channel's category), with nothing half-recorded."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    _enable_home_category_field(monkeypatch)
+    _card_f_client(rig, create_raises=True)
+    monkeypatch.setattr(sys.modules["discord"], "PermissionOverwrite",
+                        _CardFPO, raising=False)
+
+    cid = _card_f_call(rig.adapter._concierge_ensure_home_category(
+        user_id="1", guild_id="42", visibility="private", name="Alice"))
+
+    assert cid is None
+    assert registry.get_user("1") is None       # nothing recorded
+
+
+def test_ensure_general_channel_creates_and_greets(concierge_rig, monkeypatch):
+    """The general channel: #orchestrator-<slug> in the resolved category,
+    created via the shared channel helper and greeted once. Returns the id."""
+    rig = concierge_rig
+    _set_concierge_config(rig.root, enabled=True)
+    fakes = _card_f_client(rig)
+    source = _source(rig.adapter, user_name="Alice")
+
+    cid = _card_f_call(rig.adapter._concierge_ensure_general_channel(
+        guild_id="42", category_id=MANAGED_CATEGORY, source=source))
+
+    assert cid == HOME_CHANNEL
+    assert len(fakes.created["channels"]) == 1
+    ch = fakes.created["channels"][0]
+    assert ch["name"] == "orchestrator-alice"
+    assert str(ch["category"].id) == MANAGED_CATEGORY
+    assert len(fakes.home.sent) == 1 and fakes.home.sent[0]  # greeted

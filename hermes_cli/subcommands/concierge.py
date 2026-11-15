@@ -46,7 +46,20 @@ def build_concierge_parser(subparsers, *, cmd_concierge: Callable) -> None:
     new_sub.add_argument("--guild", default=None, help="Discord guild id (provider-group matching)")
     new_sub.add_argument(
         "--name", default=None, dest="name",
-        help="Display name — becomes the bot's persona identity (SOUL {name})"
+        help="Display name — becomes the bot's persona identity (SOUL {name}); "
+             "with --public it also names the shared category"
+    )
+    new_sub.add_argument(
+        "--category", default=None, dest="category",
+        help="Existing Discord category id to bind the orchestrator's home "
+             "space to (legal ONLY with --user; creates the general channel "
+             "inside it and records home_category + home_channel + guild_id)"
+    )
+    new_sub.add_argument(
+        "--public", action="store_true", default=False, dest="public",
+        help="Create a shared PUBLIC home category named by --name instead of "
+             "binding an existing one (the /bot space <name> counterpart; "
+             "legal ONLY with --user)"
     )
 
     sub.add_parser("list", aliases=["ls"], help="List provisioned bots")

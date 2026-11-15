@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import builtins
 from functools import lru_cache, wraps
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -10,6 +11,13 @@ import shutil
 import sqlite3
 import sys
 import threading
+
+# The checkout root, fixed for the process lifetime (all exemptions below derive from it).
+_CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
+# pm/environments.install_key: sha256 of the resolved checkout root, first 16 hex.
+# owning_home_root builds <home>/installs/<this-key>/facts.json from it; mirroring that
+# derivation here pins the exemption to the exact path PM probes (see the group below).
+_INSTALL_KEY = hashlib.sha256(str(_CHECKOUT_ROOT).encode("utf-8")).hexdigest()[:16]
 
 
 def _pm_generation_dirs(prefixes) -> set[Path]:
@@ -41,7 +49,25 @@ _INTERPRETER_PREFIXES = tuple({
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
+    _CHECKOUT_ROOT,
+} | {
+    # With the checkout INSIDE the home, its PARENT is the real (guarded) home, and PM's
+    # bootstrap / tool discovery probes its own install metadata there before any imports:
+    #   * _payload_manifest (pm/environments.py) reads <parent>/manifest.json
+    #   * owning_home_root (pm/environments.py, via tools_root) stats
+    #     <parent>/installs/<install_key>/facts.json
+    #   * installed_package (pm/install.py) reads the PM tool store <parent>/tools/
+    #     (facts.json plus installed tool binaries), which find_node_executable probes.
+    # All are reads of PM's install metadata / tool store — the interpreter's own
+    # installation, not Hermes state (sys.base_prefix already exempts <parent>/tools/
+    # python-*; this covers its sibling tool dirs and facts.json). Exempt the two exact
+    # metadata files plus the <parent>/tools store dir; NEVER the parent/home root itself:
+    # a blanket exemption would let genuine Hermes-state I/O (config, profiles, state.db,
+    # ...) slip through the tripwire. In a checkout NOT inside the home these paths are
+    # not guarded roots, so the entries are inert.
+    _CHECKOUT_ROOT.parent / "manifest.json",
+    _CHECKOUT_ROOT.parent / "installs" / _INSTALL_KEY / "facts.json",
+    _CHECKOUT_ROOT.parent / "tools",
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes

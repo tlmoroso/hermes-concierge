@@ -3,7 +3,7 @@
 the workflow's guards, ruff and the code-health ratchet, plus the case-collision, lazy-deps,
 profile-archive and blob-size guards that CI runs in workflows of their own.
 
-    python scripts/check                # everything, against the merge-base with origin/main
+    python scripts/check                # everything, against the fork's own main (ratchet baseline)
     python scripts/check --only health  # just the code-health ratchet
     python scripts/check --staged       # judge the index (the pre-commit hook runs this)
     python scripts/check --commit REV   # judge one commit (the pre-push hook runs this)

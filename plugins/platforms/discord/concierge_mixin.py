@@ -198,6 +198,11 @@ import re
 import time
 from typing import Any
 
+from plugins.platforms.discord.concierge_mixin_helpers import (
+    _concierge_dispatch_reply_block,
+    _concierge_threading_mode_of,
+)
+
 logger = logging.getLogger(__name__)
 
 # Wire-invisible, process-local marker: the ordered room members a source's
@@ -421,6 +426,136 @@ class ConciergeDiscordMixin:
             return
         self._concierge_warned.add(key)
         logger.warning(message, *args, exc_info=exc_info)
+
+    # ── Home-category reconciliation (design §6, card J) ───────────────────
+    #
+    # The SHARED reader/helper cards E (routing), F (bootstrap) and G
+    # (dispatch) use to answer "does this user's home category still resolve?".
+    # ``home_category`` is a durable pointer Discord can invalidate out from
+    # under us (a manual delete) or that a liveness lookup can fail to check
+    # (EACCES / EIO / a stalled mount). Either degrades QUIETLY to today's
+    # behavior, warns ONCE per user, and NEVER auto-recreates the category
+    # (an admin action), NEVER provisions over the fault, and NEVER bootstraps
+    # a second orchestrator.
+    #
+    # One taxonomy only: the bootstrap's postures (§6 rule 5) — live / ghost /
+    # stat_error / first_contact — implemented in the pure, Discord-agnostic
+    # ``concierge.home_category``. These methods are thin adapters: resolve the
+    # id against the Discord client, reuse the caller's ONE registry read when
+    # given (``reg=``) so the hot-path one-read budget is untouched, and never
+    # raise. ``first_contact`` (no pointer) is the common case and does ZERO
+    # extra work — no lookup, no warning, byte-for-byte today's behavior.
+
+    def _concierge_home_category_getter(self):
+        """A ``get_channel(cid)``-shaped liveness oracle, or ``None`` when the
+        client offers none. A missing oracle is NOT an incident: we cannot
+        confirm a delete, so we fail-closed toward ADOPTING the pointer
+        (``UNCHECKABLE`` -> ``live``), never toward creating a duplicate."""
+        client = getattr(self, "_client", None)
+        getter = getattr(client, "get_channel", None)
+        return getter if callable(getter) else None
+
+    def _concierge_home_category_resolve(self, cid):
+        """Resolve one recorded category id through the Discord client.
+        Returns the object, ``None`` (gone), or ``UNCHECKABLE`` (no oracle);
+        an OSError / ClientException / any other lookup failure RAISES so the
+        classifier maps it to ``stat_error``. Never creates anything. The int
+        conversion mirrors ``_concierge_create_channel``/``/bot space``."""
+        from concierge.home_category import UNCHECKABLE
+
+        getter = self._concierge_home_category_getter()
+        if getter is None:
+            return UNCHECKABLE
+        try:
+            return getter(int(cid))
+        except (TypeError, ValueError):
+            return getter(cid)
+
+    def _concierge_home_category_posture(self, user_id, reg=None):
+        """``(category_id, posture)`` for the user's recorded home category,
+        reusing the bootstrap's four postures. ``reg`` is the caller's
+        already-loaded registry (NO extra read); ``None`` means do one tolerant
+        load. A hand-edited/absent field reads as ``first_contact``. Never
+        raises."""
+        from concierge import registry
+        from concierge.home_category import classify_home_category
+
+        if reg is None:
+            try:
+                reg = registry.load_registry()
+            except Exception:  # health: allow BLE001 -- fail-closed: an unreadable registry degrades the home-category posture lookup to no pointer (hub routing)
+                reg = None
+        raw = None
+        if isinstance(reg, dict):
+            users = reg.get("users")
+            if isinstance(users, dict):
+                entry = users.get(str(user_id))
+                if isinstance(entry, dict):
+                    raw = entry.get("home_category")
+        return classify_home_category(
+            raw, self._concierge_home_category_resolve)
+
+    def _concierge_resolve_home_category(self, user_id, reg=None):
+        """THE shared helper: "does this user's home category still resolve?"
+        Returns the LIVE category id (use it for placement / in-scope widening),
+        or ``None`` to fall back to today's behavior. On ``ghost`` /
+        ``stat_error`` it warns ONCE per user (deduped with every other call
+        site) and degrades; on ``first_contact`` (no pointer) it is silent.
+        Reuses ``reg`` (no extra read), NEVER creates a category, NEVER
+        provisions, NEVER bootstraps. E/F/G call this."""
+        from concierge.home_category import is_degraded
+
+        cid, posture = self._concierge_home_category_posture(user_id, reg=reg)
+        if is_degraded(posture):
+            self._concierge_home_category_degraded_warn(
+                user_id, cid, posture)
+            return None
+        return cid  # live -> id; first_contact -> None
+
+    def _concierge_resolve_home_category_id(self, home_category,
+                                            user_id=None):
+        """Validate an ALREADY-READ home category value (card G/D read the
+        registry themselves): returns the id only when it resolves LIVE, else
+        ``None`` (degrade + warn once). NO registry read — safe on the hot
+        path. ``home_category`` may be the raw accessor result or ``None``."""
+        from concierge.home_category import (classify_home_category,
+                                            is_degraded)
+
+        cid, posture = classify_home_category(
+            home_category, self._concierge_home_category_resolve)
+        if is_degraded(posture):
+            self._concierge_home_category_degraded_warn(
+                str(user_id) if user_id is not None else "?", cid, posture)
+            return None
+        return cid  # live -> id; first_contact -> None
+
+    def _concierge_home_category_degraded_warn(self, user_id, cid,
+                                               posture) -> None:
+        """Warn ONCE per user about a degraded pointer, keyed like the
+        bootstrap's ghost / stat_error warnings — the fix (an ADMIN
+        re-provisions the category, or repairs the filesystem) clears the
+        notice by construction, and repeat messages never re-warn. Actionable,
+        never "auto-recreate", never "re-provision over the fault". ``live``
+        and ``first_contact`` are quiet."""
+        name = getattr(self, "name", "discord")
+        if posture == "ghost":
+            self._concierge_warn_once(
+                ("home-category-ghost", str(user_id)),
+                "[%s] concierge: user %s has a recorded home category %r "
+                "that Discord no longer resolves (deleted?); routing and "
+                "worker placement degrade to today's behavior — an ADMIN "
+                "must re-provision the home category (it is never "
+                "auto-recreated, and no second orchestrator is bootstrapped)",
+                name, str(user_id), cid)
+        elif posture == "stat_error":
+            self._concierge_warn_once(
+                ("home-category-stat", str(user_id)),
+                "[%s] concierge: the home category %r for user %s could not "
+                "be checked (EACCES / EIO / a stalled mount?); routing and "
+                "worker placement degrade to today's behavior and NOTHING "
+                "is provisioned over the fault — investigate the Discord "
+                "client / filesystem before re-provisioning",
+                name, cid, str(user_id))
 
     def build_source(self, *args: Any, **kwargs: Any):
         # Gate 1 — the zero-behavior-change gate FIRST: disabled means no
@@ -878,41 +1013,75 @@ class ConciergeDiscordMixin:
 
     def _concierge_event_category_id(self, event) -> str | None:
         """The trigger channel's category id (normalized str) — duck-typed off
-        the RAW message's channel, exactly the way the event-surface helpers
-        read it (``category_id``, else ``category.id``). ``None`` when the
-        event carries no channel or no resolvable category, which every
-        consumer reads as a fail-closed "not managed".
+        the RAW message's channel (``category_id``, else ``category.id``).
+        ``None`` when the event carries no channel or no resolvable category,
+        which every consumer reads as a fail-closed "not managed".
 
-        Threads and forum posts: the category is resolved from the RAW
-        channel object only — this helper walks no parent chain of its
-        own. For a thread the only candidate view is discord.py's own
-        ``Thread.category_id`` property, which resolves the PARENT's
-        category when the parent is cached and RAISES ClientException
-        when it is not (the duck-typed read does not swallow that — the
-        consumers' fail-closed handlers do). The unbound fallback lanes
-        (re-home + bootstrap) are therefore NOT guaranteed inside
-        threads/forum posts — fail-closed, and asymmetric with the
-        binding/room path BY DESIGN (those inherit the parent channel's
-        registry key, because the registry owns that decision). Do not
-        "fix" this by walking the parent without revisiting the
-        bootstrap's assumptions (the personal channel is created in the
-        TRIGGER channel's category, which a thread does not have)."""
+        THREAD-AWARE (design §4, §5.3): a thread / forum post exposes
+        ``parent_id`` (discord.py ``Thread.parent_id``). Its OWN
+        ``category_id`` is not usable — that property resolves the PARENT's
+        category only when the parent is cached and otherwise RAISES
+        ``ClientException``. Reading it here used to let the exception escape
+        into the wrap's fail-closed handler, so a message typed inside a
+        THREAD silently fell through to the hub instead of the author's
+        orchestrator (the root defect this card fixes). Instead, resolve the
+        parent channel OBJECT via the hub client
+        (``client.get_channel(parent_id)`` — the same one-hop shape as
+        ``_concierge_dispatch_channel_object``, :1323) and read the PARENT's
+        ``category_id``. ONE hop only — never an unbounded walk; a thread's
+        parent is a real channel, not another thread. ``SessionSource``
+        carries the equivalent ``parent_chat_id`` on the source side.
+
+        Everything is fail-closed: a missing client, an uncached/unresolvable
+        parent, or any odd channel object resolves to ``None`` and NO exception
+        escapes (the whole read is guarded), so the unbound lanes degrade to
+        the hub rather than dropping a message or re-homing on a guess.
+        Threads now behave like their parent channel — symmetric with the
+        binding/room path, which already inherits the parent's registry key.
+        """
         channel = getattr(getattr(event, "raw_message", None), "channel", None)
         if channel is None:
             return None
-        raw = getattr(channel, "category_id", None)
-        if raw is None:
-            raw = getattr(getattr(channel, "category", None), "id", None)
-        if raw is None:
+        try:
+            parent_id = getattr(channel, "parent_id", None)
+            if parent_id is not None:
+                # Thread / forum post: resolve THROUGH the parent, one hop.
+                client = getattr(self, "_client", None)
+                if client is None:
+                    return None
+                parent = client.get_channel(int(parent_id))
+                if parent is None:
+                    return None
+                raw = getattr(parent, "category_id", None)
+                if raw is None:
+                    raw = getattr(getattr(parent, "category", None), "id", None)
+                if raw is None:
+                    return None
+                return str(raw)
+            # Ordinary channel: read the category straight off the raw one.
+            raw = getattr(channel, "category_id", None)
+            if raw is None:
+                raw = getattr(getattr(channel, "category", None), "id", None)
+            if raw is None:
+                return None
+            return str(raw)
+        except Exception:  # health: allow BLE001 -- fail-closed boundary: any parent/channel fault resolves to no category
+            # Fail-closed: an uncached parent (a ClientException from a
+            # Thread.category_id-style read), a bad id, a raising
+            # get_channel — none may escape into the wrap's handler.
             return None
-        return str(raw)
 
     def _concierge_event_in_managed_category(self, event) -> bool:
         """True when the trigger channel sits in one of the configured managed
         categories (the same list the auto-offer picker gates on). Anything
         unresolvable — no category on the channel, unreadable settings —
         resolves False: the unbound→orchestrator lanes must fail closed to
-        today's hub behavior, never re-home or bootstrap on a guess."""
+        today's hub behavior, never re-home or bootstrap on a guess.
+
+        The category read rides ``_concierge_event_category_id``, which is
+        thread-aware, so this predicate is too; it stays the RAW
+        managed-category predicate that the bootstrap decision and other
+        callers depend on."""
         settings = self._concierge_settings_obj()
         if settings is None:
             return False
@@ -922,6 +1091,42 @@ class ConciergeDiscordMixin:
         managed = {str(c) for c in (settings.managed_category_ids or ())}
         return category_id in managed
 
+    def _concierge_event_in_scope(self, event) -> bool:
+        """The in-scope gate for the unbound→orchestrator re-home (design §4):
+        the thread-aware managed-category check, PLUS the shared
+        "owns conversation" surface once card D lands it.
+
+        ``_concierge_orchestrator_fallback_on`` calls THIS, not the raw
+        ``_concierge_event_in_managed_category``, so routing is a single
+        decision seam that later cards widen (home category /
+        ``unbound_scope: guild``) without touching the caller.
+
+        The managed-category check runs FIRST and is authoritative: it reads
+        the category through ``_concierge_event_category_id`` (now
+        thread-aware), so a message in a thread under a managed category
+        re-homes like its parent. ``_concierge_owns_conversation`` (card D) is
+        the surface-wide union (bound / room / managed / home category) the
+        mention + threading gates use; when it has landed we consult it to
+        widen the lane to home categories so the gates cannot drift. Its
+        managed half reads the RAW channel and is NOT thread-aware on its own,
+        which is exactly why the managed check stays primary here.
+
+        FAIL-CLOSED everywhere: D runs in parallel, so the predicate may not
+        exist yet (``getattr`` → ``None``), and a raising predicate resolves
+        False — either way an unresolvable/non-managed event keeps today's hub
+        behavior. The caller's stamp precondition already excludes bound/room
+        channels, so consulting the union cannot re-home those."""
+        if self._concierge_event_in_managed_category(event):
+            return True
+        hook = getattr(self, "_concierge_owns_conversation", None)
+        if callable(hook):
+            try:
+                return bool(hook(getattr(event, "raw_message", None),
+                                 getattr(event, "source", None)))
+            except Exception:  # health: allow BLE001 -- fail-closed: a broken shared predicate keeps the hub
+                return False  # fail-closed to the hub
+        return False
+
     def _concierge_orchestrator_fallback_on(self, event) -> str | None:
         """The unbound→orchestrator re-home verdict (design §4) for *event*:
         the orchestrator profile to re-home to, or ``None`` (today's hub
@@ -929,19 +1134,21 @@ class ConciergeDiscordMixin:
         (anti-loop: a bot's own message never re-homes to the orchestrator),
         the ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp the registry-verdict tail
         left on the source (only ever set for an UNBOUND channel, by
-        construction), and a trigger channel inside a managed category —
-        the category check needs the RAW channel, which lives on the event,
-        not the source, and is why the re-home happens at the wrap instead
-        of in the verdict tail. The stamp is a plain str the tail validated
-        against the live registry (liveness included), moments ago on this
-        same dispatch; admission re-confirms via branch (c)."""
+        construction), and an IN-SCOPE trigger channel — the
+        ``_concierge_event_in_scope`` gate (thread-aware managed category,
+        widened by the shared owns-conversation predicate when present). The
+        scope check needs the RAW channel, which lives on the event, not the
+        source, and is why the re-home happens at the wrap instead of in the
+        verdict tail. The stamp is a plain str the tail validated against the
+        live registry (liveness included), moments ago on this same dispatch;
+        admission re-confirms via branch (c)."""
         source = getattr(event, "source", None)
         if source is None or getattr(source, "is_bot", False):
             return None
         stamp = getattr(source, _CONCIERGE_ORCHESTRATOR_ATTR, None)
         if not isinstance(stamp, str) or not stamp:
             return None
-        if not self._concierge_event_in_managed_category(event):
+        if not self._concierge_event_in_scope(event):
             return None
         return stamp
 
@@ -1105,6 +1312,18 @@ class ConciergeDiscordMixin:
             reg = registry.load_registry()
             if not self._concierge_source_unbound(source, reg):
                 return  # raced a concurrent bind/room write: fail closed
+            # Card J (§6): a recorded home category that Discord deleted (or
+            # that cannot be checked) must NEVER bootstrap a second
+            # orchestrator nor silently rebuild an admin-created space.
+            # Degrade to the hub, warn ONCE per user, skip the bootstrap.
+            # Reuses THIS registry read (no second load).
+            from concierge.home_category import is_degraded as _hc_degraded
+            _hc_id, _hc_posture = self._concierge_home_category_posture(
+                user_id, reg=reg)
+            if _hc_degraded(_hc_posture):
+                self._concierge_home_category_degraded_warn(
+                    user_id, _hc_id, _hc_posture)
+                return
             profile, posture = self._concierge_user_orchestrator(
                 reg.get("users"), user_id)
             if posture != "first_contact":
@@ -1146,10 +1365,12 @@ class ConciergeDiscordMixin:
 
     async def _concierge_orchestrator_bootstrap(self, event) -> None:
         """The first-contact bootstrap driver (design §4): provision the
-        author's orchestrator, create their personal channel in the trigger
-        channel's category, record the home + binding in the registry,
-        suppress the create event's auto-offer, and post the greeting + a
-        one-line pointer in the trigger channel.
+        author's orchestrator, create their GENERAL channel in the resolved
+        home category (recorded ``home_category`` → trigger channel's
+        category → guild top level), record ``home_category``/``home_channel``
+        + the binding in the registry (binding LAST), suppress the create
+        event's auto-offer, and post the greeting + a one-line pointer in
+        the trigger channel.
 
         FAIL-CLOSED: every step rides one try — any error warns ONCE (keyed
         per user) and the bootstrap aborts; the triggering message is
@@ -1187,7 +1408,17 @@ class ConciergeDiscordMixin:
                 return
             source = getattr(event, "source", None)
             guild_id = str(getattr(source, "guild_id", "") or "") or None
-            category_id = self._concierge_event_category_id(event)
+            # Card F (design §3.1): ONE shared helper resolves the home
+            # category FIRST. ``name=None`` is RESOLVE-ONLY — a first-contact
+            # bootstrap never creates an ADMIN category (§6): with no live
+            # pointer the helper returns None and we fall back to the trigger
+            # channel's category, byte-for-byte today's behavior. The §6
+            # liveness/degrade validation lives INSIDE the shared reader the
+            # helper reuses (ghost / stat_error -> degrade + warn once).
+            home_category = await self._concierge_ensure_home_category(
+                user_id=user_id, guild_id=guild_id, visibility="private")
+            category_id = home_category or self._concierge_event_category_id(
+                event)
             from concierge import provision, registry
 
             # 1) provision the author's orchestrator — user-keyed,
@@ -1201,16 +1432,22 @@ class ConciergeDiscordMixin:
             if not profile:
                 raise RuntimeError(
                     "provisioning returned no orchestrator profile")
-            # 2) the personal channel, in the trigger channel's category.
-            home_channel = await self._concierge_create_channel(
-                guild_id=guild_id, category_id=category_id,
-                name=self._concierge_orchestrator_channel_name(source))
+            # 2) the general channel (create + greet), in the resolved home
+            #    category — the shared Card F helper both the bootstrap and
+            #    the admin surface use.
+            home_channel = await self._concierge_ensure_general_channel(
+                guild_id=guild_id, category_id=category_id, source=source)
             if not home_channel:
-                raise RuntimeError("the personal channel could not be created")
-            # 3) registry: the home channel + the binding (binding LAST among
-            #    the registry writes — until it lands, nothing routes there).
-            await asyncio.to_thread(
-                registry.update_user, user_id, home_channel=home_channel)
+                raise RuntimeError("the general channel could not be created")
+            # 3) registry: record BOTH the resolved home_category (when one
+            #    exists) and the home channel FIRST, THEN the binding LAST —
+            #    until the binding lands, nothing routes there (design §3.1
+            #    step 4). A first contact with NO recorded home_category
+            #    keeps today's behavior: home_channel only, no warning.
+            user_fields = {"home_channel": home_channel}
+            if home_category:
+                user_fields["home_category"] = home_category
+            await asyncio.to_thread(registry.update_user, user_id, **user_fields)
             await asyncio.to_thread(
                 registry.bind_channel, home_channel, profile=profile,
                 blueprint="orchestrator", guild_id=guild_id)
@@ -1219,9 +1456,9 @@ class ConciergeDiscordMixin:
             #    already marked it; re-asserted here so the suppression
             #    cannot depend on the create helper's internals).
             self._concierge_remember_hub_created_channel(home_channel)
-            # 5) greet in the new home + point at it from the trigger channel.
-            title = self._concierge_member_title(profile)
-            await self._concierge_greet_created_channel(home_channel, title)
+            # 5) point at the new home from the trigger channel (the greeting
+            #    already landed via the shared _concierge_ensure_general_channel
+            #    helper at step 2).
             trigger = getattr(
                 getattr(event, "raw_message", None), "channel", None)
             await self._concierge_post_to_channel(
@@ -1258,16 +1495,195 @@ class ConciergeDiscordMixin:
                 inflight.discard(user_id)
 
     @staticmethod
-    def _concierge_orchestrator_channel_name(source) -> str:
-        """Discord-safe name for the author's personal channel:
-        ``orchestrator-<slug of the display name>`` (falling back to the user
-        id), capped at Discord's 100-character limit. Never raises."""
+    def _concierge_registry_home_category(reg, user_id: str) -> str | None:
+        """The author's recorded ``home_category``, read tolerantly from an
+        ALREADY-loaded registry dict (missing / junk → None, never raises).
+
+        The bootstrap paid for exactly ONE registry read for its posture
+        check; resolving placement reuses THAT dict rather than a second
+        ``home_category_for_user`` load (card B's accessor serves the lanes
+        that do NOT already hold a registry snapshot). A single-user category
+        is private by implication (operator, 2026-11-14); its naming change
+        (drop ``-private``) lives in ``_concierge_cmd_category`` (card H).
+        """
+        try:
+            users = reg.get("users") if isinstance(reg, dict) else None
+            entry = users.get(str(user_id)) if isinstance(users, dict) else None
+            value = entry.get("home_category") if isinstance(entry, dict) else None
+            return value if isinstance(value, str) and value.strip() else None
+        except Exception:  # health: allow BLE001 -- fail-closed: a malformed registry users entry yields no home-category pointer
+            return None
+
+    @staticmethod
+    def _concierge_general_channel_name(source, *, home_space: bool = False) -> str:
+        """THE single naming authority for the orchestrator's GENERAL channel.
+
+        Two lanes, ONE decision (operator decision 2026-11-14, "one naming
+        authority"; the old ``_concierge_orchestrator_channel_name`` and
+        ``_concierge_home_general_channel_name`` are folded in here):
+
+        * ``home_space=True`` (the ADMIN ``/bot category`` / ``/bot space``
+          surface, card H) — a channel INSIDE an admin-created home category
+          uses the card-A config-driven name
+          ``concierge.home_category.general_channel`` (default ``general``).
+        * ``home_space=False`` (DEFAULT — the bootstrap / no-home-category
+          fallback: first contact / legacy placement, i.e.
+          ``home_category.enabled: false``) — ``orchestrator-<slug of the
+          display name>`` byte-for-byte (falling back to the user id), capped
+          at Discord's 100-character limit. This preserves invariant 3 (zero
+          behavior change when the feature is off) and leaves Card F's
+          bootstrap naming untouched.
+
+        Why a LANE flag rather than "is category_id a home category": Card F's
+        bootstrap ALSO places its general channel into a recorded home
+        category when one resolves, yet its landed contract keeps the
+        ``orchestrator-<slug>`` name there. So "inside a home category" is NOT
+        a reliable discriminator between the two policies — the ADMIN intent
+        is. Defaulting the flag to False freezes every existing caller
+        (bootstrap + Card F tests) to its current behavior; only the admin
+        surface opts into the config-driven name. No caller may compute a
+        general-channel name any other way. Never raises.
+        """
+        if home_space:
+            # ONE pure function decides the HOME-space general-channel name,
+            # shared by the admin surface AND the offline CLI (operator
+            # decision 2026-11-14). The no-home-category fallback below stays
+            # here (source-derived ``orchestrator-<slug>``, invariant 3).
+            from concierge.home_space import home_general_channel_name
+            return home_general_channel_name()
         try:
             raw = str(getattr(source, "user_name", None)
                       or getattr(source, "user_id", None) or "user")
             return f"orchestrator-{_concierge_channel_slug(raw)}"[:100]
-        except Exception:
+        except Exception:  # health: allow BLE001 -- name is cosmetic; never fail the caller
             return "orchestrator-user"
+
+    async def _concierge_ensure_home_category(self, *, user_id, guild_id,
+                                              visibility, name=None):
+        """Card F shared helper (design §2, §3.1, §6): resolve or create the
+        user's HOME CATEGORY — the single placement authority for everything
+        the orchestrator spawns. Returns the category id to use, or ``None``
+        on ANY failure (FAIL-CLOSED: the caller then falls back to the
+        trigger channel's category, i.e. today's behavior).
+
+        * A RESOLVABLE recorded ``home_category`` is ADOPTED unchanged — no
+          create, no write. Liveness comes from the shared §6 reader
+          (``_concierge_resolve_home_category``), which degrades quietly and
+          warns once on a ghost / stat_error pointer instead of rebuilding
+          an admin-created space.
+        * ``name is None`` (the bootstrap's call) is RESOLVE-ONLY: with no
+          live pointer it returns ``None`` WITHOUT creating or writing. A
+          category is an ADMIN action; a first-contact bootstrap must stay
+          byte-for-byte today's behavior (§6, §3.1).
+        * ``name`` given (the admin slash commands, card H) is
+          ENSURE-OR-CREATE: build the category in ``guild_id`` with private
+          (``@everyone`` denied; target member + every guild administrator
+          granted view+manage) or public overwrites, and record it via
+          ``update_user(home_category=...)``.
+
+        Never raises. Used by BOTH ``_concierge_orchestrator_bootstrap`` and
+        the admin surface, so there is ONE answer to "where do this user's
+        spaces live".
+        """
+        try:
+            from concierge import registry
+
+            # 1) adopt a still-resolving durable pointer (shared §6 reader).
+            existing = self._concierge_resolve_home_category(str(user_id))
+            if existing:
+                return str(existing)
+            # 2) resolve-only (bootstrap): no create, no write, no warning.
+            if not name:
+                return None
+            # 3) admin ensure-or-create: resolve the guild, build overwrites.
+            if not guild_id:
+                return None
+            client = getattr(self, "_client", None)
+            guild = None
+            if client is not None:
+                try:
+                    if hasattr(client, "get_guild"):
+                        guild = client.get_guild(int(guild_id))
+                    if guild is None and hasattr(client, "guilds"):
+                        guild = next(
+                            (g for g in client.guilds
+                             if str(getattr(g, "id", "")) == str(guild_id)),
+                            None)
+                except Exception:  # health: allow BLE001 -- fail-closed: an unresolvable guild degrades to no category
+                    guild = None
+            if guild is None:
+                return None
+            import discord
+
+            member = None
+            try:
+                getter = getattr(guild, "get_member", None)
+                if callable(getter):
+                    member = getter(int(user_id))
+            except Exception:  # health: allow BLE001 -- fail-closed: an unresolvable member only drops its overwrite
+                member = None
+            overwrites = {}
+            if visibility != "public":
+                overwrites[guild.default_role] = discord.PermissionOverwrite(
+                    view_channel=False)
+                if member is not None:
+                    overwrites[member] = discord.PermissionOverwrite(
+                        view_channel=True, manage_channels=True)
+                for m in getattr(guild, "members", []) or []:
+                    perms = getattr(m, "guild_permissions", None)
+                    if getattr(perms, "administrator", False):
+                        overwrites[m] = discord.PermissionOverwrite(
+                            view_channel=True, manage_channels=True)
+            elif member is not None:
+                overwrites[member] = discord.PermissionOverwrite(
+                    manage_channels=True)
+            category = await guild.create_category(
+                name=str(name), overwrites=overwrites)
+            category_id = str(getattr(category, "id", "") or "") or None
+            if not category_id:
+                return None
+            await asyncio.to_thread(
+                registry.update_user, str(user_id),
+                home_category=category_id)
+            return category_id
+        except Exception as e:  # health: allow BLE001 -- fail-closed boundary: any create/record fault returns None (caller falls back to the trigger category)
+            logger.debug(
+                "[%s] concierge: ensure_home_category failed for user %s "
+                "(%s); falling back to the trigger channel's category",
+                getattr(self, "name", "discord"), user_id, e)
+            return None
+
+    async def _concierge_ensure_general_channel(self, *, guild_id,
+                                                category_id, source,
+                                                home_space=False):
+        """Card F shared helper (design §3.1): create the user's GENERAL
+        channel in ``category_id`` and greet it. Named by THE single naming
+        authority ``_concierge_general_channel_name`` (``home_space=True`` for
+        the admin surface's config-driven ``general`` name, the DEFAULT
+        ``False`` for the bootstrap's byte-for-byte ``orchestrator-<slug>`` —
+        invariant 3), created through ``_concierge_create_channel`` (which
+        also suppresses the channel-create auto-offer), then greeted through
+        ``_concierge_greet_created_channel``. Returns the new channel id, or
+        ``None`` when creation failed (FAIL-CLOSED; the caller aborts).
+        Never raises. Used by the bootstrap and the admin surface alike.
+        """
+        try:
+            channel_id = await self._concierge_create_channel(
+                guild_id=guild_id, category_id=category_id,
+                name=self._concierge_general_channel_name(
+                    source, home_space=home_space))
+            if not channel_id:
+                return None
+            title = str(getattr(source, "user_name", None)
+                        or getattr(source, "user_id", None)
+                        or "your orchestrator")
+            await self._concierge_greet_created_channel(channel_id, title)
+            return channel_id
+        except Exception as e:  # health: allow BLE001 -- fail-closed boundary: a channel-create/greet fault returns None
+            logger.debug(
+                "[%s] concierge: ensure_general_channel failed (%s)",
+                getattr(self, "name", "discord"), e)
+            return None
 
     @staticmethod
     def _concierge_worker_channel_name(blueprint_key: str, source) -> str:
@@ -1458,13 +1874,43 @@ class ConciergeDiscordMixin:
             worker_channel = next(
                 iter(registry.channels_for_profile(worker)), None)
             if not worker_channel:
+                # Placement of a NEW worker channel: a recorded home_category
+                # (the registry's durable, per-user pointer) wins over the
+                # trigger's category, so a request typed in a public category
+                # never scatters this user's bots across categories. Read it
+                # through card F's SHARED tolerant helper (accessor + entry
+                # fallback, never raises) instead of duplicating that read;
+                # a missing/None/unresolvable value falls through to today's
+                # trigger-category rule (card J owns reconciliation of a
+                # category Discord has since deleted). Reuse above still wins
+                # outright: a worker provisioned before home categories
+                # existed keeps its channel, so NEW channels only reach here.
+                resolver = getattr(self, "_concierge_home_category_for", None)
+                home_category = (resolver(user_id)
+                                 if callable(resolver) else None)
+                home_category = (home_category
+                                 if isinstance(home_category, str)
+                                 and home_category.strip() else None)
+                # Card J (§6): a recorded pointer Discord has since deleted
+                # (or that cannot be checked) must NOT place a worker in a
+                # dead category, must NOT create one, and must degrade to
+                # today's trigger-category rule with ONE warning per user.
+                # Validate the already-read value (NO extra registry read).
+                live_home_category = self._concierge_resolve_home_category_id(
+                    home_category, user_id)
+                category_id = (live_home_category
+                               or self._concierge_event_category_id(event))
                 worker_channel = await self._concierge_create_channel(
                     guild_id=guild_id,
-                    category_id=self._concierge_event_category_id(event),
+                    category_id=category_id,
                     name=self._concierge_worker_channel_name(
                         blueprint_key, source))
                 if not worker_channel:
                     raise RuntimeError("the worker channel failed to create")
+                # bind_channel's schema carries no category field, so there is
+                # nothing to record for /bot list grouping yet (that is a
+                # registry-schema extension owned separately). Kept
+                # non-destructive: the binding is otherwise unchanged.
                 await asyncio.to_thread(
                     registry.bind_channel, worker_channel,
                     profile=worker, blueprint=blueprint_key,
@@ -1591,11 +2037,7 @@ class ConciergeDiscordMixin:
             phase_b_source = dataclasses.replace(
                 source, profile=orchestrator, chat_id=home_channel)
             phase_b_event = dataclasses.replace(event, source=phase_b_source)
-            reply_block = (
-                f"[{title} replied]\n{worker_answer}"
-                if worker_answer is not None else
-                f"[{title} is unavailable]\n"
-                f"(the dispatch could not reach {title})")
+            reply_block = _concierge_dispatch_reply_block(title, worker_answer)
             phase_b_event.channel_context = (
                 f"{home_history}\n\n{reply_block}"
                 if home_history else reply_block)
@@ -2053,6 +2495,244 @@ class ConciergeDiscordMixin:
                          exc_info=True)
             return False
 
+    def _concierge_owns_conversation(self, message, source) -> bool:
+        """ONE predicate: does the concierge OWN this conversation's channel?
+
+        True when the channel is:
+          * bound to a bot            — registry ``bindings``
+          * a room channel            — registry ``rooms``
+          * inside a managed category — ``ConciergeSettings.managed_category_ids``
+          * inside the author's ``home_category`` (registry
+            ``home_category_for_user``) — INCLUDING when that category is NOT
+            listed in ``managed_category_ids`` (operator decision 2026-11-14:
+            thread-first replies are surface-wide, not home-category-only).
+
+        Built from the SAME single ``registry.load_registry()`` read that
+        ``_concierge_free_response_channels`` performs (the bound + room
+        union), and mirrors ``_concierge_free_response_message``'s duck-typed
+        category resolution + fail-closed posture, so the mention gate and
+        the threading gate compute the SAME surface and cannot drift apart.
+        ``source`` (the built routing source, when available) may carry
+        ``chat_id``/``parent_chat_id``/``user_id``; ``message`` carries the
+        raw channel/category/author. Either may be None — the auto-thread
+        hook calls this with a message and no source.
+
+        Fail-closed like both free-response hooks: an unreadable registry,
+        unresolvable category, missing settings, or any reader error resolves
+        False (never raises on the intake/admission path).
+        """
+        try:
+            from concierge import registry
+
+            channel = getattr(message, "channel", None)
+            reg = registry.load_registry()
+
+            # Channel-id candidates: the channel itself and its parent.
+            # Threads/forum posts inherit the parent's binding/room key, in
+            # the same order _concierge_binding_key resolves them. Prefer the
+            # built source's normalized ids when present, else the raw
+            # message channel — the hook's message-only call uses the latter.
+            channel_ids = {
+                str(candidate) for candidate in (
+                    getattr(source, "chat_id", None),
+                    getattr(channel, "id", None),
+                    getattr(source, "parent_chat_id", None),
+                    getattr(channel, "parent_id", None),
+                )
+                if candidate is not None and str(candidate).strip()
+            }
+
+            bindings = reg.get("bindings") or {}
+            rooms = reg.get("rooms") or {}
+            if isinstance(bindings, dict) and channel_ids.intersection(bindings):
+                return True
+            if isinstance(rooms, dict) and channel_ids.intersection(rooms):
+                return True
+
+            # Category resolution — mirror _concierge_free_response_message.
+            # discord.py Thread.category_id RAISES ClientException when the
+            # parent is uncached; swallow it so the predicate fails closed.
+            try:
+                category_id = getattr(channel, "category_id", None)
+                if category_id is None:
+                    category_id = getattr(
+                        getattr(channel, "category", None), "id", None)
+            except Exception:  # health: allow BLE001 -- fail-closed: an unreadable channel/category resolves to not-owned, so the hub keeps the message
+                category_id = None
+            if category_id is None:
+                return False
+            category_id = str(category_id)
+
+            # Managed categories (the mention gate's rule).
+            settings = self._concierge_settings_obj()
+            if settings is not None:
+                managed = {str(c) for c in
+                           (getattr(settings, "managed_category_ids", None) or ())}
+                if category_id in managed:
+                    return True
+
+            # Author's home category — even when it is NOT a managed category.
+            user_id = getattr(source, "user_id", None)
+            if user_id is None:
+                user_id = getattr(getattr(message, "author", None), "id", None)
+            if user_id is not None and str(user_id).strip():
+                uid = str(user_id)
+                home_category = None
+                # Prefer card B's canonical accessor when it has landed ...
+                try:
+                    accessor = getattr(registry, "home_category_for_user", None)
+                    if callable(accessor):
+                        value = accessor(uid)
+                        if isinstance(value, str) and value.strip():
+                            home_category = str(value)
+                except Exception:
+                    logger.debug("concierge home_category accessor failed",
+                                 exc_info=True)
+                # ... else read the field off the SAME registry read, so this
+                # predicate is correct regardless of card B's landing order.
+                if home_category is None:
+                    try:
+                        users = reg.get("users") or {}
+                        entry = users.get(uid) if isinstance(users, dict) else None
+                        if isinstance(entry, dict):
+                            value = entry.get("home_category")
+                            if isinstance(value, str) and value.strip():
+                                home_category = str(value)
+                    except Exception:
+                        logger.debug("concierge home_category read failed",
+                                     exc_info=True)
+                # Card J (§6): a dead/uncheckable home category must NOT widen
+                # the owned surface (routing falls back to the managed gate /
+                # hub). Validate the already-read id; degrades + warns once.
+                live_home_category = self._concierge_resolve_home_category_id(
+                    home_category, uid)
+                if (live_home_category is not None
+                        and category_id == live_home_category):
+                    return True
+
+            return False
+        except Exception:
+            logger.debug("concierge owns-conversation lookup failed",
+                         exc_info=True)
+            return False
+
+    def _concierge_wants_auto_thread(self, message, is_free_channel) -> bool:
+        """Card C's auto-thread hook — the FINAL "thread this message?" verdict.
+
+        Returns (design §5.1–5.2, §8; card-D scope):
+          * ``False`` outright when ``concierge.threading.mode == "off"`` OR
+            any adapter-side exclusion applies: DM, ``MessageType.reply``,
+            voice-linked channel, ``discord.no_thread_channels``, or a
+            message ALREADY inside a thread (never nest a second thread).
+          * ``True`` when ``mode == "always"`` AND
+            ``_concierge_owns_conversation`` — surface-wide (bound / room /
+            managed / home category), NOT home-category-only.
+          * Otherwise the hook does NOT claim a special decision: it returns
+            the BASE RULE ``(not is_free_channel) or
+            self._discord_free_response_auto_thread()`` — byte-identical to
+            today's ``skip_thread`` free-response term, so ``mode == "mentions"``
+            (and a disabled/absent config) is byte-for-byte today's behavior.
+
+        CONTRACT WITH CARD C (``adapter.py``): treat this bool as THE decision —
+        ``return bool(hook(message, is_free_channel))`` when the hook is
+        callable, falling back to the base rule ONLY when it is absent/raises.
+        A positive-claim-only adapter (``if hook(...): return True; else:
+        base_rule``) is WRONG: ``off`` and the exclusions must be able to VETO
+        a True base rule (e.g. an @mention), so a falsy hook return must stand
+        as "do not thread", not "defer to base". The adapter's own
+        auto_thread/voice/reply/no_thread/DM/is_thread guards are unchanged
+        and kept as separate gate factors; this hook re-checks them as
+        defense-in-depth so it also stands alone.
+
+        Fail-closed to the base rule on any reader error: never break intake.
+        """
+        # Base rule first (defensive): the exact free-response term the inline
+        # gate computes today (adapter.py ~6330-6332). Duck-typed off ``self``
+        # (companion adapter method) so a bare mixin stub never breaks intake.
+        try:
+            fr_thread = getattr(self, "_discord_free_response_auto_thread", None)
+            base = (not is_free_channel) or (
+                bool(fr_thread()) if callable(fr_thread) else False)
+        except Exception:  # health: allow BLE001 -- fail-closed: a broken free-response auto-thread setting falls back to today's base (no-thread) rule
+            base = not is_free_channel
+        try:
+            # ── threading.mode (card A's reader; default mentions = today) ──
+            mode = "mentions"
+            try:
+                runner = getattr(self, "gateway_runner", None)
+                section = getattr(getattr(runner, "config", None),
+                                  "concierge", None)
+                raw = None
+                if isinstance(section, dict):
+                    th = section.get("threading")
+                    raw = _concierge_threading_mode_of(th)
+                if raw is None:
+                    settings = self._concierge_settings_obj()
+                    if settings is not None:
+                        raw = getattr(settings, "threading_mode", None)
+                        if raw is None:
+                            th = getattr(settings, "threading", None)
+                            raw = _concierge_threading_mode_of(th)
+                if raw is not None:
+                    cand = str(raw).strip().lower()
+                    if cand in {"off", "mentions", "always"}:
+                        mode = cand
+            except Exception:
+                logger.debug("concierge threading mode lookup failed",
+                             exc_info=True)
+
+            # A disabled concierge, the default ``mentions`` mode, or an
+            # absent/unreadable threading config is byte-for-byte today's
+            # behavior: return the base rule and touch nothing else.
+            if mode == "mentions" or not _concierge_enabled_from_config(
+                    getattr(self, "gateway_runner", None)):
+                return base
+            if mode == "off":
+                return False  # no auto-thread anywhere, even on @mention
+
+            # ── mode == "always": unchanged exclusions still win ──────────
+            channel = getattr(message, "channel", None)
+            # A message already inside a thread never nests a second thread.
+            if self._concierge_channel_is_thread(channel):
+                return False
+            try:
+                import discord
+                if isinstance(channel, discord.DMChannel):
+                    return False
+                # MessageType.reply messages reply inline (adapter ~6334).
+                if getattr(message, "type", None) == discord.MessageType.reply:
+                    return False
+            except Exception:
+                logger.debug("concierge discord type check failed",
+                             exc_info=True)
+            # Voice-linked text channel (adapter ~6305).
+            if str(getattr(channel, "id", "")) in {
+                    str(v) for v in getattr(
+                        self, "_voice_text_channels", {}).values()}:
+                return False
+            # discord.no_thread_channels (adapter ~6328). Duck-typed off
+            # ``self`` so a bare mixin stub degrades to "not excluded".
+            try:
+                get_no_thread = getattr(self, "_get_no_thread_channels", None)
+                get_keys = getattr(self, "_discord_channel_keys", None)
+                no_thread = get_no_thread() if callable(get_no_thread) else ()
+                keys = get_keys(message) if callable(get_keys) else ()
+                if (isinstance(no_thread, (set, frozenset, list, tuple))
+                        and isinstance(keys, (set, frozenset, list, tuple))
+                        and set(no_thread).intersection(set(keys))):
+                    return False
+            except Exception:
+                logger.debug("concierge no-thread exclusion failed",
+                             exc_info=True)
+
+            # Thread EVERY inbound message in a concierge-owned channel.
+            if self._concierge_owns_conversation(message, None):
+                return True
+            return base
+        except Exception:
+            logger.debug("concierge auto-thread hook failed", exc_info=True)
+            return base
+
     def _concierge_events_wanted(self) -> bool:
         """Gate for the whole command/event surface: enabled AND multiplexed
         (the same two gates routing applies — commands that bind channels are
@@ -2238,10 +2918,22 @@ class ConciergeDiscordMixin:
                 await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
                 return
             await self._concierge_cmd_category(interaction, user)
+
+        async def _space(interaction: discord.Interaction, name: str):
+            from concierge.auth_tiers import is_admin
+            if not is_admin(getattr(getattr(interaction, "user", None), "id", None)):
+                await self._concierge_respond(interaction, "That command is admin-only.", ephemeral=True)
+                return
+            await self._concierge_cmd_space(interaction, name)
+
         _category.__name__ = "concierge_bot_category"
+        _space.__name__ = "concierge_bot_space"
         group.add_command(discord.app_commands.Command(
-            name="category", description="Create a private category for a user (admin-only)",
+            name="category", description="Create a private home category for a user (admin-only)",
             callback=_category))
+        group.add_command(discord.app_commands.Command(
+            name="space", description="Create a public shared category named by topic (admin-only)",
+            callback=_space))
         try:
             tree.add_command(group)
         except Exception:
@@ -2342,848 +3034,14 @@ class ConciergeDiscordMixin:
 
     # ── /bot new: picker → provision (Tasks 5.4 + 5.7 chained) ──────────────
 
-    async def _concierge_cmd_category(self, interaction, user: str) -> None:
-        """Create a private Discord category for a user (admin-only)."""
-        import discord
-        await self._concierge_defer(interaction, ephemeral=True)
-        guild = getattr(interaction, "guild", None)
-        if guild is None:
-            await self._concierge_respond(interaction, "Must be used in a server.", ephemeral=True)
-            return
-        target_id = user.strip().lstrip("<@").rstrip(">").strip()
-        try:
-            target_id_int = int(target_id)
-        except ValueError:
-            await self._concierge_respond(interaction, "Invalid user id.", ephemeral=True)
-            return
-        try:
-            member = guild.get_member(target_id_int) or await guild.fetch_member(target_id_int)
-        except Exception:
-            member = None
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        }
-        if member is not None:
-            overwrites[member] = discord.PermissionOverwrite(view_channel=True, manage_channels=True)
-        for m in getattr(guild, "members", []):
-            if getattr(m, "guild_permissions", None) and m.guild_permissions.administrator:
-                overwrites[m] = discord.PermissionOverwrite(view_channel=True, manage_channels=True)
-        try:
-            category = await guild.create_category(
-                name=f"{member.display_name if member else target_id}-private",
-                overwrites=overwrites,
-            )
-        except Exception as e:
-            await self._concierge_respond(interaction, f"Failed to create category: {e}", ephemeral=True)
-            return
-        await self._concierge_respond(
-            interaction, f"Created private category '{category.name}' (id {category.id}).",
-            ephemeral=True)
+    # ── Home category admin surface (HOME_CATEGORY_DESIGN §3, §12.5) ─────────
 
-    async def _concierge_cmd_new(self, interaction) -> None:
-        """Ephemeral blueprint picker; the selection provisions the bot into
-        the invoking channel (Task 5.4), via the Task 5.7 create-vs-bind plan
-        when the invoking context is a managed category."""
-        import discord
-
-        if not await self._concierge_gate_interaction(interaction, "/bot new"):
-            return
-        payload = _concierge_payload("build_new_bot_response")()
-        view = self._concierge_build_picker_view(payload["choices"])
-        try:
-            await interaction.response.send_message(
-                payload["content"], view=view, ephemeral=True)
-        except Exception as e:
-            logger.warning("[%s] /bot new: picker send failed: %s",
-                           getattr(self, "name", "discord"), e)
-
-    def _concierge_build_picker_view(self, choices, *,
-                                     prefer_create: bool = True,
-                                     ephemeral: bool = True):
-        """The blueprint select-menu View. Auth: the hub's user/role allowlists
-        (transport-scoped, same as every component view in this adapter).
-
-        ``prefer_create``/``ephemeral`` thread through the select callback
-        into ``_concierge_provision_from_interaction``. The defaults are the
-        ``/bot new`` semantics (a dedicated channel, ephemeral replies); the
-        Task 5.5 auto-offer sites pass ``False``/``False`` — the channel the
-        picker is posted in IS the destination, and the confirmation is
-        public."""
-        import discord
-
-        view = discord.ui.View(timeout=300)
-        options = [
-            discord.SelectOption(
-                label=c["label"][:100],
-                value=c["value"],
-                description=(c.get("description") or "")[:100],
-            )
-            for c in choices[:25]
-        ]
-        select = discord.ui.Select(
-            placeholder="Pick a bot for this channel…", options=options)
-        select.callback = self._concierge_make_picker_callback(
-            view, prefer_create=prefer_create, ephemeral=ephemeral)
-        view.add_item(select)
-        return view
-
-    def _concierge_make_picker_callback(self, view, *,
-                                        prefer_create: bool = True,
-                                        ephemeral: bool = True):
-        """Bound callback for the picker's select: resolve the selection into
-        a provisioned bot, threading the picker site's
-        ``prefer_create``/``ephemeral`` into the provision step (see
-        ``_concierge_build_picker_view``). Wrapped (not a View subclass) so
-        the mixin stays duck-typed — ``_component_check_auth`` lives on the
-        adapter module."""
-        import discord
-
-        async def _on_select(interaction: discord.Interaction) -> None:
-            if not self._concierge_component_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not allowed to use this.", ephemeral=True)
-                return
-            # Defer BEFORE any provisioning work: the provision (profile
-            # copytree, cron-store write, a cross-process flock that can wait
-            # up to 60s) can outlast the ~3s interaction token, and an
-            # unanswered interaction burns it — defer-then-followup keeps
-            # every outcome (success, error, lock timeout) deliverable. The
-            # ephemeral flag threads from the picker site, so the auto-offer
-            # pickers defer (and confirm) publicly, same as before.
-            await self._concierge_defer(interaction, ephemeral=ephemeral)
-            blueprint_key = str(
-                (getattr(interaction, "data", {}) or {}).get("values", [""])[0])
-            await self._concierge_provision_from_interaction(
-                interaction, blueprint_key, source_view=view,
-                ephemeral=ephemeral, prefer_create=prefer_create)
-
-        return _on_select
-
-    def _concierge_component_auth(self, interaction) -> bool:
-        """User/role gate for concierge component clicks (picker, confirm
-        buttons). Uses the adapter module's own ``_component_check_auth``
-        (the same gate the adapter's approval/model-picker views use) with
-        THIS adapter's allowlist sets; a bare/duck-typed adapter in tests may
-        still provide ``_component_check_auth`` as an attribute, which wins."""
-        checker = getattr(self, "_component_check_auth", None)
-        if callable(checker):
-            try:
-                return bool(checker(
-                    interaction,
-                    getattr(self, "_allowed_user_ids", set()),
-                    getattr(self, "_allowed_role_ids", set())))
-            except Exception:
-                return False
-        # Upstream's approval-card refactor moved ``_component_check_auth`` out of
-        # adapter.py into adapter_component_auth.py — resolve it there (still the
-        # same gate the adapter's approval/model-picker views use).
-        try:
-            from plugins.platforms.discord.adapter_component_auth import _component_check_auth
-            return bool(_component_check_auth(
-                interaction,
-                getattr(self, "_allowed_user_ids", set()),
-                getattr(self, "_allowed_role_ids", set())))
-        except Exception:
-            return False
-
-    async def _concierge_provision_from_interaction(
-        self, interaction, blueprint_key: str, *, source_view=None,
-        ephemeral: bool = True, prefer_create: bool = False,
-    ) -> None:
-        """Provision ``blueprint_key`` for the interaction's channel, through
-        the Task 5.7 create-vs-bind plan. Shared by the ``/bot new`` picker
-        (ephemeral replies, ``prefer_create=True``) and the Task 5.5
-        auto-offer pickers (non-ephemeral, ``prefer_create=False`` — the
-        channel the picker was posted in IS the destination); both flags are
-        threaded from the picker site through
-        ``_concierge_build_picker_view``/``_concierge_make_picker_callback``.
-        When the plan CREATES a channel and provisions into it, a
-        non-ephemeral greeting is posted there afterwards (plan 5.7: "channel
-        appears, bot says hi") — best effort, never a provisioning failure.
-
-        Failure copy is user-language ("couldn't set that up — try again"),
-        never a Hermes stack trace: provisioning errors are logged with full
-        detail on the hub side."""
-        from concierge.provider_groups import resolve_provider_group
-
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        guild_id = self._concierge_interaction_guild_id(interaction)
-        category_id = self._concierge_interaction_category_id(interaction)
-        settings = self._concierge_settings_obj()
-
-        plan = self._concierge_plan_channel(
-            channel_id=channel_id, category_id=category_id, settings=settings,
-            guild_id=guild_id, prefer_create=prefer_create)
-
-        created_channel_id = None
-        try:
-            if plan.mode == "create":
-                created = await self._concierge_create_channel(
-                    guild_id=guild_id, category_id=category_id,
-                    name=_concierge_payload("channel_name_for_blueprint")(blueprint_key))
-                if created is None:
-                    # Fallback is the plan's own rule: never fail provisioning
-                    # over channel creation.
-                    if channel_id is None:
-                        await self._concierge_respond(
-                            interaction, "Couldn't create a channel for it — "
-                            "run /bot new inside a channel instead.", ephemeral=ephemeral)
-                        return
-                    plan = _concierge_payload("ChannelPlan")(
-                        "bind", reason="channel creation refused — binding the invoking channel")
-                else:
-                    channel_id = created
-                    created_channel_id = created
-            if channel_id is None:
-                await self._concierge_respond(
-                    interaction, "Couldn't tell which channel you're in — run "
-                    "/bot new inside a channel.", ephemeral=ephemeral)
-                return
-
-            group = None
-            if settings is not None:
-                group = resolve_provider_group(
-                    settings.provider_groups, guild_id=guild_id,
-                    category_id=category_id,
-                    default_group=settings.default_provider_group)
-
-            from concierge import provision
-
-            # Off the loop: create_bot does profile-tree creation, a skills
-            # copytree, .env copy + adapter discovery, a cron-store write and
-            # the registry bind — all under a cross-process flock that can
-            # wait up to 60s. Synchronously on the discord.py event loop it
-            # freezes ALL gateway event handling (a 60s wait misses the WS
-            # heartbeat and forces a reconnect). to_thread is safe here: the
-            # per-channel provision lock serializes concurrent callers and
-            # create_bot's idempotence re-check happens INSIDE that lock; the
-            # result is a plain dict, and every discord.py touch below stays
-            # on the loop.
-            binding = await asyncio.to_thread(
-                provision.create_bot, blueprint_key,
-                channel_id=str(channel_id), guild_id=guild_id,
-                provider_group=group,
-                user_id=str(getattr(getattr(interaction, "user", None), "id", "") or "") or None)
-            title = self._concierge_blueprint_title(blueprint_key)
-            already = bool(binding.get("already_provisioned"))
-            message = (
-                f"✅ **{title}** is already live in <#{channel_id}>!"
-                if already
-                else f"✅ **{title}** is live in <#{channel_id}> — say hi!")
-            await self._concierge_respond(interaction, message, ephemeral=ephemeral)
-            if created_channel_id is not None:
-                # Plan 5.7: the bot says hi IN the channel it now lives in —
-                # the ephemeral reply above is visible to the clicker only.
-                await self._concierge_greet_created_channel(
-                    created_channel_id, title)
-            elif (plan.mode == "bind" and not already
-                    and self._concierge_channel_is_thread(
-                        getattr(interaction, "channel", None))):
-                # Forum-post provisioning (a Discord forum post IS a thread):
-                # the live 2026-09-27 bug — a BIND into a thread never posted
-                # the confirmation INTO the thread, because the greeting
-                # branch above is gated on channel creation. Post it through
-                # the same best-effort channel-send path, then seed the newly
-                # bound bot with the post's opening content. Fresh
-                # provisions only (``already``): a re-selection of an
-                # existing binding must not re-run the seed turn.
-                await self._concierge_greet_thread(interaction, title)
-            if source_view is not None:
-                try:
-                    for child in getattr(source_view, "children", []) or []:
-                        child.disabled = True
-                except Exception:
-                    pass
-            logger.info(
-                "[%s] concierge: %s bot %r for channel %s (plan=%s)",
-                getattr(self, "name", "discord"),
-                "returned existing" if already else "provisioned",
-                binding.get("profile"), channel_id, plan.mode)
-        except Exception as e:
-            logger.error(
-                "[%s] concierge: /bot new provisioning failed for channel %s: %s",
-                getattr(self, "name", "discord"), channel_id, e, exc_info=True)
-            await self._concierge_respond(
-                interaction,
-                "Couldn't set that up — try again in a moment.",
-                ephemeral=ephemeral)
-
-    def _concierge_plan_channel(self, *, channel_id, category_id, settings,
-                                guild_id=None, prefer_create: bool = False):
-        """Task 5.7 decision: create a channel or bind the invoking one. The
-        permission half of ``create_vs_bind`` is the MANAGE_CHANNELS
-        pre-check on the hub's guild object, fed the REAL ``guild_id`` from
-        the interaction/channel context (``None`` here would always take the
-        unknowable→True branch and pre-check nothing). Best effort by design:
-        a denied create still falls back to bind at run time — the API
-        denial remains the enforcement of last resort.
-
-        ``prefer_create=True`` is the ``/bot new`` flow (a fresh channel per
-        bot in bot country); the Task 5.5 auto-offer sites pass False (the
-        posted-in channel is the user's fresh canvas — bind it)."""
-        can_create = self._concierge_can_create_channels(guild_id=guild_id)
-        managed = settings.managed_category_ids if settings is not None else []
-        return _concierge_payload("create_vs_bind")(
-            can_create_channels=can_create,
-            category_id=category_id,
-            managed_category_ids=managed,
-            channel_id=channel_id,
-            prefer_create=prefer_create,
-        )
-
-    def _concierge_can_create_channels(self, *, guild_id) -> bool:
-        """Best-effort MANAGE_CHANNELS check on the hub's guild object; True
-        conservatively when unknowable (a denied create falls back to bind —
-        failing closed here would silently disable the feature for bots whose
-        permissions object isn't cached)."""
-        client = getattr(self, "_client", None)
-        guild = None
-        if client is not None and guild_id is not None:
-            try:
-                guild = client.get_guild(int(guild_id)) if hasattr(client, "get_guild") else None
-            except Exception:
-                guild = None
-            if guild is None and hasattr(client, "guilds"):
-                try:
-                    guild = next(
-                        (g for g in client.guilds if str(getattr(g, "id", "")) == str(guild_id)),
-                        None)
-                except Exception:
-                    guild = None
-        me = getattr(guild, "me", None) if guild is not None else None
-        perms = getattr(me, "guild_permissions", None) if me is not None else None
-        manage = getattr(perms, "manage_channels", None) if perms is not None else None
-        if manage is None:
-            return True  # unknowable: let Discord itself referee the create call
-        return bool(manage)
-
-    async def _concierge_create_channel(self, *, guild_id, category_id, name):
-        """Hub-side ``#<bot-name>`` creation (Task 5.7). Returns the new
-        channel id, or ``None`` when creation is impossible/denied — callers
-        fall back to binding the invoking channel. Best-effort by design:
-        provisioning must never fail over channel creation."""
-        client = getattr(self, "_client", None)
-        if client is None or guild_id is None:
-            return None
-        guild = None
-        try:
-            if hasattr(client, "get_guild"):
-                guild = client.get_guild(int(guild_id))
-            if guild is None and hasattr(client, "guilds"):
-                guild = next(
-                    (g for g in client.guilds if str(getattr(g, "id", "")) == str(guild_id)),
-                    None)
-        except Exception:
-            guild = None
-        if guild is None:
-            return None
-        try:
-            import discord
-
-            kwargs = {"name": name}
-            if category_id is not None:
-                # A known category id (the managed one) is passed through;
-                # discord.py accepts the raw id for category=.
-                category = None
-                try:
-                    category = client.get_channel(int(category_id))
-                except Exception:
-                    category = None
-                if category is not None:
-                    kwargs["category"] = category
-            created = await guild.create_text_channel(**kwargs)
-            channel_id = str(getattr(created, "id", ""))
-            # Suppress the create event's own auto-offer: this channel was
-            # created BY the hub (both /room create and /bot new's create
-            # plan ride this one helper), and the creating flow posts its
-            # own greeting/confirmation into it.
-            self._concierge_remember_hub_created_channel(channel_id)
-            return channel_id
-        except Exception as e:
-            logger.warning(
-                "[%s] concierge: channel creation failed (%s); falling back to "
-                "binding the invoking channel",
-                getattr(self, "name", "discord"), e)
-            return None
-
-    async def _concierge_greet_created_channel(self, channel_id,
-                                               title: str) -> None:
-        """Plan 5.7's "bot says hi": a non-ephemeral greeting posted into a
-        channel the hub just created — delegated to
-        ``_concierge_post_to_channel`` (best effort, never fails the caller;
-        see that helper for the posture)."""
-        await self._concierge_post_to_channel(
-            channel_id, f"✅ **{title}** is live here — say hi!")
-
-    async def _concierge_greet_thread(self, interaction, title: str) -> None:
-        """The forum-post greeting (the thread-bind counterpart of
-        ``_concierge_greet_created_channel``): post the confirmation INTO
-        the thread through the same best-effort send, then seed the newly
-        bound bot with the post's opening content.
-
-        Why both ride here: a forum post's body is written at creation —
-        BEFORE the binding existed — so it can never arrive as a routed
-        message; without an explicit seed the new bot sits silent until the
-        user types a second message (the live 2026-09-27 bug). The seed
-        reuses the room fan-out's member-turn machinery (fresh source
-        stamped with the bound profile, dispatched through the REAL
-        ``super().handle_message``) — NO second turn mechanism. Best
-        effort, error-isolated: neither a greeting failure nor a seed
-        failure may fail the provisioning that already succeeded."""
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        await self._concierge_post_to_channel(
-            channel_id, f"✅ **{title}** is live here — say hi!",
-            channel=getattr(interaction, "channel", None))
-        await self._concierge_seed_thread_opening(interaction, channel_id)
-
-    async def _concierge_seed_thread_opening(self, interaction,
-                                             channel_id) -> None:
-        """One seed turn for a freshly thread-bound bot, carrying the post's
-        opening message (the starter message the user wrote at post
-        creation — content that predates the binding and therefore can
-        never reach the bot as a routed message).
-
-        The turn rides the EXISTING dispatch: a source built through the
-        REAL ``build_source`` (the concierge routing seam stamps the bound
-        profile exactly as for any later thread message — the registry
-        binding was just written), a MessageEvent carrying the starter
-        content, dispatched via ``handle_message`` — canonicalization,
-        profile-namespaced session key, busy guard and the runner's
-        profile runtime scope all run as for any bound-channel message,
-        and the reply lands in the thread through the same delivery path
-        (the faaf55aac2 cross-profile origin-delivery fix). Spawns the same
-        way the room fan-out driver does (returns fast, work on a task),
-        then waits bounded for the seed turn so provisioning completes.
-        Never raises: a seed failure is logged, never a provisioning one."""
-        try:
-            thread = getattr(interaction, "channel", None)
-            if thread is None or channel_id is None:
-                return
-            # The post's opening content: the starter message the thread
-            # carries (discord.py forum threads expose it as
-            # ``starter_message``; older surfaces fetch by id). Missing
-            # content means there is nothing to seed — the greeting already
-            # told the user to say hi.
-            content = None
-            starter = getattr(thread, "starter_message", None)
-            if starter is not None:
-                content = getattr(starter, "content", None)
-            if not (content or "").strip():
-                logger.debug(
-                    "[%s] concierge: forum post %s has no opening message "
-                    "to seed; the greeting stands alone",
-                    getattr(self, "name", "discord"), channel_id)
-                return
-
-            from gateway.platforms.event import MessageEvent, MessageType
-
-            channel_name = getattr(thread, "name", "") or ""
-            parent = getattr(thread, "parent", None)
-            parent_id = (str(getattr(parent, "id", "") or "")
-                         if parent is not None else None)
-            source = self.build_source(
-                chat_id=str(channel_id), chat_name=channel_name,
-                chat_type="thread",
-                user_id=str(getattr(interaction, "user_id", "")
-                            or getattr(getattr(interaction, "user", None),
-                                      "id", "") or ""),
-                user_name=getattr(getattr(interaction, "user", None),
-                                  "display_name", None),
-                thread_id=str(channel_id),
-                guild_id=self._concierge_interaction_guild_id(interaction),
-                parent_chat_id=parent_id,
-            )
-            event = MessageEvent(
-                text=str(content), message_type=MessageType.TEXT,
-                source=source, raw_message=thread,
-            )
-            task = asyncio.create_task(self.handle_message(event))
-            background = getattr(self, "_background_tasks", None)
-            if background is not None:
-                try:
-                    background.add(task)
-                    task.add_done_callback(background.discard)
-                except Exception:
-                    pass
-            logger.info(
-                "[%s] concierge: seeded the forum post %s opening content "
-                "into the newly bound bot",
-                getattr(self, "name", "discord"), channel_id)
-        except Exception as e:
-            logger.warning(
-                "[%s] concierge: could not seed the forum post's opening "
-                "content for channel %s; the bot stays available for the "
-                "next message: %s",
-                getattr(self, "name", "discord"), channel_id, e)
-
-
-    async def _concierge_post_to_channel(self, channel_id, text: str,
-                                         channel=None) -> None:
-        """Best-effort non-ephemeral post into a channel (the created-channel
-        greeting, the forum-post greeting and the room greeting share it):
-        the destination resolved from an in-hand ``channel`` object when the
-        caller holds one (the thread-bind path does — the interaction's
-        channel IS the thread), else through the hub's own client. Never
-        raises, and a post that cannot be sent is logged and skipped — the
-        command that triggered it already succeeded."""
-        if channel is None:
-            client = getattr(self, "_client", None)
-            if client is not None and channel_id is not None \
-                    and hasattr(client, "get_channel"):
-                try:
-                    channel = client.get_channel(int(channel_id))
-                except Exception:
-                    channel = None
-        try:
-            if channel is None or not hasattr(channel, "send"):
-                logger.warning(
-                    "[%s] concierge: channel %s is not reachable for a "
-                    "planned post; skipped it (the command itself succeeded)",
-                    getattr(self, "name", "discord"), channel_id)
-                return
-            await channel.send(text)
-        except Exception as e:
-            logger.warning(
-                "[%s] concierge: could not post into channel %s (%s); the "
-                "command itself succeeded",
-                getattr(self, "name", "discord"), channel_id, e)
-
-    # ── Task 7.4: /room create | add | remove | disband ─────────────────────
-
-    async def _concierge_cmd_room_create(self, interaction,
-                                         topic: str | None = None) -> None:
-        """``/room create [topic]``: an ephemeral MULTI-SELECT of this guild's
-        bound bots (2–6); the selection creates ``#room-<topic>`` and rooms
-        it (Task 7.4). Fewer than two guild bots is actionable refusal — no
-        picker at all."""
-        from concierge import registry
-
-        if not await self._concierge_gate_interaction(interaction, "/room create"):
-            return
-        guild_id = self._concierge_interaction_guild_id(interaction)
-        choices = _concierge_payload("build_room_member_choices")(
-            registry.list_bindings(), guild_id)
-        if len(choices) < 2:
-            await self._concierge_respond(
-                interaction,
-                "A room needs at least two bots — set more up with "
-                "`/bot new` first, then try again.", ephemeral=True)
-            return
-        view = self._concierge_build_room_picker_view(choices, topic=topic)
-        await self._concierge_respond(
-            interaction,
-            "Pick **2–6 bots** for the room — they'll all answer in the new "
-            "channel.", view=view, ephemeral=True)
-
-    def _concierge_build_room_picker_view(self, choices, *, topic=None):
-        """The multi-select View for ``/room create``: ONE Select with
-        ``min_values=2`` / ``max_values=MAX_ROOM_MEMBERS`` (discord.py
-        selects are multi-select when the bounds allow it — the same View
-        machinery the /bot picker uses, no modal needed). The topic threads
-        into the select callback so the created channel is named after what
-        the user asked for at command time."""
-        import discord
-        from concierge.registry import MAX_ROOM_MEMBERS
-
-        view = discord.ui.View(timeout=300)
-        options = [
-            discord.SelectOption(
-                label=c["label"][:100],
-                value=c["value"],
-                description=(c.get("description") or "")[:100],
-            )
-            for c in choices[:25]
-        ]
-        select = discord.ui.Select(
-            placeholder="Pick this room's bots…", options=options,
-            min_values=2, max_values=min(MAX_ROOM_MEMBERS, len(options)))
-        select.callback = self._concierge_make_room_picker_callback(
-            view, topic=topic)
-        view.add_item(select)
-        return view
-
-    def _concierge_make_room_picker_callback(self, view, *, topic=None):
-        """Bound callback for the room picker's multi-select: auth, defer
-        (the channel create + registry write are slow), then create the room
-        (see ``_concierge_create_room_from_interaction``)."""
-        async def _on_select(interaction: discord.Interaction) -> None:
-            if not self._concierge_component_auth(interaction):
-                await interaction.response.send_message(
-                    "You're not allowed to use this.", ephemeral=True)
-                return
-            await self._concierge_defer(interaction, ephemeral=True)
-            values = [str(v) for v in
-                      (getattr(interaction, "data", {}) or {}).get("values", [])]
-            await self._concierge_create_room_from_interaction(
-                interaction, values, topic=topic, source_view=view)
-
-        return _on_select
-
-    async def _concierge_create_room_from_interaction(
-        self, interaction, values, *, topic=None, source_view=None,
-    ) -> None:
-        """The room-creation flow behind the picker: validate the selection
-        (pure payload builder — 2–6 of THIS guild's bound bots), create
-        ``#room-<topic>`` via the Task 5.7 channel-creation path, register
-        the room on the NEW channel, and post the greeting naming the members
-        into it.
-
-        Unlike ``/bot new`` there is NO bind-the-invoking-channel fallback:
-        a room NEEDS its own channel (plan), so a refused creation is a
-        refusal with actionable copy — the invoking channel is never turned
-        into a room. The registry mutation is a flock-guarded sync write:
-        ``asyncio.to_thread`` (M5c discipline)."""
-        from concierge import registry
-
-        guild_id = self._concierge_interaction_guild_id(interaction)
-        choices = _concierge_payload("build_room_member_choices")(
-            registry.list_bindings(), guild_id)
-        error = _concierge_payload("validate_room_selection")(values, choices)
-        if error:
-            await self._concierge_respond(interaction, error, ephemeral=True)
-            return
-        members = list(dict.fromkeys(str(v) for v in values))
-
-        settings = self._concierge_settings_obj()
-        category_id = self._concierge_room_category_id(interaction, settings)
-        created = await self._concierge_create_channel(
-            guild_id=guild_id, category_id=category_id,
-            name=_concierge_payload("room_channel_name")(topic))
-        if created is None:
-            # The live 403 path ('Missing Permissions (50013)'): unlike
-            # /bot new there is no bind-the-invoking-channel fallback here —
-            # a room NEEDS its own channel, so the refusal is EPHEMERAL,
-            # actionable, and leaves the registry untouched (no partial room).
-            await self._concierge_respond(
-                interaction,
-                "I couldn't create a channel — grant me the **Manage "
-                "Channels** permission (Server Settings → Roles), then run "
-                "/room create again.",
-                ephemeral=True)
-            return
-        try:
-            # Off the loop: create_room is a flock-guarded sync write.
-            await asyncio.to_thread(registry.create_room, created, members)
-        except ValueError as e:
-            # The registry is the authority (cap/duplicates); its message is
-            # already user-appropriate.
-            await self._concierge_respond(
-                interaction, f"Couldn't create the room — {e}", ephemeral=True)
-            return
-        titles = [self._concierge_member_title(m) for m in members]
-        await self._concierge_respond(
-            interaction,
-            f"✅ Room created in <#{created}> — "
-            + ", ".join(f"**{t}**" for t in titles) + " will answer there.",
-            ephemeral=True)
-        await self._concierge_post_to_channel(
-            created, _concierge_payload("build_room_created_response")(titles))
-        if source_view is not None:
-            try:
-                for child in getattr(source_view, "children", []) or []:
-                    child.disabled = True
-            except Exception:
-                pass
-        logger.info(
-            "[%s] concierge: created bot room on channel %s (%d members)",
-            getattr(self, "name", "discord"), created, len(members))
-
-    def _concierge_room_category_id(self, interaction, settings):
-        """The managed category a room channel is created in: the invoking
-        channel's category when that one is managed, else the first
-        configured managed category, else ``None`` (the guild's top level —
-        Discord accepts it and never guesses, same as we do)."""
-        managed = [str(c) for c in (
-            (settings.managed_category_ids if settings is not None else [])
-            or [])]
-        invoking = self._concierge_interaction_category_id(interaction)
-        if invoking is not None and invoking in managed:
-            return invoking
-        return managed[0] if managed else None
-
-    def _concierge_room_of_interaction(self, interaction) -> list[str]:
-        """The room members of the channel the interaction was invoked IN
-        (the /room add|remove|disband operand), or ``[]`` when that channel
-        is not a room — callers answer the actionable refusal."""
-        from concierge import registry
-
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        if not channel_id:
-            return []
-        return registry.room_members(str(channel_id))
-
-    async def _concierge_cmd_room_add(self, interaction, bot: str) -> None:
-        """``/room add <bot>``: a guild-scoped bound bot joins the room of
-        the INVOKING channel. Refusals: not-a-room (actionable copy), a bot
-        that isn't this guild's; the registry's own ValueError (duplicate,
-        full room) surfaces verbatim — it is the authority."""
-        from concierge import registry
-
-        if not await self._concierge_gate_interaction(interaction, "/room add"):
-            return
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        members = self._concierge_room_of_interaction(interaction)
-        if not members:
-            await self._concierge_respond(
-                interaction,
-                "This channel isn't a bot room — create one with "
-                "`/room create` first.", ephemeral=True)
-            return
-        profile = str(bot or "").strip()
-        guild_id = self._concierge_interaction_guild_id(interaction)
-        choices = _concierge_payload("build_room_member_choices")(
-            registry.list_bindings(), guild_id)
-        if not any(c["value"] == profile for c in choices):
-            await self._concierge_respond(
-                interaction,
-                f"`{profile}` isn't one of this server's bots — check "
-                f"`/bot list`.", ephemeral=True)
-            return
-        await self._concierge_defer(interaction, ephemeral=True)
-        try:
-            # Off the loop: add_to_room is a flock-guarded sync write.
-            new_members = await asyncio.to_thread(
-                registry.add_to_room, str(channel_id), profile)
-        except ValueError as e:
-            await self._concierge_respond(
-                interaction, f"Couldn't add it — {e}", ephemeral=True)
-            return
-        await self._concierge_respond(
-            interaction,
-            f"✅ **{self._concierge_member_title(profile)}** joined the "
-            f"room.\n" + _concierge_payload("build_room_info_response")(
-                [self._concierge_member_title(m) for m in new_members]),
-            ephemeral=True)
-
-    async def _concierge_cmd_room_remove(self, interaction, bot: str) -> None:
-        """``/room remove <bot>``: drop a member from the invoking channel's
-        room. The registry's own last-removal contract (the room disbands)
-        is SURFACED in the reply copy, not hidden."""
-        from concierge import registry
-
-        if not await self._concierge_gate_interaction(interaction, "/room remove"):
-            return
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        members = self._concierge_room_of_interaction(interaction)
-        if not members:
-            await self._concierge_respond(
-                interaction,
-                "This channel isn't a bot room — create one with "
-                "`/room create` first.", ephemeral=True)
-            return
-        profile = str(bot or "").strip()
-        if profile not in members:
-            await self._concierge_respond(
-                interaction, f"`{profile}` isn't in this room.", ephemeral=True)
-            return
-        await self._concierge_defer(interaction, ephemeral=True)
-        # Off the loop: remove_from_room is a flock-guarded sync write.
-        removed = await asyncio.to_thread(
-            registry.remove_from_room, str(channel_id), profile)
-        members_after = registry.room_members(str(channel_id))
-        title = self._concierge_member_title(profile)
-        if removed and not members_after:
-            await self._concierge_respond(
-                interaction,
-                f"🗑 Removed **{title}** — that was the last bot, so the "
-                f"room is disbanded.", ephemeral=True)
-        elif removed:
-            await self._concierge_respond(
-                interaction,
-                f"🗑 Removed **{title}** from the room.\n"
-                + _concierge_payload("build_room_info_response")(
-                    [self._concierge_member_title(m) for m in members_after]),
-                ephemeral=True)
-        else:
-            await self._concierge_respond(
-                interaction, f"`{profile}` isn't in this room.", ephemeral=True)
-
-    async def _concierge_cmd_room_disband(self, interaction) -> None:
-        """``/room disband``: a confirmation button (destructive), then the
-        registry-driven teardown — every member removed, the last removal
-        deletes the room key (remove_from_room's own contract). The channel
-        itself stays."""
-        from concierge import registry
-
-        if not await self._concierge_gate_interaction(interaction, "/room disband"):
-            return
-        channel_id = self._concierge_interaction_channel_id(interaction)
-        members = self._concierge_room_of_interaction(interaction)
-        if not members:
-            await self._concierge_respond(
-                interaction,
-                "This channel isn't a bot room — create one with "
-                "`/room create` first.", ephemeral=True)
-            return
-        titles = [self._concierge_member_title(m) for m in members]
-        content = _concierge_payload("build_room_disband_response")(titles)
-
-        import discord
-
-        view = discord.ui.View(timeout=120)
-
-        async def _disband_now(btn_interaction):
-            if not self._concierge_component_auth(btn_interaction):
-                await btn_interaction.response.send_message(
-                    "You're not allowed to use this.", ephemeral=True)
-                return
-            # Defer BEFORE the teardown: registry writes under the flock.
-            await self._concierge_defer(btn_interaction, ephemeral=True)
-            try:
-                await asyncio.to_thread(
-                    self._concierge_disband_room_members, str(channel_id))
-            except Exception as e:
-                logger.error(
-                    "[%s] concierge: disband of the room on channel %s "
-                    "failed: %s",
-                    getattr(self, "name", "discord"), channel_id, e,
-                    exc_info=True)
-                await self._concierge_respond(
-                    btn_interaction,
-                    "Couldn't disband it — try again in a moment.",
-                    ephemeral=True)
-                return
-            try:
-                for child in view.children:
-                    child.disabled = True
-            except Exception:
-                pass
-            await self._concierge_respond(
-                btn_interaction,
-                "🗑 Room disbanded — the channel stays; the bots no longer "
-                "answer here.", ephemeral=True)
-
-        async def _cancel(btn_interaction):
-            try:
-                for child in view.children:
-                    child.disabled = True
-            except Exception:
-                pass
-            await btn_interaction.response.send_message(
-                "Cancelled — the room is untouched.", ephemeral=True)
-
-        disband_btn = discord.ui.Button(
-            label="Disband room", style=discord.ButtonStyle.danger)
-        disband_btn.callback = _disband_now
-        cancel_btn = discord.ui.Button(
-            label="Cancel", style=discord.ButtonStyle.secondary)
-        cancel_btn.callback = _cancel
-        view.add_item(disband_btn)
-        view.add_item(cancel_btn)
-        await self._concierge_respond(
-            interaction, content, view=view, ephemeral=True)
-
-    def _concierge_disband_room_members(self, channel_id: str) -> None:
-        """Registry-driven room teardown (runs on a worker thread): remove
-        every member; the LAST removal deletes the room key
-        (remove_from_room's own contract — no second deletion path)."""
-        from concierge import registry
-
-        for member in list(registry.room_members(channel_id)):
-            registry.remove_from_room(channel_id, member)
-
-    # ── channel-delete auto-teardown ────────────────────────────────────────
-
+    # Admin (/bot category, /bot space, home-space build), provisioning
+    # (/bot new, picker, channel/thread creation) and room-command (/room *)
+    # handlers live in the topical sibling mixins concierge_mixin_admin.py,
+    # concierge_mixin_provisioning.py, concierge_mixin_room_commands.py,
+    # mounted as DiscordAdapter bases. Moved methods keep their own cap;
+    # internal paths are not API (no re-export shims).
     async def _concierge_on_guild_channel_delete(self, channel) -> None:
         """``on_guild_channel_delete``: the mirror of the create-side
         auto-offer. A deleted channel's registry entry is torn down; a

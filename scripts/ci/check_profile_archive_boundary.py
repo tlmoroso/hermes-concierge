@@ -6,6 +6,11 @@ can be bypassed (for example with ``git add -f`` or a non-standard build
 context).  This check is the blocking, executable policy at the CI and image
 publication boundaries.  It intentionally checks the filesystem rather than
 Git's index so a generated archive cannot enter a build after checkout.
+
+Detection is suffix-based (``.tar.gz`` / ``.tgz``), so it deliberately walks
+around known regenerable build-cache roots: those can contain public build
+tarballs whose names are indistinguishable from a profile export by suffix
+alone, and they are already excluded from both source and image contexts.
 """
 
 from __future__ import annotations
@@ -16,6 +21,27 @@ from pathlib import Path
 
 _PROFILE_ARCHIVE_SUFFIXES = (".tar.gz", ".tgz")
 
+# Directories that are never a source / Docker image-build input and can only hold
+# regenerable, non-secret build artifacts.  Pruning them from the walk is what keeps this
+# guard's suffix matching accurate: a genuine profile export carries .env / config.yaml /
+# state.db and is written to a MANAGED store OUTSIDE the checkout
+# (hermes_cli/profiles.py::_profile_export_directory, get_profile_export_path).  It reaches the
+# checkout only when someone points `hermes profile export -o <path>` inside it, and is then
+# still caught at whatever path it lands on.
+#
+# The first group is VCS / dependency / runtime metadata (the original skip set).  The second
+# group -- `.cache` and `.build` -- is where the desktop/electron-builder bundler writes its
+# download + work trees (scripts/bundles/desktop.py: cache=repo/".cache/desktop-inputs",
+# work=repo/".build/desktop-job").  electron-builder drops PUBLIC, regenerable tarballs there
+# (7zip, icon bundles) whose .tar.gz/.tgz names are indistinguishable from a profile export by
+# suffix alone.  Both roots are already excluded by .gitignore (:324-325) and .dockerignore
+# (:32-33), so they cannot enter a commit or a Docker layer; flagging them was a false positive.
+# A real export is not regenerable build input and is still rejected everywhere else in the tree.
+_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__",  # VCS / deps / runtime metadata
+    ".cache", ".build",                                        # regenerable build-cache roots
+})
+
 
 def find_forbidden_profile_archives(root: Path) -> list[Path]:
     """Return profile archive paths anywhere in the checkout."""
@@ -25,11 +51,7 @@ def find_forbidden_profile_archives(root: Path) -> list[Path]:
 
     offenders: list[Path] = []
     for directory, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = [
-            name
-            for name in dirnames
-            if name not in {".git", ".venv", "venv", "node_modules", "__pycache__"}
-        ]
+        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
         for name in (*dirnames, *filenames):
             if name.casefold().endswith(_PROFILE_ARCHIVE_SUFFIXES):
                 offenders.append((Path(directory) / name).relative_to(root))

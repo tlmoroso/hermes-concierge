@@ -6,6 +6,7 @@ through the same functions so base and head are measured identically.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,13 +48,54 @@ def commit_or_none(repo: Path, rev: str) -> str | None:
     return out.strip() or None
 
 
+# The reference a branch is measured against: the FORK's own main, never upstream.
+#
+# ``origin`` is upstream NousResearch, whose main predates this fork and contains none of the
+# concierge feature, so measuring against it counts long-merged fork code as "new" -- that is
+# exactly how the ratchet reported 119 blocking findings for code already on fork main. Do not
+# add ``origin/main`` (or any upstream ref) back.
+#
+# ``personal`` is the fork's *snapshot-artifact* repo, not a history mirror (see
+# concierge/docs/repo-hygiene.md): its commits are tree snapshots with their own short chain,
+# not ancestors of this tree, so it is not a usable merge-base either. Local ``main`` is the
+# fork's real main line and is the correct baseline.
+#
+# Override for a different layout with HERMES_CODE_HEALTH_BASE_REFS (comma-separated,
+# ordered), or pass --base explicitly (CI).
+DEFAULT_BASE_REFS = ("main",)
+_BASE_REFS_ENV = "HERMES_CODE_HEALTH_BASE_REFS"
+
+
+def _base_ref_candidates() -> tuple[str, ...]:
+    override = os.environ.get(_BASE_REFS_ENV, "").strip()
+    if override:
+        return tuple(ref.strip() for ref in override.split(",") if ref.strip())
+    return DEFAULT_BASE_REFS
+
+
 def default_base(repo: Path, tip: str = "HEAD") -> str:
-    """Merge-base of ``tip`` with origin/main (local runs); CI passes ``--base`` explicitly."""
-    for ref in ("origin/main", "main"):
-        out = git(repo, "merge-base", tip, ref, check=False).strip()
-        if out:
-            return out
-    raise RuntimeError("no merge-base with origin/main or main; pass --base")
+    """Newest common ancestor of ``tip`` with the fork's own ``main`` lineage.
+
+    Local runs compare a branch against fork main, never upstream ``origin/main`` (a private
+    fork's features are absent there). Of the resolvable candidate refs we return the most
+    recent common ancestor, so a stale fork-remote snapshot or upstream cannot drag the
+    baseline back past code already on fork main. CI passes ``--base`` explicitly. Candidate
+    refs come from HERMES_CODE_HEALTH_BASE_REFS or DEFAULT_BASE_REFS.
+    """
+    refs = _base_ref_candidates()
+    bases: list[str] = []
+    for ref in refs:
+        if not git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).strip():
+            continue
+        mb = git(repo, "merge-base", tip, ref, check=False).strip()
+        if mb:
+            bases.append(mb)
+    if not bases:
+        raise RuntimeError(f"no merge-base of {tip} with any of {', '.join(refs)}; pass --base")
+    # Every merge-base is an ancestor of ``tip``; the newest is the one with the fewest commits
+    # in ``mb..tip``. That is the fork-main point the branch actually forked from.
+    return min(set(bases), key=lambda mb: int(
+        git(repo, "rev-list", "--count", f"{mb}..{tip}", check=False).strip() or 0))
 
 
 @dataclass(frozen=True)
