@@ -193,6 +193,7 @@ unit tests live in tests/concierge/test_memory_report.py.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
 import time
@@ -364,6 +365,43 @@ def _dispatch_fetch_anchor_id() -> int:
     OLDER than the anchor, so the fetch window sees the worker's reply."""
     return int(((time.time() + _DISPATCH_FETCH_ANCHOR_AHEAD_SECONDS) * 1000.0
                 - 1420070400000.0) * (1 << 22))
+
+
+# A dispatch / room lane is a SYNTHETIC turn: no inbound Discord message exists
+# for it. Core (``gateway/session_authority.py::_admit_native``) mints EVERY
+# native admission's ``request_id`` straight from ``event.message_id``:
+#     request_id = str(payload['native_text_v1']['event']['message_id'])
+# A lane cloned with ``dataclasses.replace(event, ...)`` inherits the trigger's
+# ``message_id``; re-admitting it into the SAME (principal, target session) as
+# the original but with a DIFFERENT payload (the task text / channel_context /
+# routing verdict) trips ``admission_conflict`` in
+# ``hermes_state_runtime.admit_session_input`` — the live private-home-channel
+# bug (a follow-up looked routed to the bot AND raised RuntimeStoreError).
+# Each synthetic lane therefore needs its OWN ``message_id`` (its own request
+# identity), unique per (request, target session, routing decision). The reply
+# anchor stays pinned to the real trigger via ``reply_anchor_override`` — the
+# field ``_reply_anchor_for_event`` honours over ``message_id`` — so replies
+# still quote the user's message exactly as before the id change.
+_dispatch_lane_seq = itertools.count(1)
+
+
+def _concierge_lane_message_id() -> str:
+    """Fresh numeric-string id for one synthetic concierge lane event.
+
+    A future-snowflake base keeps it in the same shape as the fetch anchor and
+    clear of any real (already-arrived) Discord id; the monotonic counter makes
+    it unique even when two lanes are minted in the same clock tick.
+    """
+    return str(_dispatch_fetch_anchor_id() + next(_dispatch_lane_seq))
+
+
+def _concierge_lane_identity(event) -> dict:
+    """``dataclasses.replace`` kwargs giving a lane clone its own request id
+    while preserving the trigger's reply anchor byte-for-byte."""
+    anchor = (getattr(event, "reply_anchor_override", None)
+              or getattr(event, "message_id", None))
+    return {"message_id": _concierge_lane_message_id(),
+            "reply_anchor_override": anchor}
 
 
 def _concierge_channel_slug(raw: str) -> str:
@@ -1995,7 +2033,8 @@ class ConciergeDiscordMixin:
                 event, source=worker_source, text=task,
                 raw_message=_DispatchFetchAnchor(
                     self._concierge_dispatch_channel_object(worker_channel),
-                    _dispatch_fetch_anchor_id()))
+                    _dispatch_fetch_anchor_id()),
+                **_concierge_lane_identity(event))
             if home_history is not None:
                 worker_event.channel_context = home_history
             worker_event.media_urls = list(worker_event.media_urls or [])
@@ -2045,7 +2084,9 @@ class ConciergeDiscordMixin:
         try:
             phase_b_source = dataclasses.replace(
                 source, profile=orchestrator, chat_id=home_channel)
-            phase_b_event = dataclasses.replace(event, source=phase_b_source)
+            phase_b_event = dataclasses.replace(
+                event, source=phase_b_source,
+                **_concierge_lane_identity(event))
             reply_block = _concierge_dispatch_reply_block(title, worker_answer)
             phase_b_event.channel_context = (
                 f"{home_history}\n\n{reply_block}"
@@ -2171,7 +2212,9 @@ class ConciergeDiscordMixin:
 
         member_source = dataclasses.replace(
             event.source, profile=member)
-        member_event = dataclasses.replace(event, source=member_source)
+        member_event = dataclasses.replace(
+            event, source=member_source,
+            **_concierge_lane_identity(event))
         if room_history is not None:
             # The cloned event carries the STANDARD backfill's context, which
             # self-partitions at the shared identity — under the concierge's

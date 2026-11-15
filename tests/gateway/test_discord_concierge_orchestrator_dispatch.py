@@ -418,6 +418,52 @@ def test_directive_dispatches_through_the_worker_and_summarizes(rig, monkeypatch
     assert (str(HOME), PHASE_B_ANSWER) in seams.sent
 
 
+def test_synthetic_lanes_have_unique_request_identities(rig, monkeypatch):
+    """Regression for the live private-home ``admission_conflict`` follow-up.
+
+    Core (``session_authority._admit_native``) mints EVERY native admission's
+    ``request_id`` from ``event.message_id``. The worker and phase-B lane events
+    are synthetic clones of the trigger built with ``dataclasses.replace``; if
+    they inherited the trigger's ``message_id``, re-admitting one into the same
+    (principal, target session) as the original but with a DIFFERENT payload
+    (the task text / channel_context / routing verdict) reuses the ORIGINAL
+    request id and raises ``RuntimeStoreError('admission_conflict')`` — while
+    the worker turn has already visibly delivered, so the user sees BOTH the
+    routed answer and a misleading ``/reset`` error card.
+
+    Each synthetic lane must carry its OWN ``message_id`` (a unique request id
+    per request / target session / routing decision), and ``reply_anchor_override``
+    must keep replies quoting the real trigger exactly as before.
+    """
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(rig, calls, {ORCH: DIRECTIVE, WORKER_PROFILE: WORKER_ANSWER})
+
+    trigger = _trigger(rig)
+    _drive(rig, trigger)
+
+    worker_call = next(c for c in calls
+                       if getattr(c.source, "profile", None) == WORKER_PROFILE)
+    phase_b = next(c for c in calls
+                   if getattr(c, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None))
+
+    # Unique per (request, target session, routing decision): the trigger and
+    # the two synthetic lanes must NOT share a core-derived request_id.
+    ids = {trigger.message_id, worker_call.message_id, phase_b.message_id}
+    assert len(ids) == 3, (
+        "a synthetic lane inherited the trigger's message_id -> "
+        f"request_id collision: {ids}")
+    assert worker_call.message_id != trigger.message_id
+    assert phase_b.message_id != trigger.message_id
+    assert worker_call.message_id != phase_b.message_id
+    # Replies still quote the REAL user message (the field
+    # _reply_anchor_for_event honours over message_id), byte-for-byte as before.
+    assert worker_call.reply_anchor_override == trigger.message_id
+    assert phase_b.reply_anchor_override == trigger.message_id
+
+
 def test_multi_line_worker_reply_reaches_phase_b_whole(rig, monkeypatch):
     """IMPORTANT #1 (quality review): a MULTI-PARAGRAPH worker answer (blank
     lines between the paragraphs) must reach the phase-B context block WHOLE —
