@@ -77,6 +77,7 @@ def provision_home_space(
     blueprint: str = "orchestrator",
     provider_group: Optional[dict] = None,
     display_name: Optional[str] = None,
+    record_home: bool = True,
 ) -> dict:
     """The shared, non-Discord tail of home-space provisioning (sync, pure).
 
@@ -115,10 +116,15 @@ def provision_home_space(
             already = bool(record.get("already_provisioned"))
 
         # 2) record home_category + home_channel + guild_id (authoritative).
+        #    SKIPPED for a shared space: ``home_category`` / ``home_channel`` are
+        #    the subject's PRIVATE home pointer, and a shared space is not it
+        #    (§12.5) — writing here hijacked the private pointer so every later
+        #    run adopted the shared category and created nothing.
         step = "record"
-        registry.update_user(
-            user_id, home_category=home_category, home_channel=home_channel,
-            guild_id=guild_id)
+        if record_home:
+            registry.update_user(
+                user_id, home_category=home_category, home_channel=home_channel,
+                guild_id=guild_id)
 
         # 3) bind_channel LAST — nothing routes into the channel until it lands.
         step = "bind"

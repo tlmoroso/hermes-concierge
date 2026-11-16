@@ -388,13 +388,12 @@ def test_space_public_full_flow(rig, monkeypatch):
                                        "send_messages": True,
                                        "manage_channels": True}
 
-    assert _names(log) == [
-        "update_user", "create_channel", "create_bot", "update_user",
-        "bind_channel"]
+    # A shared space does NOT write the subject's PRIVATE home pointer, so the
+    # only registry writes are the bind (see §12.5 / test_space_does_not_hijack_
+    # private_home_pointer). It still creates its general channel and binds it.
+    assert _names(log) == ["create_channel", "create_bot", "bind_channel"]
     assert _rows(log, "create_channel")[0][3] == "general"
     assert _rows(log, "create_bot")[0][2]["user_id"] == "700"
-    assert _rows(log, "update_user")[-1][2] == {
-        "home_category": "9001", "home_channel": "9100", "guild_id": "42"}
     assert _rows(log, "bind_channel")[0][2]["blueprint"] == "orchestrator"
 
     text, ephemeral = inter.all_replies()[0]
@@ -423,18 +422,69 @@ def test_category_adopts_existing_resolving_category(rig, monkeypatch):
     assert "7777" in text and "7888" in text   # both ids reported
 
 
-def test_space_adopts_existing_resolving_category(rig, monkeypatch):
-    log, _ = _install(rig, monkeypatch, users={
+def test_space_creates_new_instead_of_adopting_home_category(rig, monkeypatch):
+    """/bot space <name> builds a NEW shared space — it never adopts the
+    subject's PRIVATE home category (§12.5: a shared space is named by its
+    operator-supplied topic, never a display name).
+
+    Regression: the "adopt a still-resolving home category" idempotency guard
+    ran for BOTH commands. Since /bot space takes no <user> argument, the
+    subject is the invoking admin — who already owns a private home category —
+    so the command adopted it and created NOTHING. The operator saw
+    "Adopted existing home category (id ...) with general channel (id ...)."
+    and no new category or channel (live bug 2026-11-15).
+    """
+    _install(rig, monkeypatch, users={
         "admin1": {"home_category": "7777", "home_channel": "7888"},
     })
-    guild = _FakeGuild()
+    caller = _Obj(id=700, display_name="Admin", name="Admin",
+                  guild_permissions=SimpleNamespace(administrator=False))
+    guild = _FakeGuild(members=[caller])
     guild.channels[7777] = SimpleNamespace(id=7777, name="old-topic")
-    inter = _FakeInteraction(guild, user_id="admin1")
+    _wire_client(rig, guild)
+    inter = _FakeInteraction(guild, user_id="700")
+    inter.user = caller
 
     _run(rig.adapter._concierge_cmd_space(inter, "new-topic"))
 
-    assert guild.created == []
-    assert _names(log) == []
+    # a NEW public category named by the topic — the private 7777 is untouched
+    assert len(guild.created) == 1
+    name, overwrites = guild.created[0]
+    assert name == "new-topic"
+    assert guild.default_role not in overwrites   # public: no default-role overwrite
+    assert inter.user in overwrites               # the subject keeps manage_channels
+    assert guild.me in overwrites                 # public grants the bot explicitly
+
+
+def test_space_does_not_hijack_private_home_pointer(rig, monkeypatch):
+    """A shared space is recorded on its own — never into the subject's
+    ``home_category`` / ``home_channel``, which stay the PRIVATE home.
+
+    Regression: the shared non-Discord tail wrote the full triple unconditionally,
+    so creating a shared space overwrote the admin's private home pointer. The
+    next /bot category (or /bot space) then adopted the SHARED category as the
+    home and created nothing.
+    """
+    log, store = _install(rig, monkeypatch, users={
+        "700": {"home_category": "7777", "home_channel": "7888"},
+    })
+    caller = _Obj(id=700, display_name="Admin", name="Admin",
+                  guild_permissions=SimpleNamespace(administrator=False))
+    guild = _FakeGuild(members=[caller])
+    guild.channels[7777] = SimpleNamespace(id=7777, name="old-topic")
+    _wire_client(rig, guild)
+    inter = _FakeInteraction(guild, user_id="700")
+    inter.user = caller
+
+    _run(rig.adapter._concierge_cmd_space(inter, "fall-vacay"))
+
+    # the recorded PRIVATE pointer is NOT the new shared space
+    entry = store["users"]["700"]
+    assert entry["home_category"] == "7777"
+    assert entry["home_channel"] == "7888"
+    # ...but the new channel IS still bound, so it routes
+    assert len(guild.created) == 1
+    assert [e for e in log if e[0] == "bind_channel"], "must bind LAST"
 
 
 def test_stale_category_is_recreated(rig, monkeypatch):

@@ -204,6 +204,9 @@ from plugins.platforms.discord.concierge_mixin_helpers import (
     _concierge_dispatch_reply_block,
     _concierge_threading_mode_of,
 )
+from plugins.platforms.discord.concierge_mixin_home_space import (
+    _concierge_home_category_overwrites,
+)
 from plugins.platforms.discord.concierge_mixin_lanes import (
     _concierge_lane_identity,
 )
@@ -1552,7 +1555,8 @@ class ConciergeDiscordMixin:
             return "orchestrator-user"
 
     async def _concierge_ensure_home_category(self, *, user_id, guild_id,
-                                              visibility, name=None):
+                                              visibility, name=None,
+                                              adopt_recorded=True):
         """Card F shared helper (design §2, §3.1, §6): resolve or create the
         user's HOME CATEGORY — the single placement authority for everything
         the orchestrator spawns. Returns the category id to use, or ``None``
@@ -1582,9 +1586,15 @@ class ConciergeDiscordMixin:
             from concierge import registry
 
             # 1) adopt a still-resolving durable pointer (shared §6 reader).
-            existing = self._concierge_resolve_home_category(str(user_id))
-            if existing:
-                return str(existing)
+            #    A SHARED space (``/bot space <name>``) is NOT the subject's home
+            #    category (§12.5) — named by operator topic, never a display name
+            #    — so it must NEVER adopt the private pointer; it always builds a
+            #    new category. Otherwise a re-run of either command adopted the
+            #    other's category and created nothing (live bug 2026-11-15).
+            if adopt_recorded:
+                existing = self._concierge_resolve_home_category(str(user_id))
+                if existing:
+                    return str(existing)
             # 2) resolve-only (bootstrap): no create, no write, no warning.
             if not name:
                 return None
@@ -1606,8 +1616,6 @@ class ConciergeDiscordMixin:
                     guild = None
             if guild is None:
                 return None
-            import discord
-
             member = None
             try:
                 getter = getattr(guild, "get_member", None)
@@ -1615,38 +1623,19 @@ class ConciergeDiscordMixin:
                     member = getter(int(user_id))
             except Exception:  # health: allow BLE001 -- fail-closed: an unresolvable member only drops its overwrite
                 member = None
-            overwrites = {}
-            if visibility != "public":
-                overwrites[guild.default_role] = discord.PermissionOverwrite(
-                    view_channel=False)
-                if member is not None:
-                    overwrites[member] = discord.PermissionOverwrite(
-                        view_channel=True, manage_channels=True)
-                for m in getattr(guild, "members", []) or []:
-                    perms = getattr(m, "guild_permissions", None)
-                    if getattr(perms, "administrator", False):
-                        overwrites[m] = discord.PermissionOverwrite(
-                            view_channel=True, manage_channels=True)
-            elif member is not None:
-                overwrites[member] = discord.PermissionOverwrite(
-                    manage_channels=True)
-            # LAST, so no branch above can drop it: the bot must be able to see and
-            # post in the space IT creates. A private category denies @everyone and
-            # grants only the target member + guild administrators; the bot is neither,
-            # so without this overwrite it 403s on its own home channel
-            # ("Missing Access", observed live 2026-11-15).
-            bot_member = getattr(guild, "me", None)
-            if bot_member is not None:
-                overwrites[bot_member] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, manage_channels=True)
+            overwrites = _concierge_home_category_overwrites(
+                guild, member=member, visibility=visibility)
             category = await guild.create_category(
                 name=str(name), overwrites=overwrites)
             category_id = str(getattr(category, "id", "") or "") or None
             if not category_id:
                 return None
-            await asyncio.to_thread(
-                registry.update_user, str(user_id),
-                home_category=category_id)
+            # home_category is the subject's PRIVATE home pointer, so only the
+            # private path may write it; a shared space is recorded on its own.
+            if adopt_recorded:
+                await asyncio.to_thread(
+                    registry.update_user, str(user_id),
+                    home_category=category_id)
             return category_id
         except Exception as e:  # health: allow BLE001 -- fail-closed boundary: any create/record fault returns None (caller falls back to the trigger category)
             logger.debug(

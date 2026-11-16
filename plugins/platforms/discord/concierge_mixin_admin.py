@@ -83,11 +83,11 @@ class ConciergeAdminMixin:
             return
         await self._concierge_build_home_space(
             interaction, guild=guild, user_id=user_id,
-            name=topic, member=caller, visibility="public")
+            name=topic, member=caller, visibility="public", shared=True)
 
     async def _concierge_build_home_space(self, interaction, *, guild,
                                           user_id, name, member,
-                                          visibility):
+                                          visibility, shared: bool = False):
         """Create (or adopt) the subject's home category + its general channel.
 
         Both /bot category (private) and /bot space (public) funnel here. The
@@ -135,7 +135,11 @@ class ConciergeAdminMixin:
         guild_id = str(getattr(guild, "id", "") or "") or None
 
         # ── idempotency: adopt a still-resolving home category ──────────────
-        existing = self._concierge_home_category_for(user_id)
+        #    PRIVATE (``/bot category``) only. ``/bot space <name>`` builds a NEW
+        #    public category named by its operator topic (§12.5) — it must never
+        #    adopt, or a subject who already owns a home category can never get
+        #    a shared one (live bug 2026-11-15: "No new category or channel").
+        existing = None if shared else self._concierge_home_category_for(user_id)
         if existing and self._concierge_home_space_category_resolves(
                 guild, existing):
             home_channel = registry.home_channel_for_user(user_id)
@@ -154,7 +158,8 @@ class ConciergeAdminMixin:
         # used here only for the idempotency check above and the guild_id.
         category_id = await self._concierge_ensure_home_category(
             user_id=user_id, guild_id=guild_id,
-            visibility=visibility, name=name)
+            visibility=visibility, name=name,
+            adopt_recorded=not shared)
         if not category_id:
             await self._concierge_respond(
                 interaction, "Failed to create the home category.",
@@ -210,7 +215,7 @@ class ConciergeAdminMixin:
                 provision_home_space,
                 user_id=user_id, guild_id=guild_id,
                 home_channel=general_id, home_category=category_id,
-                blueprint="orchestrator")
+                blueprint="orchestrator", record_home=not shared)
         except HomeSpaceError as e:
             messages = {
                 "provision": "Failed to provision the orchestrator",
