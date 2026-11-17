@@ -8,7 +8,7 @@ self-contained (no dependency on the sibling registry/config/routing cards).
 Contracts covered:
 - /bot category <user> creates a PRIVATE category named ``<display-name>``
   (the old ``-private`` suffix is gone), with @everyone denied and the target
-  member + guild admins granted view/manage;
+  member + guild admins granted view/manage/talk;
 - /bot space <name> creates a PUBLIC category named the operator topic, with
   NO default-role overwrite;
 - both then create the general channel, provision the orchestrator only when
@@ -36,6 +36,7 @@ _ensure_discord_mock()
 import discord  # the conftest mock, installed above
 
 from concierge import provision, registry
+from plugins.platforms.discord.concierge_mixin_home_space import _TALK_PERMS
 
 
 def _run(coro):
@@ -284,15 +285,17 @@ def test_category_private_full_flow(rig, monkeypatch):
     name, overwrites = guild.created[0]
     assert name == "Alice"
     assert "-private" not in name
-    # private: @everyone denied; target + admins granted view + manage
+    # private: @everyone denied; target + admins granted view + manage + talk
     assert guild.default_role in overwrites
     assert overwrites[guild.default_role].kw == {"view_channel": False}
     assert target in overwrites
     assert overwrites[target].kw == {"view_channel": True,
-                                     "manage_channels": True}
+                                     "manage_channels": True,
+                                     **_TALK_PERMS}
     assert admin in overwrites
     assert overwrites[admin].kw == {"view_channel": True,
-                                    "manage_channels": True}
+                                    "manage_channels": True,
+                                    **_TALK_PERMS}
     # the bot itself: without this it 403s "Missing Access" on its own channel
     assert guild.me in overwrites
     assert overwrites[guild.me].kw == {"view_channel": True,

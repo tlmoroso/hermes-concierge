@@ -13,6 +13,20 @@ Returns a dict keyed by role/member, for ``guild.create_category(overwrites=)``.
 """
 
 
+# A member who can VIEW a private home category must also be able to TALK in
+# it. ``manage_channels`` does NOT imply ``send_messages``, and a private
+# category denies @everyone outright — so with view+manage alone the member
+# sees the channel and cannot post in it. Granted explicitly to the target
+# member and to every administrator.
+_TALK_PERMS = {
+    "send_messages": True,
+    "read_message_history": True,
+    "create_public_threads": True,
+    "create_private_threads": True,
+    "manage_threads": True,
+}
+
+
 def _concierge_home_category_overwrites(guild, *, member, visibility):
     """Overwrites for a HOME CATEGORY about to be created in ``guild``.
 
@@ -22,8 +36,8 @@ def _concierge_home_category_overwrites(guild, *, member, visibility):
 
 
     PRIVATE (``visibility != "public"``): @everyone is denied view; the target
-    member and every guild administrator get view+manage. PUBLIC: only the
-    member's manage_channels overwrite.
+    member and every guild administrator get view+manage+talk. PUBLIC: only
+    the member's manage_channels overwrite.
 
     Either way the BOT's own overwrite is written LAST, so no branch above can
     drop it. A private category denies @everyone and grants only the target
@@ -39,12 +53,12 @@ def _concierge_home_category_overwrites(guild, *, member, visibility):
             view_channel=False)
         if member is not None:
             overwrites[member] = discord.PermissionOverwrite(
-                view_channel=True, manage_channels=True)
+                view_channel=True, manage_channels=True, **_TALK_PERMS)
         for m in getattr(guild, "members", []) or []:
             perms = getattr(m, "guild_permissions", None)
             if getattr(perms, "administrator", False):
                 overwrites[m] = discord.PermissionOverwrite(
-                    view_channel=True, manage_channels=True)
+                    view_channel=True, manage_channels=True, **_TALK_PERMS)
     elif member is not None:
         overwrites[member] = discord.PermissionOverwrite(
             manage_channels=True)
