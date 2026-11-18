@@ -52,6 +52,28 @@ def test_notes_soul_mentions_conventions():
     assert "CONVENTIONS.md" in get_blueprint("notes").soul
 
 
+def test_notes_soul_does_not_inline_the_conventions_method():
+    """The method lives in the vault's CONVENTIONS.md (data), not in the
+    SOUL (prompt context — bloat here costs every turn). The persona line
+    may still say 'tend MOCs'; the METHOD rules it used to duplicate
+    (search-before-create, atomicity, topic-cluster MOC triggers) must
+    be gone."""
+    soul = get_blueprint("notes").soul
+    assert "Search before create" not in soul
+    # 'MOC' is persona vocabulary only: every line mentioning MOC must be the
+    # persona line ("tend MOCs"). A re-added MOC *method* rule fails this.
+    assert all("tend MOCs" in line for line in soul.splitlines() if "MOC" in line)
+    assert "topic cluster" not in soul
+
+
+def test_notes_soul_stays_small():
+    """Minimal-context invariant: the unsubstituted template ({name} still a
+    placeholder) is 363 chars; the pre-trim inlined method bloated it to 779.
+    The ceiling has headroom for ~1 added rule line — raise it consciously,
+    never to re-inline the CONVENTIONS.md method."""
+    assert len(get_blueprint("notes").soul) < 500
+
+
 def test_get_blueprint_unknown_key_raises():
     with pytest.raises(KeyError, match="Known:"):
         get_blueprint("nope")
