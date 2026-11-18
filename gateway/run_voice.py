@@ -211,15 +211,27 @@ class GatewayVoiceMixin:
     def _voice_ack_guild_for(self, source: SessionSource) -> Optional[int]:
         """Guild whose voice call is bound to *source*'s text channel on the bot that ANSWERS it.
         Under multiplexing a secondary profile's call lives on its own adapter, never the default's
-        (#139345): reading ``self.adapters`` would miss its call or borrow the primary bot's."""
+        (#139345): reading ``self.adapters`` would miss its call or borrow the primary bot's.
+        A concierge home-session re-key leaves ``source.chat_id`` as the speaker's HOME channel; the
+        lane map the restamp registered then resolves the guild whose voice call owns the turn, so
+        the verbal ack still plays in the VOICE channel (the binding, not the re-keyed id, decides)."""
         if source.platform != Platform.DISCORD:
             return None
         adapter = self._delivery_adapter_for(source)
         bound = getattr(adapter, "_voice_text_channels", None)
         if not (isinstance(bound, dict) and hasattr(adapter, "voice_mixer_active")):
             return None
-        return next((gid for gid, channel in bound.items()
-                     if str(channel) == str(source.chat_id) and adapter.voice_mixer_active(gid)), None)
+        guild = next((gid for gid, channel in bound.items()
+                      if str(channel) == str(source.chat_id) and adapter.voice_mixer_active(gid)), None)
+        if guild is None:
+            lane = getattr(adapter, "_concierge_voice_home_guild_for", None)
+            if callable(lane):
+                found = None
+                with suppress(Exception):
+                    found = lane(str(source.chat_id))
+                if isinstance(found, int):
+                    guild = found if adapter.voice_mixer_active(found) else None
+        return guild
 
     def _handle_voice_timeout_cleanup(self, chat_id: str, *, adapter=None) -> None:
         """Adapter callback on voice-channel timeout: clear runner-side voice_mode state.
@@ -359,17 +371,19 @@ class GatewayVoiceMixin:
                 safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
                 safe_text = safe_text.replace("@here", "@\u200bhere")
                 await channel.send(t("gateway.voice.transcript_echo", user=user_id, text=safe_text))
-        # Bound text channel's channel_prompt and skills: voice input gets the same per-channel
-        # context, and a first spoken turn opens the session, the only point skills load.
-        # A thread inherits its parent's bindings, as its typed messages do.
+        # Per-channel context keyed to the SOURCE's channel AFTER the restamp hook (identical to the
+        # bound text channel when no hook re-keyed it): a home-session re-key must carry the HOME
+        # channel's prompt/skills — the same context a typed turn in that session gets — or spoken
+        # turns would flip the session's pinned prompt on every modality switch. A thread inherits
+        # its parent's bindings, as its typed messages do.
         channel_prompt = auto_skill = None
         parent_id = source.parent_chat_id or None
         if callable(resolver := getattr(adapter, "_resolve_channel_prompt", None)):
             with suppress(Exception):
-                resolved = resolver(str(text_ch_id), parent_id)
+                resolved = resolver(str(source.chat_id), parent_id)
                 channel_prompt = resolved if isinstance(resolved, str) else None
         if callable(skills := getattr(adapter, "_resolve_channel_skills", None)):
-            bound = skills(str(text_ch_id), parent_id)
+            bound = skills(str(source.chat_id), parent_id)
             auto_skill = bound if isinstance(bound, list) else None
         # Synthetic MessageEvent for the normal pipeline; the SimpleNamespace raw_message lets
         # _get_guild_id() extract guild_id so _send_voice_reply() plays audio in the voice channel.

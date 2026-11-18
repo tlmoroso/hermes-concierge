@@ -156,6 +156,10 @@ class ConciergeVoiceMixin:
     _concierge_warn_once: Any
     _concierge_stamp_connect_nudge: Any
     _concierge_wire_dynamic_router: Any
+    # Duck-typed adapter names the home-session lane and the auto-TTS gate
+    # read (DiscordVoiceInfoMixin / the base adapter provide them).
+    _voice_text_channels: Any
+    is_in_voice_channel: Any
 
     # The relay handoff slot (Task 3): the member-lane voice event whose
     # auto-TTS synthesis follows. Never read across turns — see
@@ -310,26 +314,23 @@ class ConciergeVoiceMixin:
         the source unstamped and the utterance takes the normal delegation
         path (fail-closed, intake never breaks).
 
-        Speaker→orchestrator lane (design §5, admission reconciliation):
-        the normal registry verdict runs FIRST — a binding or room verdict
-        claims the channel exactly as for typed input (a user speaking in
-        a worker's channel is talking to that worker; design: binding
-        routing untouched) — and the lane AFTER it consumes the verdict
-        tail's EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp: spoken
-        input from a user with a live orchestrator runs as their
-        orchestrator when the channel owns no conversation of its own
-        (unbound); bound and room channels keep their existing routing.
-        The order is what admission reconciles with BY CONSTRUCTION — the
-        stamp exists only on an unbound, non-room channel, exactly the
-        shape branch (c) of ``_concierge_dynamic_runtime_profile``
-        confirms; re-homing a bound or room channel to the orchestrator
-        would leave a profile admission refuses (``profile_mismatch`` —
-        the utterance DROPPED, the one outcome the routing invariants
-        forbid). No category check for the voice lane (controller
-        decision: spoken input is user-scoped, not channel-scoped — the
-        user's orchestrator is the front door for all their spoken input
-        in unbound channels, regardless of category). Relay rationale:
-        the orchestrator's own final turn already contains the
+        Speaker→orchestrator lane (design: voice-home-session-rekey): the
+        normal registry verdict runs FIRST — a binding or room verdict
+        claims the channel exactly as for typed input (a user speaking in a
+        worker's channel is talking to that worker; binding routing
+        untouched) — and the lane AFTER it consumes the verdict tail's
+        EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp: spoken input from
+        a user with a live orchestrator runs as their orchestrator ON THEIR
+        HOME-CHANNEL SESSION (operator decision 2026-11-17: spoken turns
+        continue the same conversation as typed turns in the home channel —
+        not a fresh session keyed to the voice-bound text channel), by
+        re-keying the source to the recorded home channel BEFORE the
+        identity pins (run_voice canonicalizes after this hook), so
+        admission confirms via the home channel's BINDING (branch (a) of
+        ``_concierge_dynamic_runtime_profile``), by construction. No
+        category check for the voice lane (controller decision: spoken
+        input is user-scoped, not channel-scoped). Relay rationale: the
+        orchestrator's own final turn already contains the
         dispatched-and-summarized worker results, so the existing relay at
         the base auto-TTS seam speaks the right answer — no relay changes.
         """
@@ -348,45 +349,46 @@ class ConciergeVoiceMixin:
         self._concierge_wire_dynamic_router(runner)
         reg = self._concierge_registry_or_none(source)
         if reg is not None:
-            # The normal registry verdict FIRST (design §5, admission
-            # reconciliation): a binding or room verdict claims the channel
-            # exactly as for typed input, and only its no-verdict tail
-            # stamps the orchestrator — the lane below consumes that stamp,
-            # never a second users-section read or liveness pass.
+            # The normal registry verdict FIRST: a binding or room verdict
+            # claims the channel exactly as for typed input, and only its
+            # no-verdict tail stamps the orchestrator — the lane below
+            # consumes that stamp, never a second users-section read or
+            # liveness pass in the stamping itself.
             self._concierge_apply_registry_verdict(source, reg)
-            self._concierge_voice_orchestrator_lane(source)
+            self._concierge_voice_orchestrator_lane(source, reg)
 
-    def _concierge_voice_orchestrator_lane(self, source) -> None:
-        """The speaker→orchestrator lane of the voice restamp (design §5):
-        consume the verdict tail's EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR``
-        stamp — placed by ``_concierge_apply_registry_verdict`` exactly when
-        NO binding/room verdict claimed the channel AND the author has a
-        LIVE orchestrator (the stamp tail's own liveness posture and warn
-        keys — no new lookups here) — and re-home ``source.profile`` to it:
-        spoken input from a user with a live orchestrator runs as their
-        orchestrator when the channel owns no conversation of its own
-        (unbound); bound and room channels keep their existing routing
-        (design: binding routing untouched).
+    def _concierge_voice_orchestrator_lane(self, source, reg) -> None:
+        """The speaker→orchestrator lane of the voice restamp (design:
+        voice-home-session-rekey): consume the verdict tail's EXISTING
+        ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp — placed by
+        ``_concierge_apply_registry_verdict`` exactly when NO binding/room
+        verdict claimed the channel AND the author has a LIVE orchestrator
+        (the stamp tail's own liveness posture and warn keys) — and run the
+        spoken turn as the speaker's orchestrator ON THEIR HOME-CHANNEL
+        SESSION: the turn continues the same conversation typed turns in
+        the home channel run (the operator decision; per-speaker by
+        construction, so a shared voice channel works multi-user).
 
-        Admission reconciles BY CONSTRUCTION: the stamp exists only on an
-        unbound, non-room channel — exactly the shape branch (c) of
-        ``_concierge_dynamic_runtime_profile`` confirms — so a re-home to
-        a profile admission refuses (the ``profile_mismatch`` drop a
-        pre-verdict re-home could produce on a bound or room channel) is
-        impossible. No category check: spoken input is user-scoped, not
-        channel-scoped (controller decision) — the user's orchestrator is
-        the front door for all their spoken input in unbound channels,
-        regardless of category.
+        Admission reconciles BY CONSTRUCTION, now via the home BINDING:
+        the lane re-keys the source to the OWNING user's recorded home
+        channel (registry accessor, never derived from the trigger event)
+        and re-runs the registry verdict on the re-keyed shape, so the
+        restamped source carries the IDENTICAL stamps a fresh
+        ``build_source`` for the home channel gets (profile re-homed via
+        the binding branch, connect-nudge stamp included, orchestrator
+        stamp cleared) and ``_concierge_dynamic_runtime_profile`` confirms
+        via branch (a) — the home channel is bound to exactly the
+        orchestrator by provisioning, a shape the gate below verified
+        against the same registry read. Bound and room channels keep their
+        existing routing (no stamp ever lands there).
 
-        The stamp implies NO room-targets stamp (the verdict tail stamps
-        the orchestrator only on its no-verdict branch, after clearing any
-        stale room stamp), so the lane has nothing to clear; the stamp
-        itself STAYS on the source — the wrap's fallback re-home is
-        idempotent (same profile). Bot-authored sources never carry the
-        stamp (the tail's own anti-loop guard, mirrored here); NEVER raises
-        — a failure inside the lane leaves the routing as the verdict left
-        it (fail-closed: the wrap's fallback can still re-home, else the
-        hub answers — intake never breaks).
+        Fail-closed: no recorded home, the home channel not bound to
+        exactly the orchestrator, a room home, or a guild mismatch →
+        today's behaviour stands (the re-home on the bound-channel session
+        the stamp implies). Bot-authored utterances never take the lane
+        (the stamp tail's anti-loop guard, mirrored here). NEVER raises —
+        a failure inside the lane leaves the routing as the verdict left
+        it; intake never breaks.
         """
         try:
             if getattr(source, "is_bot", False):
@@ -398,12 +400,21 @@ class ConciergeVoiceMixin:
                 # warned once for the dead/uncheckable cases) — today's
                 # routing stands.
                 return
-            source.profile = orchestrator
-            logger.debug(
-                "[%s] Concierge: spoken input from user %s routed to their "
-                "orchestrator %s (personal voice lane, unbound channel)",
-                getattr(self, "name", "discord"),
-                str(getattr(source, "user_id", "") or "?"), orchestrator)
+            home = self._concierge_voice_home_rekey_target(
+                source, reg, orchestrator)
+            if home is None:
+                # No recorded home / shape drift: today's re-home stands —
+                # the stamp stays for the wrap's idempotent fallback.
+                source.profile = orchestrator
+                logger.debug(
+                    "[%s] Concierge: spoken input from user %s routed to "
+                    "their orchestrator %s (personal voice lane, unbound "
+                    "channel, no re-keyable home)",
+                    getattr(self, "name", "discord"),
+                    str(getattr(source, "user_id", "") or "?"), orchestrator)
+                return
+            self._concierge_voice_rekey_to_home(
+                source, reg, home, orchestrator)
         except Exception:
             # Fail-closed, the hook's own contract: a failure inside the
             # lane leaves the source as the verdict left it — the wrap's
@@ -413,6 +424,211 @@ class ConciergeVoiceMixin:
                 "[%s] Concierge: speaker-to-orchestrator voice re-home "
                 "failed; leaving the verdict's routing in place",
                 getattr(self, "name", "discord"), exc_info=True)
+
+    def _concierge_voice_home_rekey_target(self, source, reg, orchestrator):
+        """The home channel id to re-key *source* onto, or ``None``
+        (fail-closed: today's bound-channel re-home stands).
+
+        The home id is the OWNING user's RECORDED one — the registry's
+        canonical users-section accessor (``registry.get_user``, tolerant
+        of hand-edited files; it re-reads the registry, once per SPOKEN
+        utterance, not per message) — never derived from the trigger event.
+        The shape gates ride the ONE registry read the verdict already paid:
+        the home channel must be BOUND to exactly the stamped orchestrator
+        (what admission's branch (a) confirms and the verdict re-run needs)
+        and be no room (a room home is a fan-out shape, never a session),
+        and the user's recorded guild, when present, must be the voice
+        guild — otherwise the re-key would move the reply across guilds.
+        """
+        user_id = str(getattr(source, "user_id", "") or "")
+        voice_guild = str(getattr(source, "guild_id", "") or "")
+        if not user_id or not voice_guild:
+            return None  # no speaker or no voice guild to key playback to
+        try:
+            from concierge import registry
+
+            entry = registry.get_user(user_id)
+        except Exception:
+            logger.debug(
+                "[%s] Concierge: reading the speaker's users entry failed; "
+                "the spoken turn keeps the bound-channel session",
+                getattr(self, "name", "discord"), exc_info=True)
+            return None
+        if not isinstance(entry, dict):
+            return None
+        home = entry.get("home_channel")
+        if not isinstance(home, str) or not home.strip():
+            return None  # no home recorded: today's behaviour stands
+        entry_guild = entry.get("guild_id")
+        if (isinstance(entry_guild, str) and entry_guild.strip()
+                and entry_guild != voice_guild):
+            return None  # a home in another guild: channel-shape mismatch
+        rooms = reg.get("rooms")
+        if isinstance(rooms, dict) and isinstance(rooms.get(home), dict):
+            return None  # a room home would fan out, never a 1:1 session
+        from concierge.routing import resolve_target_profile
+
+        verdict = resolve_target_profile(
+            reg.get("bindings") or {}, channel_id=home, author_is_bot=False)
+        if not verdict.routed or verdict.profile != orchestrator:
+            return None  # drift: home unbound, or bound to another profile
+        return home
+
+    def _concierge_voice_rekey_to_home(self, source, reg, home,
+                                       orchestrator) -> None:
+        """Re-key *source* onto the home-channel session and restamp it as
+        a fresh ``build_source`` for the home channel would be stamped.
+
+        Playback lane FIRST: the re-keyed ``chat_id`` no longer names the
+        voice-bound text channel, so the voice seams (auto-TTS gate,
+        ``play_tts``, the runner's verbal-ack guild lookup) resolve the
+        VOICE GUILD through the lane map this registers. The session-bearing
+        shape then matches what a typed message in the home channel carries
+        (``build_session_key`` reads exactly these fields; the speaker's
+        ``user_id`` stays, preserving per-user isolation), the channel
+        labels follow (the session prompt renders them — a stale
+        bound-channel label would flip the home session's prompt every
+        modality switch), and the verdict re-run leaves the binding
+        branch's fresh stamps (profile re-home + connect nudge) with the
+        orchestrator stamp CLEARED — identical to fresh home input.
+        """
+        try:
+            self._concierge_voice_home_lane_register(home, source.guild_id)
+        except Exception:
+            logger.debug(
+                "[%s] Concierge: registering the voice home lane failed; "
+                "playback falls back to the bound-channel seams",
+                getattr(self, "name", "discord"), exc_info=True)
+        # The stamp's validated re-home first, kept even if the verdict
+        # re-run below declines (idempotent either way).
+        source.profile = orchestrator
+        source.chat_id = home
+        source.chat_type = "group"
+        source.thread_id = None
+        source.parent_chat_id = None
+        source.chat_name, source.chat_topic = self._concierge_voice_home_labels(
+            home, orchestrator)
+        self._concierge_apply_registry_verdict(source, reg)
+        try:
+            delattr(source, _CONCIERGE_ORCHESTRATOR_ATTR)
+        except AttributeError:
+            pass
+        logger.debug(
+            "[%s] Concierge: spoken input from user %s re-keyed onto their "
+            "home channel %s (orchestrator %s)",
+            getattr(self, "name", "discord"),
+            str(getattr(source, "user_id", "") or "?"), home, orchestrator)
+
+    def _concierge_voice_home_labels(self, home, orchestrator):
+        """``(chat_name, chat_topic)`` of the home channel, or ``(None,
+        None)``. The receiving bot may not see the user's private home
+        channel, so the orchestrator profile's bot — which is IN it, by
+        provisioning — is the second candidate. Fail-closed: unresolvable
+        labels read as ``None`` (the session prompt falls back to the
+        id-derived label), never a stale bound-channel label."""
+        clients = []
+        own = getattr(self, "_client", None)
+        if own is not None:
+            clients.append(own)
+        runner = getattr(self, "gateway_runner", None)
+        lookup = getattr(runner, "_adapters_for_profile", None)
+        if callable(lookup):
+            try:
+                peer = lookup(orchestrator).get(getattr(self, "platform", None))
+                client = getattr(peer, "_client", None)
+                if client is not None and client is not own:
+                    clients.append(client)
+            except Exception:
+                logger.debug(
+                    "[%s] Concierge: the orchestrator adapter's client was "
+                    "unreachable for home-channel labels",
+                    getattr(self, "name", "discord"), exc_info=True)
+        labels = getattr(self, "_guild_channel_labels", None)
+        for client in clients:
+            try:
+                channel = client.get_channel(int(home))
+                pair = (labels(channel) if channel is not None and callable(labels)
+                        else None)
+            except Exception:
+                logger.debug(
+                    "[%s] Concierge: reading the home channel %s's labels "
+                    "failed; the session prompt falls back to the id label",
+                    getattr(self, "name", "discord"), home, exc_info=True)
+                continue
+            if isinstance(pair, tuple) and len(pair) == 2:
+                return pair[0], pair[1]
+        return None, None
+
+    # ── The home-lane playback map (design: voice-home-session-rekey) ──────
+
+    # home channel id (str) -> the guild whose voice call captured the
+    # utterance; populated ONLY by the orchestrator lane's re-key, consumed
+    # by the auto-TTS gate below, Discord play_tts and the runner's
+    # verbal-ack guild lookup. ``None`` until the first re-key (a plain
+    # concierge-less install never populates it).
+    _voice_home_lanes: Any = None
+
+    def _concierge_voice_home_guild_for(self, chat_id):
+        """The guild whose voice call serves *chat_id*'s re-keyed home
+        session, or ``None`` — a pure map lookup; the callers apply their
+        own liveness (``is_in_voice_channel`` / ``voice_mixer_active``),
+        mirroring how the bound-channel paths do."""
+        lanes = self._voice_home_lanes
+        if not isinstance(lanes, dict):
+            return None
+        guild = lanes.get(str(chat_id) if chat_id is not None else "")
+        return guild if isinstance(guild, int) else None
+
+    def _concierge_voice_home_lane_register(self, home, guild) -> None:
+        """Record the home→guild playback lane, pruning entries whose voice
+        call went away (the map stays bounded by LIVE voice sessions). Never
+        raises: a failed registration degrades playback to the
+        bound-channel seams."""
+        try:
+            lanes = self._voice_home_lanes
+            if not isinstance(lanes, dict):
+                lanes = self._voice_home_lanes = {}
+            for key, gid in list(lanes.items()):
+                try:
+                    live = self.is_in_voice_channel(gid)
+                except Exception:
+                    logger.debug(
+                        "[%s] Concierge: probing voice liveness for guild %s "
+                        "failed; pruning the stale home lane",
+                        getattr(self, "name", "discord"), gid, exc_info=True)
+                    live = False
+                if not live:
+                    del lanes[key]
+            lanes[str(home)] = int(guild)
+        except Exception:
+            logger.debug(
+                "[%s] Concierge: the voice home-lane registration failed",
+                getattr(self, "name", "discord"), exc_info=True)
+
+    def _should_auto_tts_for_chat(self, chat_id) -> bool:
+        """Base gate, plus the home-lane mirror: a spoken turn re-keyed onto
+        the home session auto-TTSes exactly when the VOICE-BINDING channel
+        would (the mirror resolves the lane's guild → its bound channel →
+        the base verdict), so ``/voice on|tts|off`` semantics keep owning
+        spoken turns. Only VOICE-type events reach the auto-TTS path, so
+        the mirror never speaks a typed reply. Fail-closed to the base
+        verdict on any lookup fault."""
+        if super()._should_auto_tts_for_chat(chat_id):
+            return True
+        try:
+            guild = self._concierge_voice_home_guild_for(chat_id)
+            if guild is None or not self.is_in_voice_channel(guild):
+                return False
+            bound = self._voice_text_channels.get(guild)
+        except Exception:
+            logger.debug(
+                "[%s] Concierge: the home-lane auto-TTS mirror failed; the "
+                "base gate's verdict stands",
+                getattr(self, "name", "discord"), exc_info=True)
+            return False
+        return (bound is not None
+                and super()._should_auto_tts_for_chat(str(bound)))
+
 
     def _concierge_registry_or_none(self, source):
         """ONE registry read for the whole routing decision (rooms + bindings

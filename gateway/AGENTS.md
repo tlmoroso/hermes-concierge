@@ -58,24 +58,18 @@ MagicMock adapters in older tests auto-create truthy attributes.
 
 ## Background process notifications
 
-`terminal(background=true, notify_on_complete=true)` arms a watcher on the gateway loop
-(`run_notifications.py::arm_process_watcher`) that starts a new turn on completion; verbosity is
-`display.background_process_notifications`. Injection requires the `admit_internal_event` receipt
-(a handler returning None is not acceptance); refused admission refunds every claimed batch sibling
+`terminal(background=true, notify_on_complete=true)` arms a watcher (`run_notifications.py::
+arm_process_watcher`) that admits a completion turn into the session's durable FIFO
+(`internal_notification` display kind); refused admission refunds every claimed batch sibling
 without spending an attempt. Long form: `website/docs/developer-guide/gateway-internals.md`
 § Background process notifications.
-
-Canonical local CLI/TUI/Desktop sessions admit completion and watch events into the same durable
-FIFO as human input (private launch policy, `internal_notification` display kind); observers never
-own or consume those turns, and an interrupted started turn stays unknown and pauses its followers.
 
 ## `/login` (off-turn, paired DM only)
 
 `GatewayLoginCommandsMixin` refuses outside a real paired DM (ntfy, raft and a2a report `dm` for
-broadcast surfaces) and binds the WHOLE install's `providers.nous`, so shared gateways must set
-`allow_admin_from`. It drains `anon_auth.run_sign_in` on its private single-worker `_login_executor`
-(never the shared pool), allows one attempt per process, and on completion evicts agents still on
-`nous/welcome` instead of writing a model override. Long form: `gateway-internals.md` § `/login`.
+broadcast surfaces) and binds the WHOLE install's `providers.nous` — shared gateways must set
+`allow_admin_from`. One attempt per process, on the private `_login_executor`. Long form:
+`website/docs/developer-guide/gateway-internals.md` § `/login`.
 
 ## Gateway lifecycle vs. the Desktop app
 
@@ -134,7 +128,11 @@ gateway under the backend, and do NOT "fix" update locks by widening the tree-ki
   plugin injection, background-process events) reads `entry.origin` through
   `authz_mixin.py::_restored_source`, which re-pins a `RoutingIdentity(transport=None)` via
   `session_identity.restore_identity`; `_delivery_adapter_for` then delivers through that bot's
-  adapter or nothing (never the default bot by heuristic). Rows without the column (pre-PR-5)
+  adapter or nothing (never the default bot by heuristic). `restore_provenance`
+  (session_ingress_context) pins the same identity beside the weakref it stamps, so
+  `restore_native_source`-built live sources resolve by transport-profile and survive an
+  adapter-OBJECT reconnect (the frozen weakref alone dies with it → a `not_found` FIFO pause).
+  Rows without the column (pre-PR-5)
   keep the `_is_shared_bot_satellite` fallback. Deferred callbacks capture the identity/home at
   command time (`/model` picker); `_run_in_executor_with_context` carries the scope over thread
   hops. Relay: `_with_scope` echoes the routed `profile` on every outbound frame and `follow_up`

@@ -74,7 +74,7 @@ these before assuming any hook is live:
 | `docs/backlog.md` | open threads |
 | `docs/debugging.md` | routing/admission failure triage |
 | `docs/working-patterns.md` | how the operator wants work done (delegation, minimal contexts) |
-| `docs/voice-front-door.md` | voice ingress + relay |
+| `docs/voice-front-door.md` | voice ingress + relay; the orchestrator lane's home-session re-key (`docs/voice-home-session-rekey.md`) |
 | `docs/orchestrator-front-door.md` | per-user orchestrator, home category, dispatch |
 
 ## 4. Hard rules (everywhere in `concierge/`)

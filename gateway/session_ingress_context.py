@@ -273,6 +273,15 @@ def restore_provenance(runner, source, provenance):
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
     source._authorization_profile_home = home
+    # The ref above is provenance frozen at admission time: a reconnect that replaces the
+    # adapter OBJECT (a shared bot's failed websocket is popped and re-registered) kills it,
+    # and the source must then name the receiving bot by transport-profile so intake/delivery
+    # resolve the CURRENT registered adapter — the restored row of the transport matrix, the
+    # same pin _restored_source gives durable origins. No transport_profile (standalone) or a
+    # pre-column provenance pins nothing, so the fail-closed postures keep deciding.
+    from gateway.session_identity import restore_identity
+    restore_identity(source, runner=runner, transport_profile=provenance.get('transport_profile'),
+                     authorization_home=home, runtime_home=runtime_home)
     return runtime_home
 
 

@@ -1179,7 +1179,7 @@ class SessionAuthority:
     async def _claim_with_retry(self, ref, live):
         """The drain's next ``(row, first)``, waiting out transient storage and a classic turn on the
         route; None when the drain must exit (paused, or stopping with committed rows left queued)."""
-        backoff, conflicted, refusing = 0.0, None, None
+        backoff, struck, refusing = 0.0, {}, None
         while True:
             # The refusal handling's own reads and writes share the claim's storage retry, which finishes
             # that exact refusal first: once its cancellation commits, the claim no longer sees the row.
@@ -1196,14 +1196,17 @@ class SessionAuthority:
                         from gateway.session_unattended_unknown import settle_unattended_unknown
                         if await settle_unattended_unknown(self, ref):
                             continue
-                    if exc.reason == 'admission_conflict':
-                        # A verdict on the head alone (its route or binding moved under it) that every drain
-                        # repeats: pausing behind it strands the FIFO for good. Refused only once the same
-                        # head conflicted twice, read after each: never a successor a cancel advanced to.
+                    if exc.reason in ('admission_conflict', 'not_found'):
+                        # A verdict on the head alone — its route or binding moved under it
+                        # (admission_conflict) or its target is gone (not_found) — that every
+                        # drain repeats: pausing behind it strands the FIFO for good. Refused
+                        # only once the same head struck the same way twice, read after each
+                        # (per reason: one must not cancel the other's head): never a
+                        # successor a cancel advanced to.
                         head = next((row['admission_id'] for row in list_session_admissions(
                             self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
-                        if head is not None and head != conflicted:
-                            conflicted = head
+                        if head is not None and head != struck.get(exc.reason):
+                            struck[exc.reason] = head
                             continue
                         if head is not None:
                             refusing = head, exc.reason

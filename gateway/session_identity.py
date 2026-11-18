@@ -152,6 +152,7 @@ def canonical_identity(
 
 def restore_identity(
     source: SessionSource, *, runner: Any, transport_profile: Optional[str],
+    authorization_home: Optional[Path] = None, runtime_home: Optional[Path] = None,
 ) -> Optional[RoutingIdentity]:
     """Pin the identity of a source rebuilt from durable state (``SessionEntry.origin``, a
     ``sessions`` row, a cached copy) — no live adapter, so ``transport=None``: the restored row of the
@@ -160,7 +161,10 @@ def restore_identity(
     *transport_profile* is what the routing index persisted at ingress (``SessionEntry.transport_profile``);
     ``None`` = a row written before the column existed, whose transport is unknown → nothing is pinned
     and the legacy heuristics (``_is_shared_bot_satellite``) keep deciding. Standalone gateways have
-    nothing to restore (one bot, one home).
+    nothing to restore (one bot, one home). *authorization_home*/*runtime_home* are the homes a caller
+    that just re-verified them against the live registry passes verbatim (``restore_provenance`` rebinds
+    a captured provenance, so its homes are provenance, not derivation); left ``None`` they are derived
+    as for a row read back after a restart.
     """
     transport_name = _name(transport_profile)
     if transport_name is None:
@@ -175,12 +179,14 @@ def restore_identity(
 
     primary_profile = _name(getattr(runner, "_primary_profile_name", None)) or "default"
     runtime_name = _name(getattr(source, "profile", None)) or primary_profile
-    authorization_home = (
-        Path(get_process_hermes_home()) if transport_name == primary_profile
-        else get_profile_dir(transport_name))
-    runtime_home = (
-        authorization_home if runtime_name == transport_name
-        else Path(runner._resolve_profile_home_for_source(source)))
+    if authorization_home is None:
+        authorization_home = (
+            Path(get_process_hermes_home()) if transport_name == primary_profile
+            else get_profile_dir(transport_name))
+    if runtime_home is None:
+        runtime_home = (
+            authorization_home if runtime_name == transport_name
+            else Path(runner._resolve_profile_home_for_source(source)))
     source._authorization_profile_home = authorization_home
     identity = RoutingIdentity(
         transport_profile=transport_name, runtime_profile=runtime_name,

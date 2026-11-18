@@ -1,5 +1,7 @@
-"""Concierge voice ingress: the speaker→orchestrator lane (design §5),
-admission-reconciled — binding/room win for voice.
+"""Concierge voice ingress: the speaker→orchestrator lane (design:
+concierge/docs/voice-home-session-rekey.md), admission-reconciled —
+binding/room win for voice — and re-keyed onto the SPEAKER'S HOME-CHANNEL
+SESSION.
 
 ``_restate_voice_routing_stamps`` runs the NORMAL registry verdict FIRST —
 a binding or room verdict claims the channel exactly as for typed input (a
@@ -7,13 +9,18 @@ user speaking in a worker's channel is talking to that worker; design:
 binding routing untouched) — and the orchestrator LANE consumes the
 verdict tail's EXISTING ``_CONCIERGE_ORCHESTRATOR_ATTR`` stamp: stamped
 exactly when no binding/room verdict matched AND the author has a LIVE
-orchestrator — exactly the unbound, non-room channel shape admission's
-branch (c) (``_concierge_dynamic_runtime_profile``) confirms. The lane
-re-homes ``source.profile`` to the stamped orchestrator: personal-lane
-semantics, the spoken input runs as the speaker's orchestrator, no room
-fan-out. The orchestrator's own final turn already contains the
-dispatched-and-summarized worker results, so the existing voice relay
-speaks the right answer (no relay changes).
+orchestrator. The lane then re-keys the source onto the user's RECORDED
+home channel (operator decision 2026-11-17): the spoken turn runs as the
+speaker's orchestrator ON THE SAME SESSION typed turns in the home channel
+run — ``agent:<orch>:discord:group:<home>:<speaker>`` — not a fresh session
+keyed to the voice-bound text channel. Per-speaker by construction (the key
+carries the user id), so a shared voice channel works multi-user. Admission
+reconciles by construction: the re-keyed source re-runs the registry
+verdict, so it carries the IDENTICAL stamps a fresh ``build_source`` for the
+home channel gets, and ``_concierge_dynamic_runtime_profile`` confirms via
+the home channel's BINDING (branch (a)). The orchestrator's own final turn
+already contains the dispatched-and-summarized worker results, so the
+existing voice relay speaks the right answer (no relay changes).
 
 Why the verdict must run FIRST (the admission wedge this suite pins): the
 pre-reconciliation order re-homed ANY channel's speaker to their
@@ -29,17 +36,30 @@ Asserted at the RESTAMP level, mirroring the voice-ingress suite's rig
 delegations observed at the INSTALLED runner handler):
 
 - LIVE orchestrator + UNBOUND channel → the personal lane: one delegation
-  on the orchestrator's profile, no fan-out (existing behavior preserved).
+  on the orchestrator's profile, no fan-out (existing behavior preserved);
+  with a recorded home → the HOME session key (this change's contract).
+- Two speakers in one shared voice channel → two home sessions (the key's
+  user slot isolates them).
+- The re-keyed source's stamps are IDENTICAL to a fresh ``build_source``
+  for the home channel (profile via the binding branch, no orchestrator
+  stamp, thread shape flattened to the home group channel).
 - LIVE orchestrator + channel BOUND to another bot → the BINDING profile
   wins, NOT the orchestrator (admission branch (a) confirms the binding;
-  this row previously asserted the hijack — the flip IS the fix).
-- LIVE orchestrator + ROOM channel → the fan-out targets are preserved
-  (no orchestrator hijack; admission branch (b) owns room channels).
+  this row previously asserted the hijack — the flip IS the fix). A ROOM
+  channel keeps its fan-out. Neither re-keys even with a recorded home.
 - NO user entry / no orchestrator → byte-for-byte today's verdicts: room
   fan-out, bound 1:1, unbound hub (the copied ingress cases).
 - GHOST / STAT-ERROR orchestrator + unbound → warn-once under the verdict
   tail's existing keys (the liveness posture lives wholly in the stamp —
   the lane does no second pass) + fall-through to the hub lane.
+- FAIL-CLOSED re-key ladder: no recorded home, home unbound, home bound to
+  another profile, home a room, recorded guild ≠ voice guild, users-read
+  fault → today's bound-channel session stands.
+- Playback still targets the VOICE channel: the auto-TTS gate mirrors the
+  bound channel's /voice mode, play_tts resolves the lane guild, and the
+  verbal-ack guild lookup finds the voice call — none keyed on the
+  re-keyed chat id. The transcript echo still lands in the BOUND channel,
+  and the per-channel prompt/skills follow the post-hook source.
 - BOT-authored source → the lane never applies (a bot never resolves to
   an orchestrator lane).
 - The existing gates (enabled, multiplex, route-rejected, explicit config
@@ -78,8 +98,12 @@ _GUILD, _SPEAKER, _CHANNEL = 1, 42, 700
 _MEMBER_A = "bot-reminders-a1b2"
 _MEMBER_B = "bot-researcher-b2c3"
 _ORCH = "bot-orchestrator-7f3a"
+_ORCH_B = "bot-orchestrator-b9c4"
 _GHOST_ORCH = "bot-orchestrator-ghost0"
 _STAT_ORCH = "bot-orchestrator-stat0"
+_SPEAKER_B = 43
+_HOME_A = "9001"               # the speaker's recorded home channel
+_HOME_B = "9002"               # the second speaker's home channel
 
 
 @pytest.fixture
@@ -91,7 +115,7 @@ def voice_rig(tmp_path, monkeypatch):
     and the fan-out machinery are all live)."""
     ConciergeDiscordMixin._concierge_warned.clear()  # per-test warn-once hygiene
     root = tmp_path
-    for name in (_MEMBER_A, _MEMBER_B, _ORCH):
+    for name in (_MEMBER_A, _MEMBER_B, _ORCH, _ORCH_B):
         (root / "profiles" / name).mkdir(parents=True)
         (root / "profiles" / name / ".env").write_text("OPENAI_API_KEY=sk-x\n")
     monkeypatch.setenv("HERMES_HOME", str(root))
@@ -320,6 +344,325 @@ def test_unbound_lane_consumes_the_verdicts_orchestrator_stamp(voice_rig):
     assert getattr(source, concierge_mixin._CONCIERGE_ORCHESTRATOR_ATTR,
                    None) == _ORCH
     assert getattr(source, concierge_mixin._ROOM_TARGETS_ATTR, None) is None
+
+
+# ── The home-session re-key (design: voice-home-session-rekey) ─────────────
+
+
+def _seed_home(voice_rig, *, user=_SPEAKER, orchestrator=_ORCH,
+               home=_HOME_A, bind=True):
+    """The provisioning shape: the user's entry RECORDS their home channel
+    and guild, and the home channel is BOUND to the orchestrator
+    (``bind_channel`` — concierge/home_space.py)."""
+    registry.set_user(str(user), orchestrator=orchestrator,
+                      home_channel=home, guild_id=str(_GUILD))
+    if bind:
+        registry.bind_channel(str(home), profile=orchestrator,
+                               blueprint="orchestrator", guild_id=str(_GUILD))
+
+
+async def _install_home_session_recorder(monkeypatch, rig):
+    """The seam recorder's twin for the home-session contract: one row per
+    DELEGATED turn with the profile, the post-hook ``chat_id`` and the
+    DERIVED session key (the same ``_session_key_for_source`` the runner's
+    ``_handle_message`` uses), plus the source object for playback rows."""
+    rows = []
+
+    async def _runner_handler(event):
+        rows.append(SimpleNamespace(
+            profile=getattr(event.source, "profile", None),
+            chat_id=str(event.source.chat_id),
+            session_key=rig.runner._session_key_for_source(event.source),
+            source=event.source))
+
+    rig.adapter.set_message_handler(_runner_handler)
+
+    async def _fake_background(event, session_key):
+        await rig.adapter._message_handler(event)
+
+    monkeypatch.setattr(rig.adapter, "_process_message_background", _fake_background)
+    return rows
+
+
+async def _speak_as(rig, user, text="brief me on the day", *, join_source=True):
+    """One transcribed utterance through the REAL voice ingress, as *user*
+    (the cached join source is per-guild; the ingress re-stamps THIS
+    speaker's identity on it, run_voice.py's ``_voice_input_source``)."""
+    if join_source:
+        join = rig.adapter.build_source(
+            chat_id=str(_CHANNEL), chat_type="group", user_id=str(user),
+            user_name=f"User{user}", guild_id=str(_GUILD))
+        rig.adapter._voice_sources[_GUILD] = join.to_dict()
+    await rig.runner._handle_voice_channel_input(
+        _GUILD, user, text, adapter=rig.adapter)
+
+
+@pytest.mark.asyncio
+async def test_spoken_turn_lands_on_the_speakers_home_session(
+        voice_rig, monkeypatch):
+    """THE contract: an unbound voice-bound channel + a speaker whose entry
+    records a home channel bound to their orchestrator → the spoken turn
+    delegates ON THE HOME SESSION — ``agent:<orch>:discord:group:<home>:
+    <speaker>`` — the SAME key a typed turn in the home channel derives,
+    not the fresh ``…:<bound-channel>`` session of the old lane."""
+    _seed_home(voice_rig)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id) for r in rows] == [(_ORCH, _HOME_A)]
+    assert rows[0].session_key == f"agent:{_ORCH}:discord:group:{_HOME_A}:{_SPEAKER}"
+
+
+@pytest.mark.asyncio
+async def test_two_speakers_get_two_home_sessions(voice_rig, monkeypatch):
+    """Per-speaker isolation: two speakers in ONE shared voice channel,
+    each with their own orchestrator and home channel → two delegations on
+    two DIFFERENT home sessions (the key's user slot isolates them by
+    construction — the shared voice channel never shares a session)."""
+    _seed_home(voice_rig, user=_SPEAKER, orchestrator=_ORCH, home=_HOME_A)
+    _seed_home(voice_rig, user=_SPEAKER_B, orchestrator=_ORCH_B, home=_HOME_B)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER, "plan my day")
+    await _drain(voice_rig.adapter)
+    await _speak_as(voice_rig, _SPEAKER_B, "water the plants")
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id, r.session_key) for r in rows] == [
+        (_ORCH, _HOME_A, f"agent:{_ORCH}:discord:group:{_HOME_A}:{_SPEAKER}"),
+        (_ORCH_B, _HOME_B, f"agent:{_ORCH_B}:discord:group:{_HOME_B}:{_SPEAKER_B}"),
+    ]
+
+
+def test_rekeyed_source_carries_fresh_home_stamps(voice_rig):
+    """Identical-stamps proof: after the restamp re-keyed it, the source is
+    byte-shaped like a FRESH ``build_source`` for the home channel — the
+    binding branch's profile, NO orchestrator stamp (a fresh home source
+    never carries one) — and a thread-bound join is flattened to the home
+    channel's group shape (``build_session_key`` reads exactly these)."""
+    _seed_home(voice_rig)
+    source = _copy_source(voice_rig)
+    source.chat_type, source.thread_id = "thread", "77"
+    source.parent_chat_id = str(_CHANNEL)
+
+    voice_rig.adapter._restate_voice_routing_stamps(source)
+
+    fresh = voice_rig.adapter.build_source(
+        chat_id=str(_HOME_A), chat_type="group", user_id=str(_SPEAKER),
+        user_name="Operator", guild_id=str(_GUILD))
+    assert source.profile == fresh.profile == _ORCH
+    assert source.chat_id == fresh.chat_id == _HOME_A
+    assert source.chat_type == "group"
+    assert source.thread_id is None and source.parent_chat_id is None
+    for attr in (concierge_mixin._CONCIERGE_ORCHESTRATOR_ATTR,
+                 concierge_mixin._ROOM_TARGETS_ATTR):
+        assert getattr(source, attr, None) is None
+        assert getattr(fresh, attr, None) is None
+
+
+@pytest.mark.asyncio
+async def test_bound_channel_with_recorded_home_keeps_binding_routing(
+        voice_rig, monkeypatch):
+    """A recorded home NEVER re-keys a channel a binding owns: speaking in
+    a worker's channel talks to that worker, on that channel's session."""
+    registry.bind_channel(
+        str(_CHANNEL), profile=_MEMBER_A, blueprint="reminders",
+        guild_id=str(_GUILD))
+    _seed_home(voice_rig)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id) for r in rows] == [(_MEMBER_A, str(_CHANNEL))]
+
+
+@pytest.mark.asyncio
+async def test_room_channel_with_recorded_home_keeps_fanout(
+        voice_rig, monkeypatch):
+    """A recorded home NEVER re-keys a ROOM channel: the fan-out owns the
+    channel, every member lane runs on the channel's own shape."""
+    registry.create_room(str(_CHANNEL), [_MEMBER_A, _MEMBER_B])
+    _seed_home(voice_rig)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id) for r in rows] == [
+        (_MEMBER_A, str(_CHANNEL)), (_MEMBER_B, str(_CHANNEL))]
+
+
+@pytest.mark.asyncio
+async def test_no_home_recorded_keeps_the_bound_channel_session(
+        voice_rig, monkeypatch):
+    """No recorded home → today's lane stands: the orchestrator runs the
+    spoken turn, but on the BOUND channel's session (fail-closed row —
+    the re-key is an upgrade, never a requirement)."""
+    registry.set_user(str(_SPEAKER), orchestrator=_ORCH)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id) for r in rows] == [(_ORCH, str(_CHANNEL))]
+    assert rows[0].session_key == (
+        f"agent:{_ORCH}:discord:group:{_CHANNEL}:{_SPEAKER}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seed", [
+    pytest.param(None, id="home-unbound"),
+    pytest.param("other_profile", id="home-bound-elsewhere"),
+    pytest.param("room", id="home-is-a-room"),
+    pytest.param("guild_mismatch", id="recorded-guild-mismatch"),
+])
+async def test_rekey_shape_mismatch_keeps_todays_session(
+        voice_rig, monkeypatch, seed):
+    """The fail-closed ladder: a home channel that does not resolve to
+    exactly the speaker's orchestrator (unbound / bound to another profile /
+    a room / recorded in another guild) never re-keys — the spoken turn
+    keeps today's bound-channel session, orchestrator re-home and all."""
+    registry.set_user(str(_SPEAKER), orchestrator=_ORCH,
+                      home_channel=_HOME_A,
+                      guild_id="999" if seed == "guild_mismatch" else str(_GUILD))
+    if seed is None:
+        pass  # home recorded, no binding
+    elif seed == "other_profile":
+        registry.bind_channel(_HOME_A, profile=_MEMBER_A, blueprint="reminders",
+                              guild_id=str(_GUILD))
+    elif seed == "room":
+        registry.create_room(_HOME_A, [_MEMBER_A])
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert [(r.profile, r.chat_id) for r in rows] == [(_ORCH, str(_CHANNEL))]
+
+
+def test_users_read_failure_keeps_todays_lane(voice_rig, monkeypatch):
+    """A registry accessor fault inside the lane is fail-closed: the
+    spoken turn keeps the stamp's plain re-home (today's routing), never
+    raises."""
+    from concierge import registry as registry_module
+
+    registry.set_user(str(_SPEAKER), orchestrator=_ORCH)
+    monkeypatch.setattr(
+        registry_module, "get_user",
+        lambda user_id: (_ for _ in ()).throw(RuntimeError("registry fault")))
+    source = _copy_source(voice_rig)
+
+    voice_rig.adapter._restate_voice_routing_stamps(source)  # must not raise
+
+    assert source.profile == _ORCH
+    assert source.chat_id == str(_CHANNEL)  # no re-key over a fault
+
+
+@pytest.mark.asyncio
+async def test_playback_still_targets_the_voice_channel(
+        voice_rig, monkeypatch):
+    """The re-key must not leak into playback: the auto-TTS gate mirrors
+    the BOUND channel's ``/voice`` mode for the home id, ``play_tts``
+    resolves the lane's VOICE guild (never a file attachment in the home
+    channel), and the verbal-ack guild lookup finds the voice call — all
+    while ``/voice off`` on the bound channel silences the mirror."""
+    _seed_home(voice_rig)
+    rows = await _install_home_session_recorder(monkeypatch, voice_rig)
+    played, sent = [], []
+
+    async def _play(guild_id, path, **kw):
+        played.append((guild_id, path))
+        return True
+
+    async def _send(**kw):
+        sent.append(kw)
+        return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(voice_rig.adapter, "is_in_voice_channel", lambda gid: True)
+    monkeypatch.setattr(voice_rig.adapter, "play_in_voice_channel", _play)
+    monkeypatch.setattr(voice_rig.adapter, "send_voice", _send)
+    monkeypatch.setattr(voice_rig.adapter, "voice_mixer_active", lambda gid: True)
+    # Prime the /voice state DIRECTLY (the sets the base gate reads): the
+    # runner's _apply_voice_mode persists to _VOICE_MODE_PATH, which is
+    # import-time-bound to the REAL home — a test must never write it.
+    voice_rig.adapter._auto_tts_enabled_chats.add(str(_CHANNEL))
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert rows and rows[0].chat_id == _HOME_A  # the turn IS home-keyed…
+    assert voice_rig.adapter._should_auto_tts_for_chat(_HOME_A)  # …the gate mirrors the binding…
+    await voice_rig.adapter.play_tts(chat_id=_HOME_A, audio_path="x.ogg")
+    assert played == [(_GUILD, "x.ogg")] and not sent  # …and playback stays in the VC
+    assert voice_rig.runner._voice_ack_guild_for(rows[0].source) == _GUILD
+
+    # /voice off on the BOUND channel silences the home-id mirror.
+    voice_rig.adapter._auto_tts_enabled_chats.discard(str(_CHANNEL))
+    voice_rig.adapter._auto_tts_disabled_chats.add(str(_CHANNEL))
+    assert not voice_rig.adapter._should_auto_tts_for_chat(_HOME_A)
+
+
+@pytest.mark.asyncio
+async def test_transcript_echo_still_targets_the_bound_channel(
+        voice_rig, monkeypatch):
+    """The transcript echo rides the BOUND text channel (the re-key never
+    moves it), and the per-channel prompt/skills follow the POST-HOOK
+    source: the home channel's context on a re-keyed turn, the bound
+    channel's otherwise."""
+    _seed_home(voice_rig)
+    await _install_home_session_recorder(monkeypatch, voice_rig)
+    echo_channel = SimpleNamespace(sent=[], id=_CHANNEL)
+    home_channel = SimpleNamespace(sent=[], id=_HOME_A)  # must stay echo-silent
+
+    async def _send(text, **kw):
+        echo_channel.sent.append(text)
+
+    async def _send_home(text, **kw):
+        home_channel.sent.append(text)
+
+    echo_channel.send = _send
+    echo_channel.gets = []
+    # A duck-typed client: guild/member lookups degrade (None) exactly like
+    # the rig's None client, while get_channel serves the echo target (the
+    # labels lookup may also ask for the HOME channel — it must stay silent).
+    channels = {int(_CHANNEL): echo_channel, int(_HOME_A): home_channel}
+
+    def _get_channel(cid):
+        echo_channel.gets.append(cid)
+        return channels.get(cid)
+
+    voice_rig.adapter._client = SimpleNamespace(
+        get_guild=lambda gid: None, get_user=lambda uid: None,
+        get_channel=_get_channel)
+    prompts, skills = [], []
+    monkeypatch.setattr(voice_rig.adapter, "_resolve_channel_prompt",
+                        lambda cid, parent: (prompts.append((cid, parent)) or None))
+    monkeypatch.setattr(voice_rig.adapter, "_resolve_channel_skills",
+                        lambda cid, parent: (skills.append((cid, parent)) or None))
+
+    await _speak_as(voice_rig, _SPEAKER)
+    await _drain(voice_rig.adapter)
+
+    assert len(echo_channel.sent) == 1          # the transcript echo…
+    assert not home_channel.sent                 # …lands in the BOUND channel only
+    assert int(_CHANNEL) in echo_channel.gets
+    assert prompts == [(_HOME_A, None)]         # the home session's context…
+    assert skills == [(_HOME_A, None)]          # …on the re-keyed turn
+
+    # Without a re-keyable home the context stays the bound channel's.
+    prompts.clear(), skills.clear()
+    echo_channel.sent.clear(), echo_channel.gets.clear()
+    # update_user, not set_user: set_user is idempotent for the same
+    # orchestrator and would KEEP the recorded home.
+    registry.update_user(str(_SPEAKER), home_channel=None)
+    await _speak_as(voice_rig, _SPEAKER, "and another thing")
+    await _drain(voice_rig.adapter)
+    assert prompts == [(str(_CHANNEL), None)]
+    assert skills == [(str(_CHANNEL), None)]
+
 
 
 # ── No user entry / no orchestrator: today's verdicts, byte-for-byte ────────

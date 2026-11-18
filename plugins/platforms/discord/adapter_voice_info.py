@@ -1,8 +1,17 @@
-"""Who is in the bot's Discord voice channel and who is speaking, for status and prompt context."""
+"""Who is in the bot's Discord voice channel and who is speaking, for status and prompt context.
+
+Also the auto-TTS playback seam (``play_tts``, moved from adapter.py: the
+file-size ratchet), which owns the concierge home-session lane lookup.
+"""
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, Optional
+
+from gateway.platforms.base import SendResult
+
+logger = logging.getLogger(__name__)
 
 
 class DiscordVoiceInfoMixin:
@@ -12,6 +21,11 @@ class DiscordVoiceInfoMixin:
     _voice_sources: dict[int, dict[str, Any]]
     _client: Any
     discard_pending_voice_input: Any
+    # Duck-typed companion names the adapter MRO provides.
+    name: Any
+    is_in_voice_channel: Any
+    play_in_voice_channel: Any
+    send_voice: Any
 
     def _bind_voice_text_channel(self, guild_id: int, text_channel_id: Any, source: Optional[dict]) -> None:
         """A programmatic join's transcription binding, on every path: cold join, same voice channel and
@@ -28,6 +42,33 @@ class DiscordVoiceInfoMixin:
             self._voice_text_channels[guild_id] = text_channel_id
         if source is not None:
             self._voice_sources[guild_id] = source
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        """Play auto-TTS audio: in the guild's VC if joined, else as a file attachment.
+
+        A concierge home-session re-key (concierge_voice.py) leaves ``chat_id`` as the
+        speaker's HOME channel; the guild whose voice call captured the utterance is
+        then resolved through the lane map the restamp registered, so playback stays
+        in the VOICE channel instead of attaching the audio in the home channel.
+        """
+        for gid, text_ch_id in self._voice_text_channels.items():
+            if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
+                logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
+                success = await self.play_in_voice_channel(gid, audio_path)
+                return SendResult(success=success)
+        lane = getattr(self, "_concierge_voice_home_guild_for", None)
+        if callable(lane):
+            try:
+                gid = lane(chat_id)
+            except Exception:
+                logger.debug("[%s] voice home-lane guild lookup failed", self.name,
+                             exc_info=True)
+                gid = None
+            if gid is not None and self.is_in_voice_channel(gid):
+                logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
+                success = await self.play_in_voice_channel(gid, audio_path)
+                return SendResult(success=success)
+        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
     def get_voice_channel_info(self, guild_id: int) -> Optional[dict[str, Any]]:
         """Return voice channel info (name, members, count, speaking user IDs) or None if not connected."""
