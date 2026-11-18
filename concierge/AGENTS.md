@@ -16,7 +16,10 @@ Discord category spawn preconfigured bots (blueprints), managed entirely from
 Discord. It is a **personal fork feature** — NOT upstreamed, and it will never be:
 the operator has **no access to `NousResearch/hermes-agent`**. Consequences:
 
-- **Never push to `origin`** (no access, and it is the upstream remote).
+- **Never integrate `origin` — in either direction.** No push (no access, and
+  it is the upstream remote), and no pull/merge/rebase either: upstream has
+  zero concierge code, so merging it drops the feature. `personal` is the only
+  remote we push to AND the only one we pull from.
 - **`hermes update` / upstream syncs can silently reset `main` and drop this
   feature** — this happened on 2026-10-29 and cost a full recovery. The protection
   is the **snapshot chain** — keep it current after every work session.
@@ -84,7 +87,9 @@ these before assuming any hook is live:
 - **Core must never import `concierge/`**, and plugin code must not either.
   Keep every new capability a thin, duck-typed hook.
 - **Never restart the gateway while the checkout is dirty.**
-- **Deploy only `main` — enforced, not advisory.** Feature branch → rebase onto
+- **Deploy only `main` — enforced, not advisory.** Feature branch built in a
+  WORKTREE (never on the live checkout's `main`; remove the worktree after the
+  merge — see `docs/repo-hygiene.md`) → rebase onto
   `main` → fast-forward merge → test → deploy. `scripts/concierge/deploy.sh`
   refuses anything else (no override flag) and `scripts/concierge/snapshot.sh`
   owns the off-site copy. Never run either from inside the gateway process.

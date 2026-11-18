@@ -16,6 +16,15 @@
   workspace fix: honcho catalog install) → 4766432bad4 (orchestrator main + voice
   auto-join). **Push a fresh snapshot at the end of every work session** —
   this is the only off-site copy of the feature.
+- **Feature work happens in a WORKTREE (operator, 2026-11-17):** build each
+  feature on its own branch in a `git worktree add` directory — never commit
+  feature work directly on the live checkout's `main`. Rebase onto `main`,
+  fast-forward `main`, then REMOVE the worktree (`git worktree remove`) and
+  delete the branch. The live checkout stays a clean `main` at all times.
+- **`origin` is never integrated (operator, 2026-11-17):** never pull, merge
+  or rebase from `origin` (upstream NousResearch — no concierge code there; a
+  merge imports ~13k upstream commits and drops the feature). Fetch/pull ONLY
+  from `personal`, and only to import snapshot commits another session pushed.
 - **Branch + deploy policy (operator, 2026-11-14):** every change is committed on a
   feature branch; the branch is REBASED onto `main`, then fast-forward merged into
   `main`. **Only `main` is ever deployed to the VM** — never a feature branch. The
