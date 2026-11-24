@@ -495,6 +495,107 @@ def _copy_resilience_config(profile_dir: Path) -> None:
         _seed_profile_config(profile_dir, updates)
 
 
+_VAULT_CONVENTIONS = """\
+# Vault conventions
+
+Read this before every write. Keep chat answers brief; the vault holds the
+detail. The notes bot's SOUL points here instead of inlining the method.
+
+## Notes
+- One claim per note (atomic). Split long captures into linked notes.
+- Every note carries frontmatter: `created` (ISO date), `type`, `tags`.
+  `type` is one of: `zettel`, `moc`, `person`, `literature`.
+- Every note contains at least one [[wikilink]]. Home.md is exempt.
+- Link each new note to at least one MOC and to its related notes.
+- Search before creating; update and relink instead of duplicating.
+
+## People
+- Create a person note on first mention; link meetings and decisions to it.
+
+## MOCs
+- A topic cluster (~3+ notes) gets a MOC, linked from Home.md.
+- Keep each MOC's member list in sync with the notes that link to it.
+
+## Lint
+- No broken [[wikilinks]]. Report orphans (zero inbound links); do not
+  auto-rewrite them.
+"""
+
+_VAULT_HOME = """\
+# Home
+
+Index of MOCs and entry points. Link every MOC from here.
+
+## MOCs
+
+(none yet — the notes bot adds them as topic clusters form)
+"""
+
+
+def _seed_notes_vault(profile_dir: Path, user_id: Optional[str]) -> str:
+    """Materialize a DURABLE, per-user Obsidian vault OUTSIDE the bot profile.
+
+    Bot profiles are DISPOSABLE — reprovision with a different blueprint
+    retires and DELETES the old profile. Notes must therefore live under
+    ``~/.hermes/vaults/<user_id>/`` (mirrors the per-user workspace root), not
+    inside ``profiles/bot-notes-*``. On the VM that is
+    ``/root/.hermes/vaults/<user_id>/``.
+
+    Seeds CONVENTIONS.md (the rulebook the notes SOUL references) and Home.md
+    (the MOC root) ONLY when missing — never overwrite user notes. Pins
+    ``OBSIDIAN_VAULT_PATH`` in the bot profile's .env (secret-file mode 0600),
+    the documented convention the obsidian skill resolves. Idempotent.
+
+    Cross-device sync (git remote / Syncthing / iCloud) is an OPERATOR choice
+    layered on this path afterwards — see concierge/APPLE_BRIDGE.md. The
+    in-concierge use case (handoff notes, recall in later sessions) needs only
+    this durable local vault.
+    """
+    scope = str(user_id) if user_id else "shared"
+    vault = Path.home() / ".hermes" / "vaults" / scope
+    vault.mkdir(parents=True, exist_ok=True)
+    for name, content in (("CONVENTIONS.md", _VAULT_CONVENTIONS),
+                          ("Home.md", _VAULT_HOME)):
+        target = vault / name
+        if not target.exists():
+            atomic_write_text(target, content)
+
+    env_path = profile_dir / ".env"
+    lines: list[str] = []
+    if env_path.is_file():
+        lines = [line for line in
+                 env_path.read_text(encoding="utf-8").splitlines()
+                 if not line.startswith("OBSIDIAN_VAULT_PATH=")]
+    lines.append(f"OBSIDIAN_VAULT_PATH={vault}")
+    atomic_write_bytes(env_path, ("\n".join(lines) + "\n").encode("utf-8"),
+                       mode=0o600)
+    return str(vault)
+
+
+def _refresh_bot_toolsets(profile_dir: Path, bp) -> bool:
+    """Deploy-time: re-pin the three toolset keys from the CURRENT blueprint.
+
+    A blueprint toolset change (e.g. adding ``concierge_dispatch``) otherwise
+    NEVER reaches an already-provisioned profile — config.yaml is written once
+    at provisioning, exactly like SOUL.md. Only the three toolset keys are
+    touched; every other config key is preserved verbatim by the raw
+    read-modify-write. Returns True when a write was needed.
+    """
+    desired = {
+        "toolsets": list(bp.toolsets),
+        "platform_toolsets.discord": list(bp.toolsets),
+        "platform_toolsets.cron": list(bp.toolsets),
+    }
+    cfg = read_user_config_raw(profile_dir / "config.yaml")
+    pt = cfg.get("platform_toolsets") or {}
+    if (cfg.get("toolsets") == desired["toolsets"]
+            and pt.get("discord") == desired["platform_toolsets.discord"]
+            and pt.get("cron") == desired["platform_toolsets.cron"]):
+        return False
+    _seed_profile_config(profile_dir, desired)
+    return True
+
+
 def _pause_bot_routines(profile_name: str, profile_dir: Path) -> None:
     """Pause every ``[bot:<profile>]`` job in the bot's OWN cron store.
 
@@ -927,7 +1028,16 @@ def create_bot(
             #     don't 429 together and routines survive a provider outage
             _copy_resilience_config(profile_dir)
 
-            # 5d) users-section bookkeeping (user-owned modes): the ownership
+            # 5d) vault-backed blueprints: a DURABLE per-user Obsidian vault
+            #     OUTSIDE the disposable bot profile, plus the env var the
+            #     obsidian skill resolves. Cross-device sync is an operator
+            #     choice layered on afterwards (APPLE_BRIDGE.md).
+            if bp.vault:
+                vault_path = _seed_notes_vault(profile_dir, user_id)
+                logger.debug("concierge: bot %s vault at %s",
+                             profile_name, vault_path)
+
+            # 5e) users-section bookkeeping (user-owned modes): the ownership
             #     record, written BEFORE the routine/bind steps so a later
             #     failure rolls it back with the profile (the transactional
             #     rollback cleans users entries pointing at the profile).
@@ -1110,9 +1220,13 @@ def refresh_souls() -> list[str]:
     idempotence paths return the existing bot AS-IS, so a blueprint/SOUL edit
     that is deployed to the VM never reaches an already-provisioned profile —
     the live bot keeps obeying the OLD persona forever (the 2026-11-24 root
-    cause for the stale orchestrator SOUL). This is the operator's deploy-time
-    repair: run it after syncing catalog changes, before restarting the
-    gateway, under the hub profile (``hermes -p concierge ...``).
+    cause for the stale orchestrator SOUL). The SAME is true of config.yaml's
+    toolset keys, so this also re-pins ``toolsets`` +
+    ``platform_toolsets.{discord,cron}`` from the current blueprint (needed for
+    the new dispatch tool to reach live orchestrators), and ensures the
+    durable vault for vault-backed blueprints. This is the operator's
+    deploy-time repair: run it after syncing catalog changes, before
+    restarting the gateway, under the hub profile (``hermes -p concierge``).
 
     Profiles are resolved through ``get_profile_dir`` (the canonical root),
     not ``HERMES_HOME/profiles`` — under ``-p concierge`` the latter is a
@@ -1128,6 +1242,7 @@ def refresh_souls() -> list[str]:
 
     data = registry.load_registry()
     profile_to_blueprint: dict[str, str] = {}
+    profile_to_user: dict[str, str] = {}
 
     for binding in (data.get("bindings") or {}).values():
         if not isinstance(binding, dict):
@@ -1138,18 +1253,20 @@ def refresh_souls() -> list[str]:
                 and blueprint in _known_blueprint_keys()):
             profile_to_blueprint.setdefault(profile, blueprint)
 
-    for entry in (data.get("users") or {}).values():
+    for user_id, entry in (data.get("users") or {}).items():
         if not isinstance(entry, dict):
             continue
         orchestrator = entry.get("orchestrator")
         if isinstance(orchestrator, str):
             profile_to_blueprint.setdefault(orchestrator, "orchestrator")
+            profile_to_user.setdefault(orchestrator, str(user_id))
         workers = entry.get("workers") or {}
         if isinstance(workers, dict):
             for blueprint, profile in workers.items():
                 if (isinstance(profile, str)
                         and blueprint in _known_blueprint_keys()):
                     profile_to_blueprint.setdefault(profile, blueprint)
+                    profile_to_user.setdefault(profile, str(user_id))
 
     updated: list[str] = []
     for profile_name in sorted(profile_to_blueprint):
@@ -1170,8 +1287,20 @@ def refresh_souls() -> list[str]:
                 display_name = line[2:].strip() or blueprint
                 break
         rendered = get_blueprint(blueprint).soul.format(name=display_name)
-        if rendered != current:
+        soul_changed = rendered != current
+        if soul_changed:
             atomic_write_text(soul_path, rendered)
+        # A blueprint toolset change (the dispatch tool) must reach live
+        # profiles too — config.yaml is written once, exactly like SOUL.md.
+        toolsets_changed = _refresh_bot_toolsets(
+            soul_path.parent, get_blueprint(blueprint))
+        # A vault-backed blueprint needs its durable vault + env var even when
+        # its SOUL was already current (e.g. a notes bot provisioned before the
+        # vault seeding shipped). Idempotent, never overwrites user notes.
+        if get_blueprint(blueprint).vault:
+            _seed_notes_vault(soul_path.parent,
+                              profile_to_user.get(profile_name))
+        if soul_changed or toolsets_changed:
             updated.append(profile_name)
     return updated
 

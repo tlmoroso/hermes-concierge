@@ -14,10 +14,23 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   personal channel → bind → greeting). Three-posture guard: ghost/stat_error
   entries NEVER bootstrap (a dead entry must not wedge a bound channel). Hot
   path keeps ONE registry read per message.
-- **Dispatch:** a SOUL-driven directive, NOT a tool — the orchestrator's entire
-  reply is `@dispatch <blueprint-key> <task>`; the `set_message_handler` wrap
-  parses it (registry-confirmed orchestrator turn, human-authored, no
-  continuation stamp) and returns None (the directive is never posted/spoken).
+- **Dispatch is a REAL TOOL (2026-11-24):** `concierge_dispatch` is a
+  schema-backed tool (`tools/concierge_dispatch_tool.py`, toolset
+  `concierge_dispatch`); the orchestrator's toolsets are now
+  `("web", "concierge_dispatch")`. The model CALLS it with a `blueprint`
+  (enum of worker keys) and a `task`. The tool validates the blueprint and the
+  shared guards, records the intent in a process-local slot keyed by the live
+  event, and the wrap consumes it after the turn — suppressing the model's
+  final text and spawning the driver. The magic `@dispatch <key> <task>` text
+  directive remains in the wrap ONLY as a legacy fallback for profiles whose
+  SOUL.md has not been refreshed; new SOULs never mention it. Guards
+  (`_concierge_dispatch_eligible`) are shared by both paths: human-authored,
+  no continuation stamp, registry-confirmed orchestrator turn.
+- **Legacy text directive (fallback):** the OLD protocol had the orchestrator's
+  entire reply be `@dispatch <blueprint-key> <task>`; the `set_message_handler`
+  wrap parsed it (registry-confirmed orchestrator turn, human-authored, no
+  continuation stamp) and returned None. It is retained ONLY for profiles
+  whose SOUL.md has not been refreshed. The driver is the same for both paths:
   A background driver SILENTLY (no `→ asked <Title>: <task>` intermediation —
   removed 2026-11-24; the full task goes to the worker as inbound turn text,
   never posted to Discord) lazily provisions the per-user channel-less worker
@@ -30,8 +43,9 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   the adapter's own `MAX_MESSAGE_LENGTH` + `truncate_message` chunker) so no
   notice can repeat the 50035 / 2000-char abort. Fail-closed ladder at every
   step; depth 1; bot-authored never dispatches.
-- **Files / artifacts (2026-11-24):** the orchestrator stays `web`-only (two
-  tools: `web_search`, `web_extract`) and CANNOT write files. A `file`-toolset
+- **Files / artifacts (2026-11-24):** the orchestrator stays file-less (three
+  tools: `web_search`, `web_extract`, `concierge_dispatch`) and CANNOT write
+  files. A `file`-toolset
   `artifacts` worker (Files Bot) writes the document into the per-user
   workspace and answers `ARTIFACT:<absolute path>`. The driver validates that
   path against the workspace root (untrusted worker text — no arbitrary host
@@ -39,20 +53,30 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   deterministically so the user gets a downloadable attachment even if the
   model forgot the tag. The SOUL also asks for the tag: belt and braces.
 - **SOUL guardrails (2026-11-24):** the orchestrator SOUL now states its exact
-  tools, that `@dispatch` is PLAIN TEXT (never a tool call), that it must not
-  do research itself, that it gets NO progress information (never claim a
-  worker is "still running"), and how to handle files. `tests/concierge/
+  three tools, that `concierge_dispatch` is the ONLY dispatch mechanism, that
+  it must not do research itself, that it gets NO progress information (never
+  claim a worker is "still running"), and how to handle files. `tests/concierge/
   test_blueprints.py` locks those lines verbatim. Two code-level guardrails
   back them: `_concierge_guard_visible_response` scrubs malformed multi-line
   `@dispatch` leaks and delivers artifacts; `_concierge_safe_artifact_path`
   gates the upload path.
-- **SOUL staleness — DEPLOY REQUIREMENT:** `SOUL.md` is written ONCE at
-  provisioning and `create_bot`'s idempotence paths never rewrite it, so a
-  catalog/SOUL edit that is synced to the VM does NOT reach an existing bot.
+- **Vault (notes bot):** `notes` is the only `vault=True` blueprint.
+  Provisioning creates a DURABLE per-user Obsidian vault OUTSIDE the disposable
+  bot profile at `~/.hermes/vaults/<user_id>/`, seeds `CONVENTIONS.md` (the
+  rulebook the SOUL references) + `Home.md` (MOC root) only when missing, and
+  pins `OBSIDIAN_VAULT_PATH` in the bot profile's `.env` (0600) — the path
+  convention the obsidian skill resolves. Cross-device sync (git remote /
+  Syncthing / iCloud) is an operator choice layered on afterwards; see
+  `concierge/APPLE_BRIDGE.md`.
+- **SOUL staleness — DEPLOY REQUIREMENT:** `SOUL.md` AND the three toolset keys
+  in config.yaml are written ONCE at provisioning, and `create_bot`'s
+  idempotence paths never rewrite them, so a catalog change synced to the VM
+  does NOT reach an existing bot.
   `hermes -p concierge concierge refresh-souls` re-renders every registered
-  bot's persona from the current catalog (persona names preserved, orphans
-  skipped, idempotent). `scripts/concierge/deploy.sh` runs it after the rsync
-  and BEFORE the restart. Always run it after any catalog/SOUL change.
+  bot's persona, re-pins toolsets from the current blueprint, and ensures the
+  vault (persona names preserved, orphans skipped, idempotent).
+  `scripts/concierge/deploy.sh` runs it after the rsync and BEFORE the restart.
+  Always run it after any catalog/SOUL/toolset change.
 - **Voice:** the restamp runs the registry verdict FIRST (binding/room channels
   keep their routing), then re-homes unbound channels to the speaker's
   orchestrator via the `_CONCIERGE_ORCHESTRATOR_ATTR` stamp — no category check

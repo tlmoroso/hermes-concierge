@@ -439,11 +439,12 @@ def _cmd_refresh_souls(args) -> int:
 
     updated = provision.refresh_souls()
     if updated:
-        print(f"✓ refreshed SOUL.md for {len(updated)} bot(s):")
+        print(f"✓ refreshed persona/toolsets for {len(updated)} bot(s):")
         for name in updated:
             print(f"  - {name}")
     else:
-        print("✓ all bot SOUL.md files already match the current catalog")
+        print("✓ all bot SOUL.md files and toolsets already match the current "
+              "catalog")
     print("Restart the gateway so running sessions pick up the new personas.")
     return 0
 

@@ -1182,3 +1182,84 @@ def test_artifact_worker_reply_stamps_phase_b_event(rig, monkeypatch):
     assert getattr(phase_b, concierge_mixin._CONCIERGE_ARTIFACT_ATTR, None) \
         == str(artifact.resolve())
     assert rig.channels[str(HOME)].sends == []  # still no decoration
+
+
+# ── (8) The real dispatch tool (preferred path) ────────────────────────────
+
+
+def test_dispatch_tool_call_drives_the_driver(rig, monkeypatch):
+    """A real ``concierge_dispatch`` tool call made DURING the turn is
+    consumed by the wrap: the model's final prose is suppressed, the worker
+    runs with the tool's task, and phase B delivers the summary. This is the
+    replacement for the magic ``@dispatch`` text directive."""
+    from tools import concierge_dispatch_tool as dispatch_tool
+    from tools.registry import registry
+
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    seams = _wire_io(rig, monkeypatch)
+    calls = []
+
+    async def _handler(event):
+        calls.append(event)
+        if getattr(event, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None):
+            return PHASE_B_ANSWER
+        if getattr(event.source, "profile", None) == WORKER_PROFILE:
+            return WORKER_ANSWER
+        # Simulate the model calling the real tool, then writing prose anyway.
+        registry.dispatch(dispatch_tool.DISPATCH_TOOL_NAME, {
+            "blueprint": WORKER_KEY, "task": TASK})
+        return "Here is a prose answer the wrap must suppress."
+
+    rig.adapter.set_message_handler(_handler)
+    result = _drive(rig, _trigger(rig))
+
+    assert result is None  # tool intent suppresses the final reply
+    assert [getattr(c.source, "profile", None) for c in calls] == [
+        ORCH, WORKER_PROFILE, ORCH]
+    worker_call = next(c for c in calls
+                       if getattr(c.source, "profile", None) == WORKER_PROFILE)
+    assert worker_call.text == TASK
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent
+    assert rig.channels[str(HOME)].sends == []  # no decoration, no notices
+
+
+def test_dispatch_tool_intent_ignored_on_ineligible_turn(rig, monkeypatch):
+    """A tool call recorded on a non-orchestrator turn must NOT dispatch —
+    the shared guards are enforced by the wrap too, not just the tool."""
+    from tools import concierge_dispatch_tool as dispatch_tool
+    from tools.registry import registry
+
+    _seed(rig)
+    _wire_io(rig, monkeypatch)
+    calls = []
+
+    async def _handler(event):
+        calls.append(event)
+        registry.dispatch(dispatch_tool.DISPATCH_TOOL_NAME, {
+            "blueprint": WORKER_KEY, "task": TASK})
+        return "plain answer"
+
+    rig.adapter.set_message_handler(_handler)
+    # A bound-channel message routed to a DIFFERENT bot (anti-spoof row).
+    result = _run(rig.adapter._message_handler(
+        _trigger(rig, chat_id=OTHER_CHANNEL)))
+
+    assert result == "plain answer"
+    assert [getattr(c.source, "profile", None) for c in calls] == [BOUND_BOT]
+    _no_driver(rig)
+
+
+def test_legacy_text_directive_still_works(rig, monkeypatch):
+    """Backward compatibility: a profile whose SOUL.md has not been refreshed
+    still dispatches via the old plain-text directive."""
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    seams = _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(rig, calls, {ORCH: DIRECTIVE, WORKER_PROFILE: WORKER_ANSWER})
+
+    result = _drive(rig, _trigger(rig))
+
+    assert result is None
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent

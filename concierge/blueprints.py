@@ -62,6 +62,7 @@ class BotBlueprint:
     routine: Optional[RoutineTemplate] = None
     memory_provider: Optional[str] = None  # "honcho" or None
     connects: tuple[str, ...] = ()         # account kinds needed ("calendar", "email", ...)
+    vault: bool = False                   # needs a durable Obsidian vault seeded at provisioning
 
 
 CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
@@ -209,6 +210,7 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         memory_provider="honcho",  # Honcho models the USER; the vault remembers
                                    # everyone else - together they are the memory
         connects=(),
+        vault=True,  # durable per-user Obsidian vault, seeded by provision
     ),
     BotBlueprint(
         key="artifacts",
@@ -255,33 +257,38 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
         description="Your front door: triages requests, hands work to your helper bots, and answers with the result.",
         model_preset="core",
         # A REAL bundle (the catalog test forbids composites): web search+extract
-        # gives the answers-alone lane its capability. No terminal, no file —
-        # the orchestrator delegates hands-on work, it never performs it.
-        toolsets=("web",),
+        # gives the answers-alone lane its capability. The dispatch toolset is
+        # the schema-backed orchestrator->worker handoff (2026-11-24: replaces
+        # the magic `@dispatch` text directive, which models kept trying to
+        # CALL as a tool). No terminal, no file — the orchestrator delegates
+        # hands-on work, it never performs it.
+        toolsets=("web", "concierge_dispatch"),
         skills=(),
-        # Locked (PLAN decisions 2 and 7): the dispatch directive protocol is
-        # quoted EXACTLY — the inbound wrap (T5) parses this syntax. Worker
-        # catalog below is CATALOG minus the orchestrator itself;
-        # test_orchestrator_soul_carries_dispatch_protocol_and_worker_catalog
-        # in tests/concierge/test_blueprints.py enforces that sync.
+        # Locked: the worker catalog below is CATALOG minus the orchestrator
+        # itself; tests/concierge/test_blueprints.py enforces that sync AND
+        # that the tool-protocol / guardrail lines cannot drift out.
         #
         # Rewritten 2026-11-24 after the monaco thread: the old persona never
         # stated what tools the orchestrator HAS, so the model invented a
         # "@dispatch developer ..." TOOL CALL, claimed a worker was "still
         # running", did the research itself, and pasted a 9.5k-char document
-        # inline. Guardrails below are explicit capability facts, not vibes.
+        # inline. Dispatch is now a REAL TOOL with a schema; the plain-text
+        # directive survives in code only as a legacy fallback for unrefreshed
+        # SOUL.md files, never as an instruction to the model.
         soul=(
             "# {name}\n\n"
             "You are {name}, the user's single front door — every message they "
             "send lands with you first. Keep replies brief.\n\n"
             "## What you can and cannot do\n"
-            "- You have exactly two tools: web_search and web_extract. That is all.\n"
+            "- You have exactly three tools: web_search, web_extract, and "
+            "concierge_dispatch. That is all.\n"
             "- You cannot write files, run commands, inspect running workers, "
             "read a vault, or check whether a job is still running. If asked "
             "for a file, dispatch to artifacts. If asked whether a worker is "
             "running, say plainly that you cannot see it.\n"
-            "- Never invent a tool. Never call a tool named @dispatch: "
-            "@dispatch is PLAIN TEXT you write in your reply, not a tool.\n\n"
+            "- Never invent a tool. Never write @dispatch as text and never "
+            "try to call a tool by that name — concierge_dispatch is the ONLY "
+            "dispatch mechanism.\n\n"
             "## Triage\n"
             "- Small talk and simple questions: answer directly.\n"
             "- Any request that needs search, sources, or citations goes to the "
@@ -293,13 +300,16 @@ CATALOG: dict[str, BotBlueprint] = {bp.key: bp for bp in (
             "- Work that clearly belongs to another helper goes to that helper.\n"
             "- When you are unsure whether to dispatch, answer the user directly.\n\n"
             "## Dispatch protocol\n"
-            "- When you delegate, your ENTIRE reply must be exactly one line, "
-            "nothing before or after:\n"
-            "  @dispatch <blueprint-key> <task for the worker>\n"
-            "- <task for the worker> is a SHORT, complete instruction: one or "
-            "two sentences stating the work. The helper receives it verbatim, "
-            "so do not paste the user's whole message into it or draft the "
-            "answer inside it.\n"
+            "- To delegate, CALL the concierge_dispatch tool with a blueprint "
+            "key and a task. Do not write prose before or after the call: your "
+            "reply is suppressed and the helper's result is summarized back "
+            "to the user.\n"
+            "- The task is a SHORT, complete instruction: one or two sentences "
+            "stating the work. The helper receives it verbatim, so do not "
+            "paste the user's whole message into it or draft the answer "
+            "inside it.\n"
+            "- Call the tool ONCE per turn. Use only the keys below; never "
+            "dispatch to \"orchestrator\" or to an unlisted key.\n"
             "- Your helper bots (blueprint key — title):\n"
             "  reminders — Reminder Bot\n"
             "  scheduler — Scheduler Bot\n"

@@ -84,3 +84,54 @@ Ship **(a) iCloud CalDAV** on the VM: always-on, no laptop, no phone relay, and
 the credential is a revocable app-specific password. Keep **(b)** as the sync
 backup for users who will not put an app-specific password on the VM. **(c)**
 stays documentation-only.
+
+---
+
+## The Notes Bot vault (M11 open question — RESOLVED 2026-11-24)
+
+The earlier "still open, decide at deploy" note above conflated two different
+things. **The bot does NOT need the Mac's vault to function.** It only needs a
+durable directory of markdown files it can read/write with the `file` toolset.
+Cross-device sync is a *convenience*, not a prerequisite.
+
+What the bot actually requires (all now implemented in `concierge/provision.py`):
+
+1. **A durable path OUTSIDE the bot profile.** Bot profiles are disposable —
+   reprovision retires and DELETES the old one. The vault therefore lives at
+   `~/.hermes/vaults/<user_id>/` (on the VM: `/root/.hermes/vaults/<user_id>/`),
+   mirroring the per-user workspace root. A channel-bound v1 notes bot with no
+   user id gets the `shared` scope.
+2. **Starter files.** `CONVENTIONS.md` is the rulebook the (deliberately
+   trimmed) notes SOUL points at, and `Home.md` is the MOC root / index.
+   Written ONLY when missing — user notes are never overwritten.
+3. **`OBSIDIAN_VAULT_PATH`** pinned in the bot profile's `.env` (mode 0600).
+   That is the documented convention `skills/note-taking/obsidian/SKILL.md`
+   resolves; without it the skill falls back to `~/Documents/Obsidian Vault`,
+   which does not exist on a headless VM.
+4. **Deploy-time repair.** `hermes -p concierge concierge refresh-souls`
+   (`scripts/concierge/deploy.sh` runs it) ensures the vault for already-
+   provisioned notes bots too, since `create_bot`'s idempotence paths return
+   existing bots as-is.
+
+With those four, handoff notes, MOCs, person notes and recall in later
+sessions all work entirely on the VM.
+
+### Still an operator decision: cross-device sync
+
+If the vault should ALSO be readable/editable from the Mac or another device,
+pick one and supply the credential — this is the only part that cannot be
+implemented unilaterally:
+
+- **Git remote (recommended):** create a private repo, put its HTTPS URL +
+  a scoped token in the hub `.env` as `CONCIERGE_VAULT_GIT_URL`, and add a
+  `git init` + pull/commit/push step (a small `concierge vault-sync` command
+  or a cron routine). Needs a remote URL + credential from the operator.
+- **Syncthing / iCloud Drive / mount:** sync `~/.hermes/vaults/<user_id>/`
+  to the Mac with an external daemon. Needs the daemon installed and paired.
+- **Nothing:** keep the vault VM-local; access it through the Notes Bot's
+  chat answers and the file attachments it can now return.
+
+No Apple credential or Mac uptime is required for any of the above — the
+CalDAV/iCloud decision at the top of this doc applies to REMINDERS and
+CALENDAR, not to the Obsidian vault.
+

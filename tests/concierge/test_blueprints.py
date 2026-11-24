@@ -94,8 +94,8 @@ def test_orchestrator_soul_states_capabilities_and_guardrails():
     itself. These are explicit capability facts, enforced by the tests so a
     future SOUL edit cannot quietly delete them."""
     soul = get_blueprint("orchestrator").soul
-    assert "exactly two tools" in soul
-    assert "PLAIN TEXT" in soul and "not a tool" in soul
+    assert "exactly three tools" in soul
+    assert "concierge_dispatch is the ONLY" in soul
     assert "NO progress information" in soul
     assert "MEDIA:<absolute path>" in soul
     assert "do not do the research yourself" in soul.lower()
@@ -129,7 +129,7 @@ def test_orchestrator_blueprint_matches_locked_design():
         "and answers with the result."
     )
     assert bp.model_preset == "core"
-    assert bp.toolsets == ("web",)  # a real bundle (catalog-wide test enforces that)
+    assert bp.toolsets == ("web", "concierge_dispatch")
     assert "terminal" not in bp.toolsets
     assert "file" not in bp.toolsets
     assert bp.skills == ()
@@ -139,25 +139,19 @@ def test_orchestrator_blueprint_matches_locked_design():
 
 
 def test_orchestrator_soul_carries_dispatch_protocol_and_worker_catalog():
-    """The SOUL is the contract the inbound wrap (T5) parses: the directive
-    syntax must appear EXACTLY, the fail-closed triage rule and the
-    ENTIRE-reply constraint must appear verbatim (the future T5 dispatch
-    regex depends on both), and every non-orchestrator catalog key+title
-    must be listed as a dispatch target. The persona never names the
-    platform."""
+    """The SOUL is the contract the model follows: dispatch is now a REAL
+    TOOL (not a magic text line), the fail-closed triage rule survives, and
+    every non-orchestrator catalog key+title must be listed as a target.
+    The persona never names the platform."""
     soul = get_blueprint("orchestrator").soul
-    assert "@dispatch <blueprint-key> <task for the worker>" in soul
-    # Drift-critical sentences, asserted verbatim so deleting either one
-    # fails the suite. The fail-closed triage rule — the unsure case must
-    # answer the user directly, never guess a dispatch:
+    # The tool protocol, asserted verbatim so it cannot drift out:
+    assert "CALL the concierge_dispatch tool" in soul
+    assert "Call the tool ONCE per turn" in soul
+    assert "concierge_dispatch is the ONLY" in soul
+    # Drift-critical: the unsure case must answer the user directly, never
+    # guess a dispatch:
     assert (
         "When you are unsure whether to dispatch, answer the user directly."
-        in soul
-    )
-    # The no-prose constraint the T5 dispatch regex depends on — the reply
-    # is the directive line alone:
-    assert (
-        "your ENTIRE reply must be exactly one line, nothing before or after:"
         in soul
     )
     # The task is a short instruction to the worker, NOT the user's message

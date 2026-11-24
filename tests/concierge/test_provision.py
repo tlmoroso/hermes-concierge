@@ -1180,8 +1180,8 @@ def test_refresh_souls_repairs_stale_persona(concierge_home):
     assert profile in updated
     rendered = (pdir / "SOUL.md").read_text()
     assert rendered.startswith("# Assistant")            # name preserved
-    assert "exactly two tools" in rendered               # new guardrails landed
-    assert "@dispatch <blueprint-key>" in rendered
+    assert "exactly three tools" in rendered               # new guardrails landed
+    assert "concierge_dispatch" in rendered
     assert rendered == get_blueprint("orchestrator").soul.format(
         name="Assistant")
 
@@ -1201,3 +1201,95 @@ def test_refresh_souls_skips_unregistered_profiles(concierge_home):
 
     assert provision.refresh_souls() == []
     assert (pdir / "SOUL.md").read_text() == stale
+
+
+def test_only_notes_is_vault_backed():
+    from concierge.blueprints import CATALOG, get_blueprint
+
+    assert get_blueprint("notes").vault is True
+    assert [k for k, bp in CATALOG.items() if bp.vault] == ["notes"]
+
+
+def test_seed_notes_vault_is_durable_and_idempotent(concierge_home, tmp_path):
+    """The vault lives OUTSIDE the disposable bot profile, is namespaced per
+    user, carries the rulebook + Home index, pins OBSIDIAN_VAULT_PATH at 0600,
+    preserves existing .env keys, and NEVER overwrites user notes."""
+    import stat
+
+    from concierge import provision
+
+    profile = concierge_home / "profiles" / "bot-notes-x1"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+
+    vault = provision._seed_notes_vault(profile, "1001")
+
+    assert vault == str(tmp_path / ".hermes" / "vaults" / "1001")
+    assert "profiles" not in vault  # durable, outside the bot profile
+    root = tmp_path / ".hermes" / "vaults" / "1001"
+    assert (root / "CONVENTIONS.md").is_file()
+    assert "wikilink" in (root / "CONVENTIONS.md").read_text()
+    assert (root / "Home.md").is_file()
+    env_text = (profile / ".env").read_text()
+    assert f"OBSIDIAN_VAULT_PATH={vault}" in env_text
+    assert "OPENAI_API_KEY=sk-x" in env_text
+    assert stat.S_IMODE((profile / ".env").stat().st_mode) == 0o600
+
+    # A second sweep is idempotent: user edits survive, no duplicate key.
+    conv = root / "CONVENTIONS.md"
+    conv.write_text("# my own rules\n")
+    provision._seed_notes_vault(profile, "1001")
+    assert conv.read_text() == "# my own rules\n"
+    assert (profile / ".env").read_text().count("OBSIDIAN_VAULT_PATH=") == 1
+
+
+def test_refresh_souls_also_seeds_a_notes_vault(concierge_home):
+    """A notes bot provisioned before vault seeding shipped gets its vault on
+    the deploy-time refresh, even when its SOUL is already current."""
+    from concierge import provision, registry
+    from concierge.blueprints import get_blueprint
+
+    profile = "bot-notes-legacy"
+    registry.set_user("1001", orchestrator="bot-orchestrator-x",
+                      home_channel="555", guild_id="42")
+    registry.set_user_worker("1001", "notes", profile)
+    pdir = concierge_home / "profiles" / profile
+    pdir.mkdir(parents=True)
+    (pdir / "SOUL.md").write_text(
+        get_blueprint("notes").soul.format(name="notes"))
+    (pdir / ".env").write_text("OPENAI_API_KEY=sk-x\n")
+
+    provision.refresh_souls()
+
+    assert (concierge_home.parent / ".hermes" / "vaults" / "1001"
+            / "CONVENTIONS.md").is_file()
+    assert "OBSIDIAN_VAULT_PATH=" in (pdir / ".env").read_text()
+
+
+def test_refresh_souls_upgrades_stale_toolsets(concierge_home):
+    """config.yaml is written ONCE too: without this repair the new dispatch
+    tool never reaches a live orchestrator even after the SOUL is refreshed.
+    Other config keys must survive verbatim."""
+    from concierge import provision, registry
+    from concierge.blueprints import get_blueprint
+
+    profile = "bot-orchestrator-oldtools"
+    registry.set_user("1001", orchestrator=profile,
+                      home_channel="555", guild_id="42")
+    pdir = concierge_home / "profiles" / profile
+    pdir.mkdir(parents=True)
+    (pdir / "SOUL.md").write_text(
+        get_blueprint("orchestrator").soul.format(name="orchestrator"))
+    (pdir / "config.yaml").write_text(
+        "toolsets:\n  - web\n"
+        "platform_toolsets:\n  discord:\n    - web\n  cron:\n    - web\n"
+        "model:\n  default: keep-me\n")
+
+    assert profile in provision.refresh_souls()
+    cfg = _yaml(pdir / "config.yaml")
+    expected = ["web", "concierge_dispatch"]
+    assert cfg["toolsets"] == expected
+    assert cfg["platform_toolsets"]["discord"] == expected
+    assert cfg["platform_toolsets"]["cron"] == expected
+    assert cfg["model"]["default"] == "keep-me"
+    assert provision.refresh_souls() == []  # idempotent

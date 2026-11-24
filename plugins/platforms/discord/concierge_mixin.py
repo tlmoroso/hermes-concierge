@@ -852,13 +852,41 @@ class ConciergeDiscordMixin:
                     "connected and can send, but every inbound message is "
                     "discarded.", getattr(self, "name", "discord"))
             return None
-        response = await runner_handler(event)
-        # Orchestrator dispatch (PLAN decision 2): a REGISTRY-CONFIRMED
-        # orchestrator turn that answered with the ``@dispatch`` directive
-        # hands the exchange to the background driver — the directive
-        # response itself is SUPPRESSED (None: the driver delivers
-        # everything). Every guard failure keeps the response UNCHANGED
-        # (fail-closed: the orchestrator answered alone).
+        # Expose (adapter, event) to any ``concierge_dispatch`` tool call
+        # made during this turn (ContextVar propagates into the tool thread).
+        # Fail-closed on an unavailable tool module: intake must never break.
+        from contextlib import nullcontext
+        try:
+            from tools.concierge_dispatch_tool import (
+                dispatch_context, take_dispatch_intent)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-tool-import",),
+                "[%s] concierge: dispatch tool module unavailable (%s); "
+                "legacy text dispatch only",
+                getattr(self, "name", "discord"), e)
+            dispatch_context = take_dispatch_intent = None
+        ctx = (dispatch_context(self, event) if dispatch_context
+               else nullcontext())
+        with ctx:
+            response = await runner_handler(event)
+        intent = take_dispatch_intent(event) if take_dispatch_intent else None
+
+        # PREFERRED PATH: the model called the real schema-backed tool. The
+        # handler already validated the blueprint and the shared guards; the
+        # model's final text (if any) is SUPPRESSED — the driver delivers.
+        if intent is not None:
+            blueprint_key, task = intent
+            if self._concierge_dispatch_eligible(event):
+                return self._concierge_launch_dispatch(
+                    event, task, blueprint_key, fallback=response)
+            logger.warning(
+                "[%s] concierge: a dispatch tool call was recorded on an "
+                "ineligible turn; ignoring it", getattr(self, "name", "discord"))
+
+        # LEGACY FALLBACK: a plain-text ``@dispatch`` directive (profiles
+        # whose SOUL.md has not yet been refreshed). Guard failures keep the
+        # response UNCHANGED (fail-closed: the orchestrator answered alone).
         dispatch = self._concierge_dispatch_directive_on(event, response)
         if dispatch is None:
             # Every guard failure keeps the response UNCHANGED apart from the
@@ -866,6 +894,14 @@ class ConciergeDiscordMixin:
             # never drop a worker-produced file).
             return self._concierge_guard_visible_response(event, response)
         blueprint_key, task = dispatch
+        return self._concierge_launch_dispatch(
+            event, task, blueprint_key, fallback=response)
+
+    def _concierge_launch_dispatch(self, event, task, blueprint_key, *,
+                                   fallback):
+        """Spawn the background dispatch driver for one validated intent.
+        Returns None (response suppressed; the driver delivers everything) or
+        *fallback* when the driver could not be tracked."""
         channel_id = str(
             getattr(getattr(event, "source", None), "chat_id", "") or "")
         driver = None
@@ -887,7 +923,7 @@ class ConciergeDiscordMixin:
                 "delivered as-is instead",
                 getattr(self, "name", "discord"), channel_id, e,
                 exc_info=True)
-            return response
+            return fallback
         logger.info(
             "[%s] concierge: orchestrator dispatch started for channel %s "
             "(blueprint %s)",
@@ -896,31 +932,48 @@ class ConciergeDiscordMixin:
 
     # ── Orchestrator dispatch (PLAN decision 2): the wrap capability ──────
 
-    def _concierge_dispatch_directive_on(self, event, response):
-        """The dispatch verdict for *event*'s turn response:
-        ``(blueprint_key, task)`` when the response is the orchestrator's
-        ``@dispatch`` directive AND every guard holds, else ``None``.
+    def _concierge_dispatch_eligible(self, event) -> bool:
+        """Shared guards for BOTH dispatch paths — the real
+        ``concierge_dispatch`` tool AND the legacy ``@dispatch`` text
+        directive. Fail-closed to "no dispatch":
 
-        Guards (ALL must hold, fail-closed to "no dispatch"):
-        - the event is human-authored (``source.is_bot`` False — a bot's
-          own directive-shaped answer never dispatches; anti-loop);
-        - the event does NOT carry the process-local dispatch-continuation
-          stamp (a phase-B turn never re-dispatches — depth 1);
-        - the response is a non-empty plain string whose (stripped) first
-          line is the directive, with a CATALOG worker blueprint key —
-          never ``orchestrator`` (no self-dispatch); every other response
-          shape (media objects, ephemeral wrappers, None) falls through;
-        - the turn ran AS the author's registry orchestrator
-          (``source.profile == orchestrator_for_user(user_id)``,
-          anti-spoof) — ONE registry read, paid ONLY on a
-          directive-shaped response (the wrap runs on every message; the
-          common case must stay read-free), tolerant → no dispatch.
+        - human-authored (``source.is_bot`` False — anti-loop);
+        - no process-local dispatch-continuation stamp (phase-B turns never
+          re-dispatch, depth 1);
+        - the turn ran AS the author's registry-confirmed orchestrator
+          (``source.profile == orchestrator_for_user(user_id)``, anti-spoof).
         """
         source = getattr(event, "source", None)
         if source is None or getattr(source, "is_bot", False):
-            return None
+            return False
         if getattr(event, _CONCIERGE_DISPATCH_ATTR, None):
-            return None
+            return False
+        user_id = str(getattr(source, "user_id", "") or "")
+        if not user_id:
+            return False
+        try:
+            from concierge import registry
+
+            orchestrator = registry.orchestrator_for_user(user_id)
+        except Exception as e:
+            self._concierge_warn_once(
+                ("dispatch-registry", user_id),
+                "[%s] concierge: the orchestrator lookup for user %s failed "
+                "(%s); the dispatch is refused",
+                getattr(self, "name", "discord"), user_id, e, exc_info=True)
+            return False
+        return bool(orchestrator) and source.profile == orchestrator
+
+    def _concierge_dispatch_directive_on(self, event, response):
+        """LEGACY FALLBACK: the dispatch verdict for *event*'s final response
+        when it is the old plain-text ``@dispatch <key> <task>`` directive.
+
+        New SOULs instruct the real ``concierge_dispatch`` tool; this parser
+        exists so a profile whose SOUL.md has not yet been refreshed still
+        works. Returns ``(blueprint_key, task)`` or ``None``. The expensive
+        registry read is paid ONLY on a directive-shaped response (the wrap
+        runs on every message; the common case must stay read-free).
+        """
         if not isinstance(response, str):
             return None
         match = _DISPATCH_DIRECTIVE_RE.match(response.strip())
@@ -950,21 +1003,7 @@ class ConciergeDiscordMixin:
                 "as-is instead",
                 getattr(self, "name", "discord"), e, exc_info=True)
             return None
-        user_id = str(getattr(source, "user_id", "") or "")
-        if not user_id:
-            return None
-        try:
-            from concierge import registry
-
-            orchestrator = registry.orchestrator_for_user(user_id)
-        except Exception as e:
-            self._concierge_warn_once(
-                ("dispatch-registry", user_id),
-                "[%s] concierge: the orchestrator lookup for user %s failed "
-                "(%s); the response is delivered as-is instead",
-                getattr(self, "name", "discord"), user_id, e, exc_info=True)
-            return None
-        if not orchestrator or source.profile != orchestrator:
+        if not self._concierge_dispatch_eligible(event):
             return None
         return blueprint_key, task
 
