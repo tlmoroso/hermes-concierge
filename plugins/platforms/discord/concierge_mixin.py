@@ -267,6 +267,14 @@ _CONCIERGE_DISPATCH_ATTR = "_concierge_dispatch_continuation"
 # response must still OPEN with the directive.
 _DISPATCH_DIRECTIVE_RE = re.compile(r"^@dispatch ([a-z_]+) (.+)$", re.DOTALL)
 
+# OBSERVABILITY ONLY — never an enforcement cap. The dispatch task is passed
+# to the worker as its inbound turn text and is NEVER posted to Discord (the
+# orchestrator<->worker exchange is silent), so an over-long directive is no
+# longer a delivery failure. Warn once per blueprint so a runaway SOUL is
+# visible in the logs, but pass the task through VERBATIM: the worker needs
+# every requirement, and truncating/summarising it here would be a dumb clamp.
+_CONCIERGE_DISPATCH_TASK_WARN_CHARS = 2000
+
 # One history window line authored by the shared bot identity — the shape
 # ``_format_channel_history_line`` formats (``[Name [bot]] content``; foreign
 # bots are dropped by the formatter under the default DISCORD_ALLOW_BOTS, so
@@ -909,6 +917,14 @@ class ConciergeDiscordMixin:
         blueprint_key, task = match.group(1), match.group(2).strip()
         if not task or blueprint_key == "orchestrator":
             return None
+        if len(task) > _CONCIERGE_DISPATCH_TASK_WARN_CHARS:
+            self._concierge_warn_once(
+                ("dispatch-task-length", blueprint_key),
+                "[%s] concierge: orchestrator %s dispatch task is %d chars "
+                "(> %d); passing it to the worker INTACT — the task is never "
+                "posted to Discord, so length cannot fail the dispatch",
+                getattr(self, "name", "discord"), blueprint_key, len(task),
+                _CONCIERGE_DISPATCH_TASK_WARN_CHARS)
         try:
             from concierge.blueprints import CATALOG
 
@@ -1777,25 +1793,30 @@ class ConciergeDiscordMixin:
                                                blueprint_key: str) -> None:
         """The Discord-mediated dispatch driver (PLAN decision 2): run the
         worker's turn and the orchestrator's phase-B summary as REAL Discord
-        turns, visibly, through the room machinery — never in-process.
+        turns through the room machinery — never in-process.
+
+        The orchestrator<->worker exchange is SILENT: no visible
+        "→ asked <Title>: <task>" intermediation is posted. The directive is
+        suppressed by the wrap, the task travels as the worker's inbound turn
+        text, and the only thing that lands in the home channel is the
+        phase-B answer (plus a terminal failure notice when something breaks).
 
         Serialized per home channel (``_concierge_room_lock_for``, the
         fan-out's queue-behind contract) and tracked like a fan-out driver.
         Fail-closed ladder, mirrored from the plan:
 
-        - PRE-HANDOFF prepare failures (registry entry, worker provision,
-          worker channel): warn ONCE and post ONE best-effort
-          "⚠ dispatch failed" notice into the home channel — the wrap already
-          suppressed the directive, so without the notice the user would see
-          nothing at all (the quality-review fix). The HANDOFF post failure
-          keeps the quiet abort: the handoff is the visible boundary, and a
-          channel that could not take the handoff could not take a notice
-          either.
-        - POST-HANDOFF: a worker-turn or reply-fetch failure posts the
+        - PREPARE failures (registry entry, worker provision, worker
+          channel): warn ONCE and post ONE best-effort "⚠ dispatch failed"
+          notice into the home channel — the wrap already suppressed the
+          directive, so without the notice the user would see nothing at all
+          (the quality-review fix). Nothing decorative can abort the
+          dispatch; every visible post goes through
+          ``_concierge_post_visible``.
+        - WORKER-TURN / REPLY-FETCH failures: post the
           "⚠ <worker> is unavailable" notice and phase B STILL runs (with the
-          failure noted in its context) so the user is never left with just
-          the handoff line; a phase-B failure posts the orchestrator's own
-          unavailable notice. Never a silent drop.
+          failure noted in its context) so the user always gets an answer; a
+          phase-B failure posts the orchestrator's own unavailable notice.
+          Never a silent drop.
         """
         source = getattr(event, "source", None)
         user_id = str(getattr(source, "user_id", "") or "")
@@ -1924,15 +1945,15 @@ class ConciergeDiscordMixin:
             # The wrap already SUPPRESSED the directive, so without a notice
             # the user would see nothing at all (quality review): ONE
             # best-effort "⚠ dispatch failed" post into the home channel.
-            # The HANDOFF subcase below keeps its quiet abort — the handoff
-            # post is the visible boundary, and a channel that could not
-            # take the handoff could not take a notice either. Best-effort: a
-            # notice failure must never raise out of the driver.
+            # This is a TERMINAL notice, not intermediation — it goes through
+            # the single visible-post formatter so a too-long or broken post
+            # can never kill the dispatch. Best-effort: a notice failure must
+            # never raise out of the driver.
             try:
                 channel = getattr(getattr(event, "raw_message", None),
                                   "channel", None)
-                if channel is not None and hasattr(channel, "send"):
-                    await channel.send("⚠ dispatch failed")
+                await self._concierge_post_visible(
+                    channel, "⚠ dispatch failed")
             except Exception as notice_error:
                 logger.warning(
                     "[%s] concierge: the dispatch-failed notice for channel "
@@ -1941,25 +1962,22 @@ class ConciergeDiscordMixin:
                     notice_error)
             return
 
-        # 3) the visible handoff — the point of no return. The raw message's
-        #    channel is the home channel (the member-unavailable posture).
-        try:
-            channel = getattr(getattr(event, "raw_message", None),
-                              "channel", None)
-            if channel is None or not hasattr(channel, "send"):
-                raise RuntimeError("the event carried no postable channel")
-            await channel.send(f"→ asked **{title}**: {task}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._concierge_warn_once(
-                ("dispatch-handoff", home_channel),
-                "[%s] concierge: posting the dispatch handoff into channel "
-                "%s failed (%s); the dispatch aborted with nothing else "
-                "posted",
-                getattr(self, "name", "discord"), home_channel, e,
-                exc_info=True)
-            return
+        # 3) NO visible handoff. The orchestrator<->worker exchange is
+        #    deliberately SILENT: the directive was suppressed by the wrap,
+        #    the task is passed to the worker as its inbound turn text (never
+        #    posted to Discord), and the ONLY thing that lands in the home
+        #    channel is the phase-B answer. There is no
+        #    "→ asked <Title>: <task>" intermediation line.
+        #
+        #    This also removes the old "point of no return". A purely
+        #    decorative post used to abort the WHOLE dispatch on a Discord
+        #    50035 / "Must be 2000 or fewer" rejection — silently dropping
+        #    the worker turn and leaving the user with nothing (the
+        #    2026-11-24 Monte Carlo incident: a 1,995-char task produced a
+        #    2,023-char handoff). Observability stays in the logs (the wrap's
+        #    "orchestrator dispatch started for channel … (blueprint …)").
+        #    Nothing in this step can fail the dispatch: terminal failure
+        #    notices below remain best-effort.
 
         # 4) the worker's turn — the member-turn clone pattern, on the WORKER
         #    profile + channel with the TASK as the message text and the home
@@ -2360,27 +2378,72 @@ class ConciergeDiscordMixin:
             # shield: a wait timeout must never cancel the member's turn.
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
 
+    async def _concierge_post_visible(self, channel, text: str) -> bool:
+        """ONE formatting boundary for every dispatch-authored visible post.
+
+        The orchestrator<->worker exchange is intentionally SILENT (no
+        ``→ asked <Title>: <task>`` intermediation). Only TERMINAL notices
+        reach Discord from the driver (``⚠ dispatch failed`` /
+        ``⚠ <bot> is unavailable``), and each passes through here so no
+        notice can repeat the 50035 / "Must be 2000 or fewer" abort that
+        used to kill a WHOLE dispatch.
+
+        Uses the adapter's own ``MAX_MESSAGE_LENGTH`` + ``truncate_message``
+        — the SAME chunker ``DiscordAdapter.send`` uses for agent answers —
+        rather than a hand-rolled clamp, and degrades to a deterministic
+        split when a test double or older adapter lacks them. This is a
+        formatter, not a truncator: nothing is dropped. Best-effort by
+        design — a notice failure must never eat the remaining members or
+        the phase-B answer. Returns True when at least one chunk was posted.
+        """
+        if channel is None or not hasattr(channel, "send"):
+            return False
+        raw = str(text or "")
+        if not raw.strip():
+            return False
+        max_len = int(getattr(self, "MAX_MESSAGE_LENGTH", 2000) or 2000)
+        truncate = getattr(self, "truncate_message", None)
+        chunks = None
+        if callable(truncate):
+            try:
+                split = truncate(raw, max_len)
+                if isinstance(split, (list, tuple)):
+                    chunks = [str(c) for c in split]
+            except Exception:
+                chunks = None
+        if not chunks:
+            # Deterministic fallback: SPLIT, never truncate-and-drop.
+            chunks = [raw[i:i + max_len]
+                      for i in range(0, len(raw), max_len)]
+        delivered = False
+        for chunk in chunks:
+            if not chunk:
+                continue
+            await channel.send(chunk)
+            delivered = True
+        return delivered
+
     async def _concierge_post_member_unavailable(self, event, member: str) -> None:
         """The plan's error-isolation notice: ONE "⚠ <bot> is unavailable"
         into the channel, then the fan-out continues. Best effort by design
-        (a notice failure must not eat the remaining members): duck-typed
-        onto the triggering message's channel, logged when undeliverable."""
+        (a notice failure must not eat the remaining members): routed through
+        ``_concierge_post_visible`` — the single formatter for EVERY
+        dispatch-authored visible post — and logged when undeliverable."""
         text = f"⚠ **{self._concierge_member_title(member)}** is unavailable"
         channel = getattr(getattr(event, "raw_message", None), "channel", None)
         try:
-            if channel is not None and hasattr(channel, "send"):
-                await channel.send(text)
-                return
+            posted = await self._concierge_post_visible(channel, text)
         except Exception as e:
             logger.warning(
                 "[%s] concierge: could not post the unavailable notice for "
                 "room member %s: %s",
                 getattr(self, "name", "discord"), member, e)
             return
-        logger.warning(
-            "[%s] concierge: no channel to post the unavailable notice for "
-            "room member %s (raw message carried none)",
-            getattr(self, "name", "discord"), member)
+        if not posted:
+            logger.warning(
+                "[%s] concierge: no channel to post the unavailable notice "
+                "for room member %s (raw message carried none)",
+                getattr(self, "name", "discord"), member)
 
     def _concierge_member_title(self, profile: str) -> str:
         """Display title for a member profile: the ``profile.yaml``

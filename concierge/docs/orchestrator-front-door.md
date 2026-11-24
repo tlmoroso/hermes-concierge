@@ -18,13 +18,18 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   reply is `@dispatch <blueprint-key> <task>`; the `set_message_handler` wrap
   parses it (registry-confirmed orchestrator turn, human-authored, no
   continuation stamp) and returns None (the directive is never posted/spoken).
-  A background driver posts the visible `→ asked <Title>: <task>` handoff,
-  lazily provisions the per-user channel-less worker + its channel, runs the
-  worker's turn through the member-turn machinery, parses the reply MESSAGE-wise
-  (multi-line answers reach phase B whole), and runs a continuation-stamped
-  orchestrator turn that summarizes into the home channel — the ONE spoken
-  playback on voice. Fail-closed ladder at every step; depth 1; bot-authored
-  never dispatches.
+  A background driver SILENTLY (no `→ asked <Title>: <task>` intermediation —
+  removed 2026-11-24; the full task goes to the worker as inbound turn text,
+  never posted to Discord) lazily provisions the per-user channel-less worker
+  + its channel, runs the worker's turn through the member-turn machinery,
+  parses the reply MESSAGE-wise (multi-line answers reach phase B whole), and
+  runs a continuation-stamped orchestrator turn that summarizes into the home
+  channel — the ONLY visible response, and the ONE spoken playback on voice.
+  Terminal failure notices (`⚠ dispatch failed`, `⚠ <bot> is unavailable`)
+  go through one visible-post formatter (`_concierge_post_visible`, backed by
+  the adapter's own `MAX_MESSAGE_LENGTH` + `truncate_message` chunker) so no
+  notice can repeat the 50035 / 2000-char abort. Fail-closed ladder at every
+  step; depth 1; bot-authored never dispatches.
 - **Voice:** the restamp runs the registry verdict FIRST (binding/room channels
   keep their routing), then re-homes unbound channels to the speaker's
   orchestrator via the `_CONCIERGE_ORCHESTRATOR_ATTR` stamp — no category check

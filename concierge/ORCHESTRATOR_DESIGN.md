@@ -59,7 +59,10 @@ Reuses the tested room paths: `_concierge_run_member_turn` +
 3. Post the task to the worker channel; the binding routes it; the worker's turn
    runs with its own narrow toolsets.
 4. Orchestrator waits for the reply, summarizes, and answers in the personal
-   channel with a visible one-line intermediation ("→ asked Researcher: …").
+   channel. NO visible intermediation is posted — the orchestrator↔worker
+   exchange is silent (operator override 2026-11-24: the original
+   "→ asked Researcher: …" one-liner was removed; it was decoration, and a
+   >2000-char handoff once aborted the whole dispatch).
 - Anti-loop and fail-closed guarantees are inherited from the room machinery
   (bot-authored never dispatches; dispatch failure degrades to the orchestrator
   answering alone, never silently dropping).

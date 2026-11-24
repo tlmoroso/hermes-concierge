@@ -132,6 +132,9 @@ def test_orchestrator_soul_carries_dispatch_protocol_and_worker_catalog():
         "your ENTIRE reply must be exactly one line, nothing before or after:"
         in soul
     )
+    # The task is a short instruction to the worker, NOT the user's message
+    # or a drafted answer (the 2026-11-24 over-long-directive regression):
+    assert "one or two sentences stating the work" in soul
     # Triage tie-breaker: research-flavored requests always dispatch.
     assert (
         "Any request that needs search, sources, or citations goes to the "

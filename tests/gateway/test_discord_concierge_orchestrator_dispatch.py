@@ -13,7 +13,9 @@ that does the whole exchange through the room machinery, visibly, in Discord:
 2. the worker bot is provisioned lazily (channel-less, per-user, idempotent)
    and its channel created lazily + bound ONCE (the second dispatch reuses
    both);
-3. a visible handoff (``→ asked <Title>: <task>``) lands in the home channel;
+3. NO visible handoff — the orchestrator↔worker exchange is SILENT: the task
+   is passed to the worker as its inbound turn text (NEVER posted to Discord)
+   and the only thing that lands in the home channel is the phase-B answer;
 4. the worker's turn runs through the REAL base chain
    (``super().handle_message`` on a clone stamped with the worker profile,
    the worker channel as chat_id, and the TASK as the message text) with the
@@ -35,10 +37,14 @@ UNCHANGED — the orchestrator answered alone. A PREPARE failure (registry
 entry, worker provision, worker channel) warns once and posts ONE
 best-effort ``⚠ dispatch failed`` notice into the home channel — the wrap
 already suppressed the directive, so without the notice the user would see
-nothing at all; a HANDOFF-post failure keeps the quiet abort (the handoff
-post is the visible boundary, and a channel that could not take the handoff
-could not take a notice). After the handoff, an explicit notice lands in the
-home channel and phase B still runs — never a silent drop.
+nothing at all. There is NO decorative post that can abort the dispatch (the
+2026-11-24 regression: a 2,023-char ``→ asked`` handoff rejected by Discord
+50035 used to kill the whole worker turn). A WORKER-TURN / reply-fetch
+failure posts an explicit notice into the home channel and phase B still
+runs — never a silent drop. Every dispatch-authored visible post goes
+through the single ``_concierge_post_visible`` formatter (the adapter's
+``MAX_MESSAGE_LENGTH`` + ``truncate_message`` chunker), so a too-long notice
+can never repeat the abort.
 
 Rig: the room_live_chain suite's shape (a REAL DiscordAdapter over the
 conftest discord mock, a REAL temp registry under an isolated HERMES_HOME, a
@@ -330,8 +336,7 @@ def _trigger(rig, *, text=TRIGGER_TEXT, chat_id=HOME,
              message_type=MessageType.TEXT):
     """A message in a BOUND channel, through the REAL ``build_source`` (the
     binding verdict stamps the orchestrator profile), carrying a raw message
-    whose channel is the fake channel — the handoff post and the window
-    fetches both need it."""
+    whose channel is the fake channel — the history-window fetches need it."""
     channel = rig.channels[str(chat_id)]
     raw = _FakeMessage(next(_ids), text, _HUMAN, channel=channel)
     source = rig.adapter.build_source(
@@ -366,9 +371,10 @@ def test_directive_dispatches_through_the_worker_and_summarizes(rig, monkeypatch
     """A registry-confirmed orchestrator turn answering with the directive
     spawns the driver: the wrap returns None (the directive is suppressed),
     the worker is provisioned lazily (channel-less, user-keyed), its channel
-    created lazily and bound once, the handoff names the blueprint TITLE, the
-    worker turn runs with the TASK text on the worker profile (the home
-    window as context, NO voice-relay stamp), and the stamped phase-B turn —
+    created lazily and bound once, NO visible intermediation is posted (the
+    home channel's raw sends stay empty), the worker turn runs with the TASK
+    text on the worker profile (the home window as context, NO voice-relay
+    stamp), and the stamped phase-B turn —
     the ORIGINAL user text plus the worker's reply as context — delivers the
     summary into the home channel through the normal machinery."""
     _seed(rig)
@@ -389,9 +395,12 @@ def test_directive_dispatches_through_the_worker_and_summarizes(rig, monkeypatch
     assert binding["profile"] == WORKER_PROFILE
     assert binding["blueprint"] == WORKER_KEY
     assert rig.adapter._concierge_channel_is_hub_created(str(WORKER_CHANNEL))
-    # the visible handoff: the blueprint TITLE, the task
-    assert any(s == f"→ asked **{WORKER_TITLE}**: {TASK}"
-               for s in rig.channels[str(HOME)].sends)
+    # NO visible intermediation: the orchestrator↔worker exchange is silent.
+    # The home channel sees no raw channel.send() at all on the success path
+    # (the worker answer and the phase-B summary arrive via adapter.send()).
+    assert rig.channels[str(HOME)].sends == []
+    assert all("→ asked" not in (m.content or "")
+               for m in rig.channels[str(HOME)].messages)
     # the worker turn: the TASK as text, the worker profile + channel, the
     # home window as context, and NO voice-relay stamp on the lane
     worker_call = next(c for c in calls
@@ -664,9 +673,9 @@ def test_prepare_failure_posts_dispatch_failed_notice(rig, monkeypatch):
     so a PREPARE failure (registry entry, worker provisioning, worker channel)
     would otherwise leave the user with NOTHING — exactly ONE best-effort
     ``⚠ dispatch failed`` notice lands in the home channel and the driver
-    stops (no handoff, no worker turn, no phase B). The HANDOFF subcase keeps
-    its quiet abort (the next test): the handoff post is the visible
-    boundary."""
+    stops (no worker turn, no phase B). That notice is TERMINAL, not
+    intermediation — it is the only thing the user sees when provisioning
+    fails, and it goes through ``_concierge_post_visible``."""
     _seed(rig)
 
     def _provision_boom(*args, **kwargs):
@@ -691,7 +700,7 @@ def test_worker_turn_failure_posts_notice_and_phase_b_still_runs(rig, monkeypatc
     the one failure shape the base's turn machinery does NOT swallow into an
     error reply) posts the unavailable notice into the home channel, and
     phase B still runs — with the failure noted in its context — so the
-    user is never left with just the handoff line."""
+    user always gets an answer even though the worker could not run."""
     _seed(rig)
     provision_calls = []
     _fake_provision(rig, monkeypatch, provision_calls)
@@ -740,14 +749,19 @@ def test_missing_worker_reply_treated_as_failure(rig, monkeypatch):
     assert (str(HOME), PHASE_B_ANSWER) in seams.sent
 
 
-def test_handoff_post_failure_aborts_the_driver_quietly(rig, monkeypatch):
-    """The handoff is the point of no return: if it cannot be posted, the
-    driver aborts with the warn-once and NOTHING else happens — no worker
-    turn, no phase B, no notices."""
+def test_broken_home_channel_never_blocks_the_dispatch(rig, monkeypatch):
+    """REGRESSION (2026-11-24 Monte Carlo incident): a home channel whose raw
+    ``send`` fails used to abort the WHOLE dispatch — the driver posted a
+    decorative ``→ asked <Title>: <task>`` handoff FIRST and treated any
+    failure of that post as the "point of no return", so the worker turn and
+    phase B never ran and the user saw nothing. With the handoff removed, a
+    broken home channel cannot block anything: the worker turn, the phase-B
+    summary and the home-channel delivery all still complete. Terminal
+    notices are best-effort and their failure is contained."""
     _seed(rig)
     provision_calls = []
     _fake_provision(rig, monkeypatch, provision_calls)
-    _wire_io(rig, monkeypatch)
+    seams = _wire_io(rig, monkeypatch)
     calls = []
     _install_handler(rig, calls, {ORCH: DIRECTIVE, WORKER_PROFILE: WORKER_ANSWER})
 
@@ -771,11 +785,65 @@ def test_handoff_post_failure_aborts_the_driver_quietly(rig, monkeypatch):
 
     result = _run(_scenario())
 
-    assert result is None  # the wrap suppressed the directive
-    # the trigger reached the runner handler; no lane turn ever dispatched
-    assert [getattr(c.source, "profile", None) for c in calls] == [ORCH]
+    assert result is None  # the wrap still suppressed the directive
+    # BOTH lane turns ran — the worker's AND the stamped phase-B summary
+    assert WORKER_PROFILE in [getattr(c.source, "profile", None) for c in calls]
+    phase_b = next(c for c in calls
+                   if getattr(c, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None))
+    assert phase_b.source.profile == ORCH
+    # the final answer still reached the home channel through adapter.send()
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent
+    # no raw channel.send ever succeeded — nothing decorative was posted
+    assert rig.channels[str(HOME)].sends == []
     assert (getattr(rig.adapter, "_concierge_room_fanout_tasks", None) or {}) == {}
-    assert rig.channels[str(HOME)].sends == []  # nothing else was posted
+
+
+def test_overlong_task_dispatches_in_full_with_no_visible_handoff(
+        rig, monkeypatch):
+    """REGRESSION: the original production failure was a 1,995-char task whose
+    2,023-char ``→ asked **Researcher Bot**: <task>`` handoff exceeded
+    Discord's 2,000-char cap (HTTP 400 / 50035) and aborted the whole
+    dispatch. The task is now NEVER posted: it must reach the worker
+    VERBATIM (no truncation, no summarising — a dumb clamp would lose
+    requirements), nothing decorative lands in the home channel, and phase B
+    still delivers the answer."""
+    _seed(rig)
+    long_task = (
+        "Plan a comprehensive Monte Carlo/Monaco trip guide with sources: "
+        "cover hotels, packing, the craps tables, opening hours, lines of "
+        "credit, dinner reservations, day trips and current prices. " * 40
+    ).rstrip()  # the directive parser strips response whitespace; no trailing
+    assert len(long_task) > 2000  # the exact shape that used to break
+    directive = f"@dispatch {WORKER_KEY} {long_task}"
+    _fake_provision(rig, monkeypatch, [])
+    seams = _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(rig, calls, {ORCH: directive, WORKER_PROFILE: WORKER_ANSWER})
+
+    _drive(rig, _trigger(rig))
+
+    worker_call = next(c for c in calls
+                       if getattr(c.source, "profile", None) == WORKER_PROFILE)
+    assert worker_call.text == long_task  # VERBATIM, never clamped
+    assert rig.channels[str(HOME)].sends == []  # no decoration, no notice
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent
+
+
+def test_visible_post_formatter_splits_and_never_truncates(rig):
+    """The ONE formatter for every dispatch-authored visible post uses the
+    adapter's own ``MAX_MESSAGE_LENGTH`` + ``truncate_message`` chunker: an
+    over-long TERMINAL notice is SPLIT into <=2000-char chunks with NOTHING
+    dropped, so no notice can repeat the 50035 abort. (The chunker adds
+    ``(1/N)`` indicators, so compare payload characters, not exact joins.)"""
+    channel = _FakeChannel(999)
+    text = "⚠ " + ("x" * 5000)
+    posted = _run(rig.adapter._concierge_post_visible(channel, text))
+
+    assert posted is True
+    assert len(channel.sends) > 1
+    assert all(len(s) <= rig.adapter.MAX_MESSAGE_LENGTH
+               for s in channel.sends)
+    assert sum(s.count("x") for s in channel.sends) == 5000  # nothing lost
 
 
 # ── (4) Voice: the phase-B answer is the ONE playback ───────────────────────
@@ -884,7 +952,7 @@ def _place_home_category(rig, monkeypatch, *, value, seen=None):
 
 def _spy_create_channel(rig, monkeypatch):
     """Record the placement decision while still running the REAL create
-    helper, so everything downstream (binding, handoff, worker turn, phase B)
+    helper, so everything downstream (binding, worker turn, phase B)
     behaves exactly as in production."""
     calls = []
     original = rig.adapter._concierge_create_channel
