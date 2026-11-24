@@ -117,3 +117,24 @@ def test_only_one_dispatch_per_turn():
     assert first["dispatched"] is True
     assert "already been dispatched" in second["error"]
     assert t.take_dispatch_intent(event) == ("researcher", "a")
+
+
+def test_dispatch_tool_is_registered_and_stays_eager():
+    """On the VM, tool_search is ACTIVE (snowballstemmer installed). A normal
+    non-core toolset would be deferred behind tool_search/tool_call, so the
+    model never sees dispatch and the SOUL's 'exactly three tools' is a lie.
+    Session-gating the toolset keeps it eager AND out of default composites.
+    """
+    from model_tools import get_all_tool_names, get_tool_definitions
+    from toolsets import TOOLSET_SESSION_PLATFORMS, resolve_toolset
+    from tools.tool_search import is_deferrable_tool_name
+
+    assert "concierge_dispatch" in get_all_tool_names()
+    assert TOOLSET_SESSION_PLATFORMS.get("concierge_dispatch") == frozenset(
+        {"discord"})
+    assert "concierge_dispatch" not in resolve_toolset("all")  # no leak
+    assert is_deferrable_tool_name("concierge_dispatch") is False
+    defs = get_tool_definitions(
+        enabled_toolsets=["web", "concierge_dispatch"])
+    assert sorted(d["function"]["name"] for d in defs) == [
+        "concierge_dispatch", "web_extract", "web_search"]

@@ -127,6 +127,13 @@ TOOLSETS = {
     "concierge_dispatch": _ts(
         "Orchestrator -> worker dispatch (concierge only): a real, schema-backed tool",
         ["concierge_dispatch"],
+        # Session-gated surface: (1) keeps it OUT of the default `all` / platform
+        # composites so only a profile that explicitly allows it sees the tool,
+        # and (2) tools/tool_search.py treats session-gated toolsets as DIRECT —
+        # otherwise dispatch gets deferred behind tool_search/tool_call on the VM
+        # (where snowballstemmer is installed), the model never sees it, and the
+        # SOUL's "exactly three tools" no longer matches reality.
+        platforms=frozenset({"discord"}),
     ),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
