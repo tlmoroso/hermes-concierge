@@ -30,6 +30,29 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   the adapter's own `MAX_MESSAGE_LENGTH` + `truncate_message` chunker) so no
   notice can repeat the 50035 / 2000-char abort. Fail-closed ladder at every
   step; depth 1; bot-authored never dispatches.
+- **Files / artifacts (2026-11-24):** the orchestrator stays `web`-only (two
+  tools: `web_search`, `web_extract`) and CANNOT write files. A `file`-toolset
+  `artifacts` worker (Files Bot) writes the document into the per-user
+  workspace and answers `ARTIFACT:<absolute path>`. The driver validates that
+  path against the workspace root (untrusted worker text — no arbitrary host
+  upload), stamps it on the phase-B event, and the wrap appends `MEDIA:<path>`
+  deterministically so the user gets a downloadable attachment even if the
+  model forgot the tag. The SOUL also asks for the tag: belt and braces.
+- **SOUL guardrails (2026-11-24):** the orchestrator SOUL now states its exact
+  tools, that `@dispatch` is PLAIN TEXT (never a tool call), that it must not
+  do research itself, that it gets NO progress information (never claim a
+  worker is "still running"), and how to handle files. `tests/concierge/
+  test_blueprints.py` locks those lines verbatim. Two code-level guardrails
+  back them: `_concierge_guard_visible_response` scrubs malformed multi-line
+  `@dispatch` leaks and delivers artifacts; `_concierge_safe_artifact_path`
+  gates the upload path.
+- **SOUL staleness — DEPLOY REQUIREMENT:** `SOUL.md` is written ONCE at
+  provisioning and `create_bot`'s idempotence paths never rewrite it, so a
+  catalog/SOUL edit that is synced to the VM does NOT reach an existing bot.
+  `hermes -p concierge concierge refresh-souls` re-renders every registered
+  bot's persona from the current catalog (persona names preserved, orphans
+  skipped, idempotent). `scripts/concierge/deploy.sh` runs it after the rsync
+  and BEFORE the restart. Always run it after any catalog/SOUL change.
 - **Voice:** the restamp runs the registry verdict FIRST (binding/room channels
   keep their routing), then re-homes unbound channels to the speaker's
   orchestrator via the `_CONCIERGE_ORCHESTRATOR_ATTR` stamp — no category check

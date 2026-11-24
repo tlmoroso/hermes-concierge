@@ -56,8 +56,21 @@ case "${1:-deploy}" in
     $SSHCMD $VM 'systemctl is-active hermes-gateway; tail -3 /root/.hermes/profiles/concierge/logs/gateway.log 2>/dev/null' ;;
   --no-restart|deploy)
     preflight
-    rsync -az --delete "${EXCLUDES[@]}" -e "$SSHCMD" "$REPO/" "$DST"
+    # Deliberately NOT the naive ``-a --delete``: ``-a`` chowns the whole VM
+    # tree to the LOCAL uid (10000) and ``--delete`` removes VM runtime markers
+    # (install-stamp.json, .bytecode-fingerprint) that are not in the checkout.
+    # --checksum avoids re-transferring ~22k files whose mtimes merely differ;
+    # full-tree hash verification after the sync proves nothing was missed.
+    rsync -az --checksum --no-owner --no-group "${EXCLUDES[@]}" -e "$SSHCMD" "$REPO/" "$DST"
     printf '✓ synced main (%s) to %s\n' "$(git -C "$REPO" rev-parse --short HEAD)" "$VM_IP"
+    # SOUL.md is written ONCE, at provisioning; create_bot's idempotence paths
+    # return existing bots AS-IS. A catalog/SOUL edit in the synced code would
+    # otherwise NEVER reach an already-provisioned bot (2026-11-24: the live
+    # orchestrator kept obeying the old persona for days). Re-render every
+    # registered bot's persona from the CURRENT catalog BEFORE the restart.
+    # Uses the checkout launcher (the .venv shim is a Mac binary on this VM).
+    echo "→ refreshing bot SOULs from the current catalog"
+    $SSHCMD $VM '/root/.hermes/hermes-agent/.hermes/bin/hermes -p concierge concierge refresh-souls'
     if [ "${1:-deploy}" = "--no-restart" ]; then echo "✓ no restart (--no-restart)"; exit 0; fi
     echo "→ restarting gateway"
     $SSHCMD $VM 'systemctl restart hermes-gateway'

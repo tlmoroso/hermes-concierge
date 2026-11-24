@@ -1156,3 +1156,48 @@ def test_resolve_provider_group_unknown_default_returns_none():
     groups = {"a": {"provider": "x", "model": "y"}}
     assert resolve_provider_group(groups, guild_id="1", category_id="2",
                                   default_group="nope") is None
+
+
+def test_refresh_souls_repairs_stale_persona(concierge_home):
+    """SOUL.md is written ONCE at provisioning and create_bot's idempotence
+    paths return existing bots AS-IS — so a catalog/SOUL edit never reaches a
+    live bot. refresh_souls is the deploy-time repair. It must preserve the
+    persona name from the existing header (a bot provisioned with a display
+    name must not be renamed to its blueprint slug) and be idempotent."""
+    from concierge import provision, registry
+    from concierge.blueprints import get_blueprint
+
+    profile = "bot-orchestrator-stale"
+    registry.set_user("1001", orchestrator=profile,
+                      home_channel="555", guild_id="42")
+    pdir = concierge_home / "profiles" / profile
+    pdir.mkdir(parents=True)
+    (pdir / "SOUL.md").write_text(
+        "# Assistant\n\nYou are Assistant, an old persona.\n")
+
+    updated = provision.refresh_souls()
+
+    assert profile in updated
+    rendered = (pdir / "SOUL.md").read_text()
+    assert rendered.startswith("# Assistant")            # name preserved
+    assert "exactly two tools" in rendered               # new guardrails landed
+    assert "@dispatch <blueprint-key>" in rendered
+    assert rendered == get_blueprint("orchestrator").soul.format(
+        name="Assistant")
+
+    # Idempotent: a second sweep changes nothing.
+    assert provision.refresh_souls() == []
+
+
+def test_refresh_souls_skips_unregistered_profiles(concierge_home):
+    """An orphan profile is left alone rather than guessed at — the registry
+    is the single source of truth for which blueprint a profile runs."""
+    from concierge import provision
+
+    pdir = concierge_home / "profiles" / "bot-orphan"
+    pdir.mkdir(parents=True)
+    stale = "# Orphan\n\nold\n"
+    (pdir / "SOUL.md").write_text(stale)
+
+    assert provision.refresh_souls() == []
+    assert (pdir / "SOUL.md").read_text() == stale

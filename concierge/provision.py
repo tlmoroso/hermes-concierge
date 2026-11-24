@@ -120,7 +120,7 @@ from utils import atomic_json_write, atomic_write_bytes, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["bot_status", "create_bot", "retire_bot"]
+__all__ = ["bot_status", "create_bot", "retire_bot", "refresh_souls"]
 
 _PROFILE_PREFIX = "bot"
 
@@ -1100,3 +1100,83 @@ def bot_status(profile_name: str) -> dict:
         status["user_id"] = owner
         status["channel_less"] = not channels
     return status
+
+
+def refresh_souls() -> list[str]:
+    """Re-render SOUL.md for every live concierge bot from the CURRENT
+    catalog, and return the names actually changed.
+
+    SOUL.md is written ONCE, at provisioning (``create_bot`` step 3). Its
+    idempotence paths return the existing bot AS-IS, so a blueprint/SOUL edit
+    that is deployed to the VM never reaches an already-provisioned profile —
+    the live bot keeps obeying the OLD persona forever (the 2026-11-24 root
+    cause for the stale orchestrator SOUL). This is the operator's deploy-time
+    repair: run it after syncing catalog changes, before restarting the
+    gateway, under the hub profile (``hermes -p concierge ...``).
+
+    Profiles are resolved through ``get_profile_dir`` (the canonical root),
+    not ``HERMES_HOME/profiles`` — under ``-p concierge`` the latter is a
+    DIFFERENT directory. The blueprint for each profile comes from the
+    registry (bindings + the users section's orchestrator/workers maps), so
+    an unregistered/orphan profile is left alone rather than guessed.
+
+    The persona name is preserved from the existing ``# <name>`` header — a
+    bot provisioned with a display name must not be silently renamed to its
+    blueprint slug. Non-existent/unreadable SOUL.md files are skipped.
+    """
+    from concierge.blueprints import get_blueprint
+
+    data = registry.load_registry()
+    profile_to_blueprint: dict[str, str] = {}
+
+    for binding in (data.get("bindings") or {}).values():
+        if not isinstance(binding, dict):
+            continue
+        profile = binding.get("profile")
+        blueprint = binding.get("blueprint")
+        if (isinstance(profile, str) and isinstance(blueprint, str)
+                and blueprint in _known_blueprint_keys()):
+            profile_to_blueprint.setdefault(profile, blueprint)
+
+    for entry in (data.get("users") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        orchestrator = entry.get("orchestrator")
+        if isinstance(orchestrator, str):
+            profile_to_blueprint.setdefault(orchestrator, "orchestrator")
+        workers = entry.get("workers") or {}
+        if isinstance(workers, dict):
+            for blueprint, profile in workers.items():
+                if (isinstance(profile, str)
+                        and blueprint in _known_blueprint_keys()):
+                    profile_to_blueprint.setdefault(profile, blueprint)
+
+    updated: list[str] = []
+    for profile_name in sorted(profile_to_blueprint):
+        blueprint = profile_to_blueprint[profile_name]
+        try:
+            soul_path = get_profile_dir(profile_name) / "SOUL.md"
+        except Exception:
+            continue  # an invalid profile id must never abort the sweep
+        if not soul_path.is_file():
+            continue
+        try:
+            current = soul_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        display_name = blueprint
+        for line in current.splitlines():
+            if line.startswith("# "):
+                display_name = line[2:].strip() or blueprint
+                break
+        rendered = get_blueprint(blueprint).soul.format(name=display_name)
+        if rendered != current:
+            atomic_write_text(soul_path, rendered)
+            updated.append(profile_name)
+    return updated
+
+
+def _known_blueprint_keys() -> set[str]:
+    from concierge.blueprints import CATALOG
+
+    return set(CATALOG)

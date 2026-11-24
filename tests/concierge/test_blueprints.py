@@ -74,6 +74,34 @@ def test_notes_soul_stays_small():
     assert len(get_blueprint("notes").soul) < 500
 
 
+def test_artifacts_blueprint_is_a_minimal_file_writer():
+    """Files/itineraries/handoff docs are a WORKER concern, not the
+    orchestrator's (it must stay web-only). The marker line is what the
+    dispatch driver validates and turns into a MEDIA: attachment."""
+    bp = get_blueprint("artifacts")
+    assert bp.title == "Files Bot"
+    assert bp.toolsets == ("file",)
+    assert "terminal" not in bp.toolsets and "web" not in bp.toolsets
+    assert "ARTIFACT:" in bp.soul
+    assert "write_file" in bp.soul
+    bp.soul.format(name="Files Bot")
+
+
+def test_orchestrator_soul_states_capabilities_and_guardrails():
+    """The 2026-11-24 monaco thread: the old persona never said what tools
+    the orchestrator HAS, so the model invented an '@dispatch developer'
+    TOOL CALL, claimed a worker was still running, and did the research
+    itself. These are explicit capability facts, enforced by the tests so a
+    future SOUL edit cannot quietly delete them."""
+    soul = get_blueprint("orchestrator").soul
+    assert "exactly two tools" in soul
+    assert "PLAIN TEXT" in soul and "not a tool" in soul
+    assert "NO progress information" in soul
+    assert "MEDIA:<absolute path>" in soul
+    assert "do not do the research yourself" in soul.lower()
+    assert "  artifacts — Files Bot" in soul
+
+
 def test_get_blueprint_unknown_key_raises():
     with pytest.raises(KeyError, match="Known:"):
         get_blueprint("nope")

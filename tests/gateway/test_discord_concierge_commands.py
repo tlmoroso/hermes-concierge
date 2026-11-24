@@ -631,12 +631,12 @@ def test_auto_offer_posts_picker_into_managed_channel(rig):
     chan_id, _text, view = sends[0]
     assert chan_id == "700"
     # Non-ephemeral (channel.send has no ephemeral at all); the picker
-    # carries the six WORKER blueprints in CATALOG order — the orchestrator
+    # carries the seven WORKER blueprints in CATALOG order — the orchestrator
     # is absent by design (blueprint_choices excludes it: auto-provisioned
     # per user, never channel-bound via a pick).
     assert [o.value for o in view.children[0].options] == [
         "reminders", "scheduler", "researcher", "email_triage", "notes",
-        "developer"]
+        "artifacts", "developer"]
 
 
 def test_auto_offer_selection_binds_the_posted_in_channel(rig, monkeypatch):

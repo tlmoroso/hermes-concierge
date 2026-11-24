@@ -73,4 +73,9 @@ def build_concierge_parser(subparsers, *, cmd_concierge: Callable) -> None:
 
     sub.add_parser("bindings", help="Raw channel -> bot binding table")
 
+    sub.add_parser(
+        "refresh-souls",
+        help="Re-render SOUL.md for live bots from the current blueprint catalog "
+             "(run after deploying a catalog/SOUL change)")
+
     parser.set_defaults(func=cmd_concierge)

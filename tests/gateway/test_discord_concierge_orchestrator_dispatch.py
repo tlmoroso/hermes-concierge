@@ -1093,3 +1093,92 @@ def test_missing_home_category_accessor_never_raises(rig, monkeypatch):
     assert create_calls[0]["category_id"] == str(CATEGORY)
     assert registry.get_binding(str(WORKER_CHANNEL))["profile"] == WORKER_PROFILE
     assert "⚠ dispatch failed" not in rig.channels[str(HOME)].sends
+
+
+# ── (7) Visible-response guardrails + artifact delivery ────────────────────
+
+
+def test_visible_response_guard_scrubs_malformed_directive(rig):
+    """A directive wrapped in prose fails the strict parser and would
+    otherwise be posted VERBATIM, exposing the internal protocol."""
+    out = rig.adapter._concierge_guard_visible_response(
+        SimpleNamespace(),
+        "Sure, here you go:\n@dispatch researcher find papers\nDone")
+    assert "@dispatch" not in out
+    assert "Sure, here you go:" in out and "Done" in out
+
+
+def test_visible_response_guard_keeps_clean_directive(rig):
+    """A CLEAN standalone directive that merely failed a dispatch GUARD keeps
+    the locked fail-closed contract (returned unchanged)."""
+    out = rig.adapter._concierge_guard_visible_response(
+        SimpleNamespace(), DIRECTIVE)
+    assert out == DIRECTIVE
+
+
+def test_visible_response_guard_appends_artifact_tag(rig):
+    """The file reaches the user even if the model forgot the MEDIA: tag —
+    but never twice."""
+    path = "/root/.hermes/workspaces/1001/itinerary.md"
+    ev = SimpleNamespace(
+        **{concierge_mixin._CONCIERGE_ARTIFACT_ATTR: path})
+    out = rig.adapter._concierge_guard_visible_response(
+        ev, "Here's your file.")
+    assert out.endswith(f"MEDIA:{path}")
+    assert out.count("MEDIA:") == 1
+
+    ev2 = SimpleNamespace(
+        **{concierge_mixin._CONCIERGE_ARTIFACT_ATTR: path})
+    out2 = rig.adapter._concierge_guard_visible_response(ev2, f"MEDIA:{path}")
+    assert out2.count("MEDIA:") == 1
+
+
+def test_artifact_path_gate_rejects_outside_workspace(rig, monkeypatch,
+                                                     tmp_path):
+    """A worker's ARTIFACT: line is UNTRUSTED text: only real files inside
+    the per-user workspaces root may become a MEDIA: upload."""
+    from pathlib import Path as _Path
+
+    ws = tmp_path / ".hermes" / "workspaces" / USER
+    ws.mkdir(parents=True)
+    good = ws / "itinerary.md"
+    good.write_text("# hi")
+    monkeypatch.setattr(_Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert rig.adapter._concierge_safe_artifact_path(
+        str(good)) == str(good.resolve())
+    assert rig.adapter._concierge_safe_artifact_path("/etc/passwd") is None
+    assert rig.adapter._concierge_safe_artifact_path(
+        str(ws / "missing.md")) is None
+    assert rig.adapter._concierge_safe_artifact_path(None) is None
+    assert rig.adapter._concierge_safe_artifact_path(123) is None
+
+
+def test_artifact_worker_reply_stamps_phase_b_event(rig, monkeypatch):
+    """End-to-end wiring: a Files Bot-style ARTIFACT: reply is validated and
+    stamped on the phase-B continuation event, so the wrap can deliver the
+    attachment deterministically."""
+    from pathlib import Path as _Path
+
+    ws = rig.root / ".hermes" / "workspaces" / USER
+    ws.mkdir(parents=True, exist_ok=True)
+    artifact = ws / "monte-carlo-itinerary.md"
+    artifact.write_text("# Monte Carlo")
+    monkeypatch.setattr(_Path, "home", classmethod(lambda cls: rig.root))
+
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    _wire_io(rig, monkeypatch)
+    calls = []
+    _install_handler(rig, calls, {
+        ORCH: DIRECTIVE,
+        WORKER_PROFILE: f"ARTIFACT:{artifact}",
+    })
+
+    _drive(rig, _trigger(rig))
+
+    phase_b = next(c for c in calls
+                   if getattr(c, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None))
+    assert getattr(phase_b, concierge_mixin._CONCIERGE_ARTIFACT_ATTR, None) \
+        == str(artifact.resolve())
+    assert rig.channels[str(HOME)].sends == []  # still no decoration

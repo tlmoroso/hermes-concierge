@@ -430,11 +430,30 @@ def _cmd_bindings(args) -> int:
     return 0
 
 
+def _cmd_refresh_souls(args) -> int:
+    """Deploy-time repair: SOUL.md is written once at provisioning, so a
+    catalog/SOUL edit never reaches an already-live bot. Re-render every
+    registered bot's SOUL.md from the CURRENT catalog (persona names kept).
+    """
+    from concierge import provision
+
+    updated = provision.refresh_souls()
+    if updated:
+        print(f"✓ refreshed SOUL.md for {len(updated)} bot(s):")
+        for name in updated:
+            print(f"  - {name}")
+    else:
+        print("✓ all bot SOUL.md files already match the current catalog")
+    print("Restart the gateway so running sessions pick up the new personas.")
+    return 0
+
+
 _ACTIONS = {
     "new": _cmd_new, "create": _cmd_new,
     "list": _cmd_list, "ls": _cmd_list,
     "retire": _cmd_retire,
     "bindings": _cmd_bindings,
+    "refresh-souls": _cmd_refresh_souls,
 }
 
 
@@ -450,6 +469,6 @@ def concierge_command(args) -> int:
     handler = _ACTIONS.get(sub)
     if handler is None:
         print(f"Unknown concierge command: {sub}\n"
-              "Usage: hermes concierge [new|list|retire|bindings]")
+              "Usage: hermes concierge [new|list|retire|bindings|refresh-souls]")
         return 1
     return handler(args)

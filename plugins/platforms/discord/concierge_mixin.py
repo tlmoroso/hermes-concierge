@@ -197,6 +197,7 @@ import itertools
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 from plugins.platforms.discord.concierge_mixin_helpers import (
@@ -257,6 +258,14 @@ _VOICE_RELAY_ATTR = "_concierge_voice_relay_member"
 # AFTER the dataclasses.replace clones (plain attrs do not survive a
 # replace). Same discipline as _ROOM_TARGETS_ATTR: never serialized.
 _CONCIERGE_DISPATCH_ATTR = "_concierge_dispatch_continuation"
+
+# Wire-invisible, process-local marker: a VALIDATED absolute path a worker
+# produced as a downloadable artifact, stamped on the phase-B continuation
+# event after the dataclasses.replace clones (plain attrs do not survive a
+# replace) and consumed by the wrap's visible-response guard, which appends
+# the MEDIA: tag deterministically. Same discipline as the dispatch stamp.
+_CONCIERGE_ARTIFACT_ATTR = "_concierge_artifact_path"
+_ARTIFACT_MARKER_RE = re.compile(r"ARTIFACT:(\S+)")
 
 # The orchestrator's dispatch directive (PLAN decision 2): when work belongs
 # to a worker blueprint the ENTIRE response is exactly
@@ -852,7 +861,10 @@ class ConciergeDiscordMixin:
         # (fail-closed: the orchestrator answered alone).
         dispatch = self._concierge_dispatch_directive_on(event, response)
         if dispatch is None:
-            return response
+            # Every guard failure keeps the response UNCHANGED apart from the
+            # two deterministic guardrails (never leak the internal protocol,
+            # never drop a worker-produced file).
+            return self._concierge_guard_visible_response(event, response)
         blueprint_key, task = dispatch
         channel_id = str(
             getattr(getattr(event, "source", None), "chat_id", "") or "")
@@ -955,6 +967,69 @@ class ConciergeDiscordMixin:
         if not orchestrator or source.profile != orchestrator:
             return None
         return blueprint_key, task
+
+    # ── Visible-response guardrails ───────────────────────────────────────
+    #
+    # The SOUL is a PROMPT, not an enforcement boundary. These two rules are
+    # enforced in code so a model slip can never leak the internal protocol
+    # to the user or silently drop a file a worker actually produced.
+
+    @staticmethod
+    def _concierge_safe_artifact_path(raw: object) -> str | None:
+        """Accept ONLY a real file inside the per-user workspaces root.
+
+        A worker's ``ARTIFACT:<path>`` line is untrusted text: without this
+        gate a prompt-injected worker could name any host path and have the
+        gateway upload it as a MEDIA: attachment. Mirrors provision.py's
+        ``Path.home()/.hermes/workspaces/<user_id>`` sandbox.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            candidate = Path(raw.strip()).expanduser().resolve()
+            root = (Path.home() / ".hermes" / "workspaces").resolve()
+            if not candidate.is_file() or root not in candidate.parents:
+                return None
+            return str(candidate)
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    def _concierge_guard_visible_response(self, event, response):
+        """Final guard on every response that actually reaches the user.
+
+        1. SCRUB leaked ``@dispatch`` lines. A malformed directive (prose
+           around it, or a tool-call-shaped attempt) fails the strict parser
+           and would otherwise be delivered VERBATIM, exposing the internal
+           protocol. Fail-closed to a clean answer, warn once.
+        2. DELIVER artifacts deterministically. If the phase-B turn carries a
+           validated artifact path and the model omitted the MEDIA: tag,
+           append it — the user gets the downloadable file regardless of
+           prompt compliance. Non-string responses are returned untouched.
+        """
+        if not isinstance(response, str):
+            return response
+        # Only a MALFORMED, MULTI-LINE directive (prose wrapped around a
+        # dispatch line) is scrubbed. A single-line directive — clean or a
+        # near-miss — keeps the locked fail-closed contract: returned
+        # unchanged as the orchestrator answering alone (the guards suite
+        # asserts those exact shapes).
+        if ("@dispatch " in response and "\n" in response
+                and _DISPATCH_DIRECTIVE_RE.match(response.strip()) is None):
+            lines = response.splitlines()
+            leaked = [l for l in lines if "@dispatch " in l]
+            self._concierge_warn_once(
+                ("leaked-dispatch-directive",),
+                "[%s] concierge: scrubbing %d malformed @dispatch line(s) "
+                "from a visible reply — the internal protocol must never "
+                "reach the user", getattr(self, "name", "discord"),
+                len(leaked))
+            response = "\n".join(
+                l for l in lines if "@dispatch " not in l).strip()
+        artifact = getattr(event, _CONCIERGE_ARTIFACT_ATTR, None)
+        if artifact and "MEDIA:" not in response:
+            response = ((response + "\n\n") if response.strip()
+                        else "") + f"MEDIA:{artifact}"
+        return response
 
     # ── Task 8.2: account-connection nudges (execution at the wrap) ────────
 
@@ -2035,6 +2110,16 @@ class ConciergeDiscordMixin:
         if worker_answer is None:
             await self._concierge_post_member_unavailable(event, worker)
 
+        # A file-producing worker answers with ARTIFACT:<path>. Treat that as
+        # UNTRUSTED worker text: validate it against the per-user workspace
+        # root before it can become a MEDIA: upload, then carry the accepted
+        # path on the phase-B event so the wrap delivers it deterministically
+        # (the SOUL asks the model to emit the tag too; the code guarantees it).
+        artifact_marker = (_ARTIFACT_MARKER_RE.search(worker_answer)
+                           if isinstance(worker_answer, str) else None)
+        artifact_path = self._concierge_safe_artifact_path(
+            artifact_marker.group(1) if artifact_marker else None)
+
         # 6) phase B: the orchestrator summarizes. The clone keeps the
         #    ORIGINAL user text and the home channel; the context appends
         #    the worker's reply (or the failure note) as a labeled block so
@@ -2059,6 +2144,8 @@ class ConciergeDiscordMixin:
                 phase_b_event.media_text_inlined or [])
             phase_b_event.metadata = dict(phase_b_event.metadata or {})
             setattr(phase_b_event, _CONCIERGE_DISPATCH_ATTR, True)
+            if artifact_path:
+                setattr(phase_b_event, _CONCIERGE_ARTIFACT_ATTR, artifact_path)
             await super().handle_message(phase_b_event)
             await self._concierge_wait_for_member_turn(phase_b_event)
         except asyncio.CancelledError:
