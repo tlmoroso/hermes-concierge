@@ -1,10 +1,14 @@
 # Open threads & backlog
 
-1. **Notes Bot in the cloud** needs the Obsidian vault reachable on the VM.
-   APPROVED DESIGN (2026-10-30, NOT BUILT): Zettelkasten method, Syncthing
-   sync (multi-user reproducible), vault at a neutral path (`~/hermes-vault`,
-   not Documents/iCloud), NO pre-defined sections (MOCs emerge from topic
-   clusters). Full spec: `concierge/handoffs/NOTES_BOT_HANDOFF.md`.
+1. **Notes Bot in the cloud — vault + sync BUILT and DEPLOYED** (verified
+   2026-11-25). Zettelkasten method, Syncthing sync (multi-user reproducible),
+   neutral vault path `/root/hermes-vault` VM / `~/hermes-vault` Mac, NO
+   pre-defined sections. Syncthing v1.27.2 running, Mac device connected,
+   folder in sync, `OBSIDIAN_VAULT_PATH` wired through the hub `.env`. Spec:
+   `concierge/handoffs/NOTES_BOT_HANDOFF.md`; deployed state:
+   `concierge/APPLE_BRIDGE.md`. REMAINING (operator-side): spawn the Notes Bot
+   from Discord (managed category -> picker -> Notes) — no notes bot is
+   provisioned yet, so the synced vault has no consumer.
 2. **VM hardening:** gateway runs as root (installer's LXC-style override);
    consider re-homing under a dedicated user + enabling Hetzner automated
    backups (console, ~€0.90/mo, 7 rolling days) as the second backup layer.

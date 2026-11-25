@@ -97,6 +97,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 import re
 import shutil
 import threading
@@ -533,26 +534,43 @@ Index of MOCs and entry points. Link every MOC from here.
 
 
 def _seed_notes_vault(profile_dir: Path, user_id: Optional[str]) -> str:
-    """Materialize a DURABLE, per-user Obsidian vault OUTSIDE the bot profile.
+    """Materialize a DURABLE Obsidian vault OUTSIDE the bot profile.
 
     Bot profiles are DISPOSABLE — reprovision with a different blueprint
-    retires and DELETES the old profile. Notes must therefore live under
-    ``~/.hermes/vaults/<user_id>/`` (mirrors the per-user workspace root), not
-    inside ``profiles/bot-notes-*``. On the VM that is
-    ``/root/.hermes/vaults/<user_id>/``.
+    retires and DELETES the old profile. Notes must therefore live outside
+    ``profiles/bot-notes-*``.
+
+    An OPERATOR-configured ``OBSIDIAN_VAULT_PATH`` WINS. The approved design
+    (``concierge/handoffs/NOTES_BOT_HANDOFF.md`` §1.4) sets it in the hub
+    ``.env`` to the Syncthing-synced absolute path (on the VM
+    ``/root/hermes-vault``), and ``_seed_credentials`` copies every non-channel
+    hub env var into each bot profile. Overwriting that with a fresh
+    ``~/.hermes/vaults/<user_id>/`` would silently take the Notes Bot OUT of
+    the cross-device sync (2026-11-25 defect). Respect it, and never rewrite
+    the bot's .env when it is already pinned.
+
+    Only when NO path is configured do we create the per-user fallback
+    ``~/.hermes/vaults/<scope>/`` and pin it at 0600.
 
     Seeds CONVENTIONS.md (the rulebook the notes SOUL references) and Home.md
-    (the MOC root) ONLY when missing — never overwrite user notes. Pins
-    ``OBSIDIAN_VAULT_PATH`` in the bot profile's .env (secret-file mode 0600),
-    the documented convention the obsidian skill resolves. Idempotent.
-
-    Cross-device sync (git remote / Syncthing / iCloud) is an OPERATOR choice
-    layered on this path afterwards — see concierge/APPLE_BRIDGE.md. The
-    in-concierge use case (handoff notes, recall in later sessions) needs only
-    this durable local vault.
+    (the MOC root) ONLY when missing — never overwrite user notes. Idempotent.
     """
-    scope = str(user_id) if user_id else "shared"
-    vault = Path.home() / ".hermes" / "vaults" / scope
+    from agent.secret_scope import load_env_file
+
+    env_path = profile_dir / ".env"
+    # The bot reads its OWN .env (profiles are credential islands), so that is
+    # the authoritative source — not the gateway's process environment.
+    inherited = (load_env_file(env_path).get("OBSIDIAN_VAULT_PATH")
+                 or "").strip()
+    if inherited:
+        # expanduser/expandvars: the hub .env uses an absolute path, but a
+        # locally configured "~/" must resolve too.
+        vault = Path(os.path.expandvars(inherited)).expanduser()
+        pin_env = False
+    else:
+        scope = str(user_id) if user_id else "shared"
+        vault = Path.home() / ".hermes" / "vaults" / scope
+        pin_env = True
     vault.mkdir(parents=True, exist_ok=True)
     for name, content in (("CONVENTIONS.md", _VAULT_CONVENTIONS),
                           ("Home.md", _VAULT_HOME)):
@@ -560,15 +578,16 @@ def _seed_notes_vault(profile_dir: Path, user_id: Optional[str]) -> str:
         if not target.exists():
             atomic_write_text(target, content)
 
-    env_path = profile_dir / ".env"
-    lines: list[str] = []
-    if env_path.is_file():
-        lines = [line for line in
-                 env_path.read_text(encoding="utf-8").splitlines()
-                 if not line.startswith("OBSIDIAN_VAULT_PATH=")]
-    lines.append(f"OBSIDIAN_VAULT_PATH={vault}")
-    atomic_write_bytes(env_path, ("\n".join(lines) + "\n").encode("utf-8"),
-                       mode=0o600)
+    if pin_env:
+        lines: list[str] = []
+        if env_path.is_file():
+            lines = [line for line in
+                     env_path.read_text(encoding="utf-8-sig").splitlines()
+                     if not line.startswith("OBSIDIAN_VAULT_PATH=")]
+        lines.append(f"OBSIDIAN_VAULT_PATH={vault}")
+        atomic_write_bytes(env_path,
+                           ("\n".join(lines) + "\n").encode("utf-8"),
+                           mode=0o600)
     return str(vault)
 
 

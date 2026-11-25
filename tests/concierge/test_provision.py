@@ -1243,6 +1243,53 @@ def test_seed_notes_vault_is_durable_and_idempotent(concierge_home, tmp_path):
     assert (profile / ".env").read_text().count("OBSIDIAN_VAULT_PATH=") == 1
 
 
+def test_seed_notes_vault_respects_the_operator_synced_path(
+        concierge_home, tmp_path):
+    """REGRESSION 2026-11-25: the hub .env pins OBSIDIAN_VAULT_PATH to the
+    Syncthing-synced /root/hermes-vault and _seed_credentials copies it into
+    EVERY bot profile. Overwriting it with a fresh ~/.hermes/vaults/<user_id>/
+    would silently take the Notes Bot OUT of the cross-device sync. Respect the
+    inherited path, seed starter files there, and leave the bot's .env ALONE."""
+    from concierge import provision
+
+    synced = tmp_path / "hermes-vault"
+    synced.mkdir()
+    (synced / "CONVENTIONS.md").write_text("# operator's own rules\n")
+    profile = concierge_home / "profiles" / "bot-notes-synced"
+    profile.mkdir(parents=True)
+    env_before = ("OPENAI_API_KEY=***\n"
+                  f"OBSIDIAN_VAULT_PATH={synced}\n")
+    (profile / ".env").write_text(env_before)
+
+    vault = provision._seed_notes_vault(profile, "1001")
+
+    assert vault == str(synced)
+    assert (synced / "CONVENTIONS.md").read_text() == (
+        "# operator's own rules\n")  # never overwrite user notes
+    assert (synced / "Home.md").is_file()  # missing starter file is added
+    assert (profile / ".env").read_text() == env_before  # untouched
+    assert not (tmp_path / ".hermes" / "vaults").exists()
+    provision._seed_notes_vault(profile, "1001")  # idempotent
+    assert (profile / ".env").read_text() == env_before
+
+
+def test_seed_notes_vault_expands_a_home_relative_inherited_path(
+        concierge_home, tmp_path, monkeypatch):
+    """A '~/...' configured path resolves against the profile host's home."""
+    from concierge import provision
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))  # expanduser on Windows
+    profile = concierge_home / "profiles" / "bot-notes-home"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text("OBSIDIAN_VAULT_PATH=~/hermes-vault\n")
+
+    vault = provision._seed_notes_vault(profile, "1001")
+
+    assert vault == str(tmp_path / "hermes-vault")
+    assert (tmp_path / "hermes-vault" / "Home.md").is_file()
+
+
 def test_refresh_souls_also_seeds_a_notes_vault(concierge_home):
     """A notes bot provisioned before vault seeding shipped gets its vault on
     the deploy-time refresh, even when its SOUL is already current."""

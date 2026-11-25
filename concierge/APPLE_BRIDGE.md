@@ -97,14 +97,18 @@ Cross-device sync is a *convenience*, not a prerequisite.
 What the bot actually requires (all now implemented in `concierge/provision.py`):
 
 1. **A durable path OUTSIDE the bot profile.** Bot profiles are disposable —
-   reprovision retires and DELETES the old one. The vault therefore lives at
-   `~/.hermes/vaults/<user_id>/` (on the VM: `/root/.hermes/vaults/<user_id>/`),
-   mirroring the per-user workspace root. A channel-bound v1 notes bot with no
+   reprovision retires and DELETES the old profile. The deployed vault is the
+   operator-configured `OBSIDIAN_VAULT_PATH` (on the VM
+   `/root/hermes-vault`, Syncthing-synced); provisioning uses it verbatim. With
+   no path configured it falls back to `~/.hermes/vaults/<user_id>/` (mirrors
+   the per-user workspace root), and a channel-bound v1 notes bot with no
    user id gets the `shared` scope.
 2. **Starter files.** `CONVENTIONS.md` is the rulebook the (deliberately
    trimmed) notes SOUL points at, and `Home.md` is the MOC root / index.
    Written ONLY when missing — user notes are never overwritten.
-3. **`OBSIDIAN_VAULT_PATH`** pinned in the bot profile's `.env` (mode 0600).
+3. **`OBSIDIAN_VAULT_PATH`** in the bot profile's `.env`. The hub `.env` sets
+   it and `_seed_credentials` copies it into every bot profile (mode 0600).
+   Provisioning pins the fallback path itself only when the key is absent.
    That is the documented convention `skills/note-taking/obsidian/SKILL.md`
    resolves; without it the skill falls back to `~/Documents/Obsidian Vault`,
    which does not exist on a headless VM.
@@ -116,22 +120,35 @@ What the bot actually requires (all now implemented in `concierge/provision.py`)
 With those four, handoff notes, MOCs, person notes and recall in later
 sessions all work entirely on the VM.
 
-### Still an operator decision: cross-device sync
+### Cross-device sync — DEPLOYED (verified 2026-11-25)
 
-If the vault should ALSO be readable/editable from the Mac or another device,
-pick one and supply the credential — this is the only part that cannot be
-implemented unilaterally:
+The approved design (`concierge/handoffs/NOTES_BOT_HANDOFF.md` §0 decision 1)
+is **Syncthing, NOT git/GitHub**, with a neutral vault path. It is already
+live on the VM — no operator action is needed to "deploy" it:
 
-- **Git remote (recommended):** create a private repo, put its HTTPS URL +
-  a scoped token in the hub `.env` as `CONCIERGE_VAULT_GIT_URL`, and add a
-  `git init` + pull/commit/push step (a small `concierge vault-sync` command
-  or a cron routine). Needs a remote URL + credential from the operator.
-- **Syncthing / iCloud Drive / mount:** sync `~/.hermes/vaults/<user_id>/`
-  to the Mac with an external daemon. Needs the daemon installed and paired.
-- **Nothing:** keep the vault VM-local; access it through the Notes Bot's
-  chat answers and the file attachments it can now return.
+- Syncthing v1.27.2, `syncthing@root.service` enabled + running (since
+  2026-11-15), folder `hermes-vault` -> `/root/hermes-vault`.
+- Mac device `3J5MR3Z-...` is **connected** on port 22000; folder state
+  `idle`, 0 errors, files in sync. `ufw` inactive so 22000 is reachable.
+- `/root/hermes-vault` holds `CONVENTIONS.md` (the Zettelkasten rulebook),
+  `Home.md` (MOC root) and `.stfolder` (Syncthing folder marker).
+- `OBSIDIAN_VAULT_PATH=/root/hermes-vault` is set in the hub `.env`.
+  `_seed_credentials` copies every non-channel hub env var into each bot
+  profile, so a Notes Bot inherits the synced path automatically.
 
-No Apple credential or Mac uptime is required for any of the above — the
+`_seed_notes_vault` MUST respect that inherited path: it seeds any missing
+starter files there and NEVER rewrites the bot's `.env`. Overwriting it with a
+fresh `~/.hermes/vaults/<user_id>/` would silently take the Notes Bot OUT of
+the sync (fixed 2026-11-25; locked by
+`test_seed_notes_vault_respects_the_operator_synced_path`). The per-user
+`~/.hermes/vaults/<scope>/` directory remains only as the FALLBACK for an
+install with no `OBSIDIAN_VAULT_PATH` configured.
+
+The remaining step is operator-side, not a deploy: spawn the Notes Bot from
+Discord (managed category -> picker -> Notes). No notes bot is provisioned yet,
+so the synced vault currently has no consumer.
+
+No Apple credential or Mac uptime is required for the above — the
 CalDAV/iCloud decision at the top of this doc applies to REMINDERS and
 CALENDAR, not to the Obsidian vault.
 

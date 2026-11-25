@@ -61,12 +61,13 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   `@dispatch` leaks and delivers artifacts; `_concierge_safe_artifact_path`
   gates the upload path.
 - **Vault (notes bot):** `notes` is the only `vault=True` blueprint.
-  Provisioning creates a DURABLE per-user Obsidian vault OUTSIDE the disposable
-  bot profile at `~/.hermes/vaults/<user_id>/`, seeds `CONVENTIONS.md` (the
-  rulebook the SOUL references) + `Home.md` (MOC root) only when missing, and
-  pins `OBSIDIAN_VAULT_PATH` in the bot profile's `.env` (0600) — the path
-  convention the obsidian skill resolves. Cross-device sync (git remote /
-  Syncthing / iCloud) is an operator choice layered on afterwards; see
+  Provisioning uses the operator's `OBSIDIAN_VAULT_PATH` (hub `.env` ->
+  `_seed_credentials` -> bot `.env`), which on the VM is the
+  **Syncthing-synced `/root/hermes-vault`** — it seeds `CONVENTIONS.md` (the
+  rulebook the SOUL references) + `Home.md` (MOC root) only when missing and
+  NEVER rewrites the pinned path. With no path configured it falls back to a
+  durable `~/.hermes/vaults/<user_id>/` outside the disposable bot profile
+  and pins that (0600). Sync is already DEPLOYED (Syncthing, Mac paired); see
   `concierge/APPLE_BRIDGE.md`.
 - **SOUL staleness — DEPLOY REQUIREMENT:** `SOUL.md` AND the three toolset keys
   in config.yaml are written ONCE at provisioning, and `create_bot`'s
