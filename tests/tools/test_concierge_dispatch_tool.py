@@ -19,9 +19,15 @@ from tools.registry import registry
 def _clear_pending():
     with t._pending_lock:
         t._pending.clear()
+    with t._worker_reply_lock:
+        t._worker_replies.clear()
+        t._worker_reply_expected.clear()
     yield
     with t._pending_lock:
         t._pending.clear()
+    with t._worker_reply_lock:
+        t._worker_replies.clear()
+        t._worker_reply_expected.clear()
 
 
 class _FakeAdapter:
@@ -200,3 +206,30 @@ def test_without_the_hub_pin_the_worker_home_breaks_dispatch(tmp_path):
         reset_hermes_home_override(token)
     assert "not an eligible orchestrator turn" in out["error"]
     assert t.take_dispatch_intent(event) is None
+
+
+def test_worker_reply_capture_roundtrip():
+    """The driver's reliable replacement for scraping Discord history."""
+    t.expect_worker_reply("bot-artifacts-x", "700")
+    event = SimpleNamespace(source=SimpleNamespace(
+        profile="bot-artifacts-x", chat_id="700"))
+    t.record_worker_reply(event, "ARTIFACT:/root/x/itinerary.md")
+    assert t.take_worker_reply("bot-artifacts-x", "700") == (
+        "ARTIFACT:/root/x/itinerary.md")
+    assert t.take_worker_reply("bot-artifacts-x", "700") is None
+
+
+def test_worker_reply_capture_ignores_unexpected_turns():
+    """A normal orchestrator/user turn must never be mistaken for a worker."""
+    event = SimpleNamespace(source=SimpleNamespace(
+        profile="bot-orchestrator-x", chat_id="555"))
+    t.record_worker_reply(event, "a normal answer")
+    assert t.take_worker_reply("bot-orchestrator-x", "555") is None
+
+
+def test_worker_reply_capture_ignores_empty_responses():
+    t.expect_worker_reply("bot-artifacts-x", "700")
+    event = SimpleNamespace(source=SimpleNamespace(
+        profile="bot-artifacts-x", chat_id="700"))
+    t.record_worker_reply(event, "   ")
+    assert t.take_worker_reply("bot-artifacts-x", "700") is None

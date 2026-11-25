@@ -1308,3 +1308,51 @@ def test_dispatch_tool_survives_worker_hermes_home_override(
     assert worker_call.text == TASK
     assert (str(HOME), PHASE_B_ANSWER) in seams.sent
     assert rig.channels[str(HOME)].sends == []
+
+
+def test_dispatch_uses_in_process_worker_reply_when_history_is_empty(
+        rig, monkeypatch):
+    """REGRESSION 2026-11-25: the artifacts worker wrote the file AND replied
+    ``ARTIFACT:<path>``, but the lazily created worker channel's history window
+    was EMPTY (the worker event inherited the trigger's thread lane), so the
+    driver posted "Files Bot is unavailable" and never delivered the artifact.
+    The wrap now captures the worker's FINAL answer in-process; Discord history
+    is only a fallback. Force EVERY history fetch to return nothing and prove
+    the phase-B turn still receives the worker's answer."""
+    from tools import concierge_dispatch_tool as dispatch_tool
+    from tools.registry import registry
+
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    seams = _wire_io(rig, monkeypatch)
+    calls = []
+
+    async def _empty_history(ev):
+        return ""
+
+    monkeypatch.setattr(rig.adapter, "_concierge_fetch_room_history",
+                        _empty_history)
+
+    async def _handler(event):
+        calls.append(event)
+        if getattr(event, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None):
+            return PHASE_B_ANSWER
+        if getattr(event.source, "profile", None) == WORKER_PROFILE:
+            return WORKER_ANSWER
+        registry.dispatch(dispatch_tool.DISPATCH_TOOL_NAME, {
+            "blueprint": WORKER_KEY, "task": TASK})
+        return "Here is a prose answer the wrap must suppress."
+
+    rig.adapter.set_message_handler(_handler)
+    result = _drive(rig, _trigger(rig))
+
+    assert result is None
+    phase_b = next(c for c in calls
+                   if getattr(c, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None))
+    assert WORKER_ANSWER in phase_b.channel_context
+    assert getattr(phase_b, concierge_mixin._CONCIERGE_ARTIFACT_ATTR, None) \
+        is None  # a non-artifact reply stamps no path
+    # No terminal failure notice: the worker was NOT treated as unavailable.
+    assert not any(f"⚠ **{WORKER_TITLE}** is unavailable" in s
+                   for s in rig.channels[str(HOME)].sends)
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent

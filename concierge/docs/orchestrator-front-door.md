@@ -91,6 +91,16 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   `test_dispatch_tool_survives_worker_hermes_home_override`. Any NEW tool that
   reads concierge state must do the same — never assume the handler sees the
   hub profile.
+- **Worker replies are captured IN-PROCESS (2026-11-25):** the driver used to
+  read the worker's answer back out of Discord channel history. A lazily
+  created worker channel can be EMPTY (the worker event inherits the trigger's
+  thread lane, so the reply lands elsewhere) — the artifacts bot wrote the
+  file and answered `ARTIFACT:<path>`, but the driver scraped nothing and
+  posted "Files Bot is unavailable". The wrap now records the worker's FINAL
+  response in a process-local slot keyed by `(profile, chat_id)`; the history
+  scrape remains only a fallback. `expect_worker_reply` /
+  `record_worker_reply` / `take_worker_reply` in
+  `tools/concierge_dispatch_tool.py`.
 - **New toolsets must be EAGER:** on the VM `snowballstemmer` is installed, so
   `tools.tool_search` is ACTIVE and a non-core toolset gets deferred behind the
   `tool_search`/`tool_call` bridge. `concierge_dispatch` is registered with

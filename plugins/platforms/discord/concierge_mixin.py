@@ -858,14 +858,14 @@ class ConciergeDiscordMixin:
         from contextlib import nullcontext
         try:
             from tools.concierge_dispatch_tool import (
-                dispatch_context, take_dispatch_intent)
+                dispatch_context, take_dispatch_intent, record_worker_reply)
         except Exception as e:
             self._concierge_warn_once(
                 ("dispatch-tool-import",),
                 "[%s] concierge: dispatch tool module unavailable (%s); "
                 "legacy text dispatch only",
                 getattr(self, "name", "discord"), e)
-            dispatch_context = take_dispatch_intent = None
+            dispatch_context = take_dispatch_intent = record_worker_reply = None
         # Capture the HUB Hermes home HERE, before runner_handler() copies the
         # context into the agent worker. gateway/run.py overrides HERMES_HOME to
         # the per-bot profile inside the worker, where concierge/registry.json
@@ -882,6 +882,19 @@ class ConciergeDiscordMixin:
                if dispatch_context else nullcontext())
         with ctx:
             response = await runner_handler(event)
+        # Record the worker's FINAL answer in-process for the dispatch driver.
+        # Only an EXPECTed worker lane is captured; the ordinary user turn is
+        # a no-op. This is the reliable replacement for scraping Discord
+        # channel history (see tools/concierge_dispatch_tool.py).
+        if record_worker_reply is not None:
+            try:
+                record_worker_reply(event, response)
+            except Exception as e:
+                self._concierge_warn_once(
+                    ("worker-reply-capture",),
+                    "[%s] concierge: recording the worker reply failed (%s); "
+                    "the driver falls back to channel history",
+                    getattr(self, "name", "discord"), e)
         intent = take_dispatch_intent(event) if take_dispatch_intent else None
 
         # PREFERRED PATH: the model called the real schema-backed tool. The
@@ -2127,6 +2140,8 @@ class ConciergeDiscordMixin:
         #    which no voice session joined).
         worker_event = None
         home_history = None
+        captured_reply = None
+        reply_key = (worker, str(worker_channel))
         try:
             home_history = await self._concierge_fetch_room_history(event)
             worker_source = dataclasses.replace(
@@ -2144,8 +2159,18 @@ class ConciergeDiscordMixin:
             worker_event.media_text_inlined = list(
                 worker_event.media_text_inlined or [])
             worker_event.metadata = dict(worker_event.metadata or {})
+            # Catch the worker's FINAL answer in-process (the wrap records it).
+            # Channel-history scraping below remains a FALLBACK, not the source
+            # of truth: a lazily created worker channel is often EMPTY and the
+            # worker event can inherit the trigger's thread lane, so the reply
+            # never lands in the channel we scrape (2026-11-25 incident).
+            from tools.concierge_dispatch_tool import (
+                expect_worker_reply, take_worker_reply)
+
+            expect_worker_reply(*reply_key)
             await super().handle_message(worker_event)
             await self._concierge_wait_for_member_turn(worker_event)
+            captured_reply = take_worker_reply(*reply_key)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2154,6 +2179,12 @@ class ConciergeDiscordMixin:
                 "(%s); the dispatch continues with the unavailable notice",
                 getattr(self, "name", "discord"), blueprint_key, user_id, e,
                 exc_info=True)
+            try:
+                from tools.concierge_dispatch_tool import take_worker_reply
+
+                take_worker_reply(*reply_key)  # clear the expectation
+            except Exception:
+                pass
             worker_event = None
 
         # 5) the worker's reply: the newest shared-identity MESSAGE of the
@@ -2165,8 +2196,8 @@ class ConciergeDiscordMixin:
         #    The fetch anchor is re-minted HERE (fresh channel object, fresh
         #    ahead-in-time id): at clone time the channel may not have been
         #    cache-resolved yet, and the reply only exists since the turn.
-        worker_answer = None
-        if worker_event is not None:
+        worker_answer = captured_reply
+        if worker_answer is None and worker_event is not None:
             worker_event.raw_message = _DispatchFetchAnchor(
                 self._concierge_dispatch_channel_object(worker_channel),
                 _dispatch_fetch_anchor_id())

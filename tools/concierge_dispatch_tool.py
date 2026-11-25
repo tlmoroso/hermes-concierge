@@ -115,6 +115,55 @@ def take_dispatch_intent(event) -> Optional[tuple[str, str]]:
         return _pending.pop(id(event), None)
 
 
+# ── Worker reply capture ──────────────────────────────────────────────────
+# The dispatch driver needs the worker's FINAL text (an ARTIFACT:<path> line,
+# a research answer, ...). Reading it back from Discord channel history is
+# UNRELIABLE: a lazily created worker channel can be empty, the worker event
+# can inherit the trigger's thread lane so the reply lands elsewhere, or the
+# channel object can be unresolvable. 2026-11-25 incident: the artifacts
+# worker wrote the file AND answered ARTIFACT:<path>, but the driver scraped
+# an empty window and told the user "Files Bot is unavailable".
+# Instead the wrap records the response IN-PROCESS, keyed by (profile, chat_id)
+# — both sides can compute it and it survives event clones. The history scrape
+# remains as a fallback for any path the wrap does not see.
+_worker_reply_expected: set[str] = set()
+_worker_replies: dict[str, str] = {}
+_worker_reply_lock = threading.Lock()
+
+
+def worker_reply_key(profile: str, chat_id: str) -> str:
+    return f"{profile}:{chat_id}"
+
+
+def expect_worker_reply(profile: str, chat_id: str) -> None:
+    """The driver is about to run a worker turn; clear any stale result."""
+    key = worker_reply_key(profile, chat_id)
+    with _worker_reply_lock:
+        _worker_replies.pop(key, None)
+        _worker_reply_expected.add(key)
+
+
+def record_worker_reply(event, response) -> None:
+    """Called by the inbound wrap after runner_handler returns. Only an
+    EXPECTed worker lane is recorded; every other turn is a no-op."""
+    source = getattr(event, "source", None)
+    if source is None or not isinstance(response, str) or not response.strip():
+        return
+    key = worker_reply_key(str(getattr(source, "profile", "") or ""),
+                           str(getattr(source, "chat_id", "") or ""))
+    with _worker_reply_lock:
+        if key in _worker_reply_expected:
+            _worker_reply_expected.discard(key)
+            _worker_replies[key] = response
+
+
+def take_worker_reply(profile: str, chat_id: str) -> Optional[str]:
+    key = worker_reply_key(profile, chat_id)
+    with _worker_reply_lock:
+        _worker_reply_expected.discard(key)
+        return _worker_replies.pop(key, None)
+
+
 def _known_workers() -> list[str]:
     from concierge.blueprints import CATALOG
 
