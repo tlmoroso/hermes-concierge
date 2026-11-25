@@ -32,11 +32,22 @@ logger = logging.getLogger(__name__)
 
 DISPATCH_TOOL_NAME = "concierge_dispatch"
 
-# (adapter, event) for the turn currently running through the inbound wrap.
-# ContextVar, not a global: concurrent turns must never cross-talk, and tool
-# handlers run in a ThreadPoolExecutor whose context is propagated from the
-# submitting task (tools/thread_context.py::propagate_context_to_thread).
-_current: ContextVar[Optional[tuple[Any, Any]]] = ContextVar(
+# (adapter, event, hub_home) for the turn currently running through the
+# inbound wrap. ContextVar, not a global: concurrent turns must never
+# cross-talk, and tool handlers run in a ThreadPoolExecutor whose context is
+# propagated from the submitting task
+# (tools/thread_context.py::propagate_context_to_thread).
+#
+# ``hub_home`` is the gateway's Hermes home, captured by the WRAP before the
+# agent worker copies the context. gateway/run.py::_profile_runtime_scope sets
+# a HERMES_HOME ContextVar override to the *per-bot* profile home inside the
+# worker, and concierge.registry.registry_path() resolves get_hermes_home() —
+# that profile has no concierge/registry.json, so an eligibility check run
+# there reads an EMPTY registry and refuses EVERY dispatch (the 2026-11-25
+# "this is not an eligible orchestrator turn" incident). The handler re-pins
+# hub_home around the check. Capturing a string is I/O-free; the registry read
+# still happens only when the tool is actually called.
+_current: ContextVar[Optional[tuple[Any, Any, Optional[str]]]] = ContextVar(
     "concierge_dispatch_context", default=None)
 
 # id(event) -> (blueprint_key, task). Bounded by in-flight turns; every entry
@@ -80,10 +91,17 @@ DISPATCH_SCHEMA = {
 
 
 @contextmanager
-def dispatch_context(adapter, event):
-    """Expose (adapter, event) to any ``concierge_dispatch`` call made during
-    this inbound turn. Set by the Discord wrap; reset in ``finally``."""
-    token = _current.set((adapter, event))
+def dispatch_context(adapter, event, *, hub_home: Optional[str] = None):
+    """Expose (adapter, event, hub_home) to any ``concierge_dispatch`` call
+    made during this inbound turn. Set by the Discord wrap; reset in
+    ``finally``.
+
+    ``hub_home`` is the gateway/hub Hermes home, captured in the wrap's
+    context BEFORE the agent worker overrides HERMES_HOME to the per-bot
+    profile. The handler re-pins it around the eligibility check; see
+    ``_current``. ``None`` is the tests/legacy fallback (no re-pinning).
+    """
+    token = _current.set((adapter, event, hub_home))
     try:
         yield
     finally:
@@ -109,7 +127,7 @@ def _handle_dispatch(args: dict, **kwargs) -> str:
         return json.dumps({
             "error": "concierge_dispatch is only available during a live "
                      "orchestrator turn. Do not retry."})
-    adapter, event = ctx
+    adapter, event, hub_home = ctx
     payload = args if isinstance(args, dict) else {}
     blueprint = str(payload.get("blueprint") or "").strip()
     task = str(payload.get("task") or "").strip()
@@ -121,7 +139,21 @@ def _handle_dispatch(args: dict, **kwargs) -> str:
             "error": f"unknown helper '{blueprint}'. Known: "
                      + ", ".join(_known_workers())})
     try:
-        eligible = adapter._concierge_dispatch_eligible(event)
+        if hub_home is not None:
+            # Re-pin the HUB home for the guard. The agent worker overrides
+            # HERMES_HOME to the bot profile, whose registry.json is absent —
+            # without this the guard reads an empty registry and refuses every
+            # dispatch (2026-11-25). Scope is restored immediately after.
+            from hermes_constants import (
+                reset_hermes_home_override, set_hermes_home_override)
+
+            token = set_hermes_home_override(hub_home)
+            try:
+                eligible = adapter._concierge_dispatch_eligible(event)
+            finally:
+                reset_hermes_home_override(token)
+        else:
+            eligible = adapter._concierge_dispatch_eligible(event)
     except Exception as e:
         logger.warning("concierge dispatch eligibility check failed: %s", e)
         return json.dumps({"error": "dispatch is unavailable in this session."})

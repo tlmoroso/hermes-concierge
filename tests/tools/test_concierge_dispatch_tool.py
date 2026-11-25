@@ -138,3 +138,65 @@ def test_dispatch_tool_is_registered_and_stays_eager():
         enabled_toolsets=["web", "concierge_dispatch"])
     assert sorted(d["function"]["name"] for d in defs) == [
         "concierge_dispatch", "web_extract", "web_search"]
+
+
+class _RegistryAwareAdapter(_FakeAdapter):
+    """Mimic the real guard: it resolves the registry path from the ambient
+    HERMES_HOME ContextVar, so it only passes when the HUB home is pinned."""
+
+    def __init__(self, hub):
+        super().__init__()
+        self.hub = str(hub)
+
+    def _concierge_dispatch_eligible(self, event):
+        from concierge import registry
+
+        self.checks += 1
+        return str(registry.registry_path()).startswith(self.hub)
+
+
+def test_handler_repins_hub_home_around_eligibility(tmp_path):
+    """REGRESSION 2026-11-25. gateway/run.py sets a HERMES_HOME ContextVar
+    override to the per-bot profile inside the agent worker; that profile has
+    no concierge/registry.json, so an eligibility check run there reads an
+    EMPTY registry and refuses every dispatch. The wrap captures the hub home
+    and the handler re-pins it around the guard.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override, set_hermes_home_override)
+
+    hub = tmp_path / "hub"
+    event = SimpleNamespace()
+    adapter = _RegistryAwareAdapter(hub)
+    token = set_hermes_home_override(str(tmp_path / "bot-orchestrator-xxxx"))
+    try:
+        with t.dispatch_context(adapter, event, hub_home=str(hub)):
+            out = _as_dict(registry.dispatch(
+                t.DISPATCH_TOOL_NAME,
+                {"blueprint": "researcher", "task": "find papers"}))
+    finally:
+        reset_hermes_home_override(token)
+    assert out["dispatched"] is True
+    assert adapter.checks == 1
+    assert t.take_dispatch_intent(event) == ("researcher", "find papers")
+
+
+def test_without_the_hub_pin_the_worker_home_breaks_dispatch(tmp_path):
+    """The bug, made explicit: no hub_home => the worker's HERMES_HOME wins
+    and the guard refuses the dispatch. Documents why the pin is mandatory."""
+    from hermes_constants import (
+        reset_hermes_home_override, set_hermes_home_override)
+
+    hub = tmp_path / "hub"
+    event = SimpleNamespace()
+    adapter = _RegistryAwareAdapter(hub)
+    token = set_hermes_home_override(str(tmp_path / "bot-orchestrator-xxxx"))
+    try:
+        with t.dispatch_context(adapter, event):  # legacy/tests: no pin
+            out = _as_dict(registry.dispatch(
+                t.DISPATCH_TOOL_NAME,
+                {"blueprint": "researcher", "task": "find papers"}))
+    finally:
+        reset_hermes_home_override(token)
+    assert "not an eligible orchestrator turn" in out["error"]
+    assert t.take_dispatch_intent(event) is None

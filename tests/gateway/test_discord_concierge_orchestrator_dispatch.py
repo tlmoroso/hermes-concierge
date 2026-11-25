@@ -1263,3 +1263,48 @@ def test_legacy_text_directive_still_works(rig, monkeypatch):
 
     assert result is None
     assert (str(HOME), PHASE_B_ANSWER) in seams.sent
+
+
+def test_dispatch_tool_survives_worker_hermes_home_override(
+        rig, monkeypatch, tmp_path):
+    """REGRESSION 2026-11-25: inside the agent worker the gateway sets a
+    HERMES_HOME ContextVar override to the per-bot profile, which has NO
+    concierge/registry.json. Recomputing eligibility in the tool handler then
+    returns an empty registry and refuses EVERY dispatch ('this is not an
+    eligible orchestrator turn'). The wrap must compute the verdict in the
+    HUB context and pass it into the tool context."""
+    from hermes_constants import (
+        reset_hermes_home_override, set_hermes_home_override)
+    from tools import concierge_dispatch_tool as dispatch_tool
+    from tools.registry import registry
+
+    _seed(rig)
+    _fake_provision(rig, monkeypatch, [])
+    seams = _wire_io(rig, monkeypatch)
+    calls = []
+
+    async def _handler(event):
+        calls.append(event)
+        if getattr(event, concierge_mixin._CONCIERGE_DISPATCH_ATTR, None):
+            return PHASE_B_ANSWER
+        if getattr(event.source, "profile", None) == WORKER_PROFILE:
+            return WORKER_ANSWER
+        # Simulate gateway/run.py::_profile_runtime_scope.
+        token = set_hermes_home_override(
+            str(tmp_path / "bot-orchestrator-xxxx"))
+        try:
+            registry.dispatch(dispatch_tool.DISPATCH_TOOL_NAME, {
+                "blueprint": WORKER_KEY, "task": TASK})
+        finally:
+            reset_hermes_home_override(token)
+        return "Here is a prose answer the wrap must suppress."
+
+    rig.adapter.set_message_handler(_handler)
+    result = _drive(rig, _trigger(rig))
+
+    assert result is None
+    worker_call = next(c for c in calls
+                       if getattr(c.source, "profile", None) == WORKER_PROFILE)
+    assert worker_call.text == TASK
+    assert (str(HOME), PHASE_B_ANSWER) in seams.sent
+    assert rig.channels[str(HOME)].sends == []

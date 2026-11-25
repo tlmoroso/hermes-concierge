@@ -77,6 +77,26 @@ Spec: `concierge/ORCHESTRATOR_DESIGN.md`. Commits `f095e5e1432..fa0f8b5c371`
   vault (persona names preserved, orphans skipped, idempotent).
   `scripts/concierge/deploy.sh` runs it after the rsync and BEFORE the restart.
   Always run it after any catalog/SOUL/toolset change.
+- **Tool handlers run in a DIFFERENT HERMES_HOME context (2026-11-25):** the
+  gateway multiplexes profiles; `gateway/run.py::_profile_runtime_scope` sets a
+  `HERMES_HOME` ContextVar override to the per-bot profile inside the agent
+  worker. `concierge.registry.registry_path()` resolves `get_hermes_home()`, so
+  a registry lookup done INSIDE a tool handler reads
+  `<bot profile>/concierge/registry.json`, which does not exist — an empty
+  registry, `orchestrator_for_user()` → None, and every dispatch refused with
+  "this is not an eligible orchestrator turn". The old text-directive guard ran
+  in the wrap (hub context) and never hit this. Fix: the wrap captures the hub
+  home (I/O-free `get_hermes_home()`) and the tool handler re-pins it around the
+  shared `_concierge_dispatch_eligible` guard. Test-locked by
+  `test_dispatch_tool_survives_worker_hermes_home_override`. Any NEW tool that
+  reads concierge state must do the same — never assume the handler sees the
+  hub profile.
+- **New toolsets must be EAGER:** on the VM `snowballstemmer` is installed, so
+  `tools.tool_search` is ACTIVE and a non-core toolset gets deferred behind the
+  `tool_search`/`tool_call` bridge. `concierge_dispatch` is registered with
+  `platforms=frozenset({"discord"})` in `toolsets.py`, which keeps it direct and
+  out of default composites. Verify on the VM runtime (the local scratch venv
+  lacks snowballstemmer, so local smoke tests silently pass).
 - **Voice:** the restamp runs the registry verdict FIRST (binding/room channels
   keep their routing), then re-homes unbound channels to the speaker's
   orchestrator via the `_CONCIERGE_ORCHESTRATOR_ATTR` stamp — no category check

@@ -866,8 +866,20 @@ class ConciergeDiscordMixin:
                 "legacy text dispatch only",
                 getattr(self, "name", "discord"), e)
             dispatch_context = take_dispatch_intent = None
-        ctx = (dispatch_context(self, event) if dispatch_context
-               else nullcontext())
+        # Capture the HUB Hermes home HERE, before runner_handler() copies the
+        # context into the agent worker. gateway/run.py overrides HERMES_HOME to
+        # the per-bot profile inside the worker, where concierge/registry.json
+        # does not exist — the tool handler re-pins this captured home around
+        # its eligibility check (2026-11-25 incident). get_hermes_home() is a
+        # ContextVar read: NO registry I/O, so the hot-path budget is unchanged.
+        try:
+            from hermes_constants import get_hermes_home
+
+            hub_home = str(get_hermes_home())
+        except Exception:
+            hub_home = None
+        ctx = (dispatch_context(self, event, hub_home=hub_home)
+               if dispatch_context else nullcontext())
         with ctx:
             response = await runner_handler(event)
         intent = take_dispatch_intent(event) if take_dispatch_intent else None
@@ -953,6 +965,7 @@ class ConciergeDiscordMixin:
             return False
         try:
             from concierge import registry
+            from hermes_constants import get_hermes_home
 
             orchestrator = registry.orchestrator_for_user(user_id)
         except Exception as e:
@@ -962,7 +975,20 @@ class ConciergeDiscordMixin:
                 "(%s); the dispatch is refused",
                 getattr(self, "name", "discord"), user_id, e, exc_info=True)
             return False
-        return bool(orchestrator) and source.profile == orchestrator
+        ok = bool(orchestrator) and source.profile == orchestrator
+        if not ok:
+            # One line per (user, profile) — enough to diagnose the classic
+            # failure: a HERMES_HOME ContextVar override pointing at a bot
+            # profile with no concierge/registry.json (empty registry).
+            self._concierge_warn_once(
+                ("dispatch-ineligible", user_id, str(source.profile)),
+                "[%s] concierge: dispatch refused for user %s — "
+                "source.profile=%r registry_orchestrator=%r "
+                "hermes_home=%s registry=%s",
+                getattr(self, "name", "discord"), user_id,
+                getattr(source, "profile", None), orchestrator,
+                get_hermes_home(), registry.registry_path())
+        return ok
 
     def _concierge_dispatch_directive_on(self, event, response):
         """LEGACY FALLBACK: the dispatch verdict for *event*'s final response
